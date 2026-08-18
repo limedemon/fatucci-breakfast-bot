@@ -175,7 +175,10 @@ CREATE TABLE IF NOT EXISTS admin_state (
 async def connect() -> aiosqlite.Connection:
     global _conn
     if _conn is None:
-        _conn = await aiosqlite.connect(cfg.db_path)
+        pending = aiosqlite.connect(cfg.db_path)
+        # поток соединения не должен удерживать процесс при аварийном выходе
+        pending.daemon = True
+        _conn = await pending
         _conn.row_factory = aiosqlite.Row
         await _conn.execute("PRAGMA journal_mode=WAL")
         await _conn.execute("PRAGMA busy_timeout=5000")

@@ -66,13 +66,23 @@ async def main() -> None:
     setup_logging()
     net.apply_ca_bundle()
     log.info("Запуск Fatucci-бота…")
-    await db.init_db()
+    for line in cfg.describe():
+        log.info("  %s", line)
 
     if not cfg.telegram_token:
-        log.error("Не задан TELEGRAM_TOKEN в .env — запускать нечего.")
+        log.error(
+            "Токен Telegram не найден. Задайте переменную окружения TELEGRAM_TOKEN "
+            "(подойдёт и BOT_TOKEN) в панели хостинга — либо положите её в файл .env "
+            "рядом с main.py. Запускать нечего."
+        )
         return
     if not cfg.admin_ids:
-        log.warning("Не задан ADMIN_IDS — админ-панель будет недоступна.")
+        log.warning(
+            "Не задан ADMIN_IDS — админ-панель будет недоступна. "
+            "Свой ID можно узнать, отправив боту /id."
+        )
+
+    await db.init_db()
 
     tasks: list[asyncio.Task] = []
 
