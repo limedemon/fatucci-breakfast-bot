@@ -8,7 +8,7 @@ from typing import Any, Iterable, Optional
 
 import aiosqlite
 
-from . import repo, statuses
+from . import admins, repo, statuses
 from .channels.base import MAX, TG, Btn, Out, channel_title, get_channel
 from .config import cfg
 from .utils import esc, fmt_date, fmt_dt, fmt_money, fmt_phone
@@ -93,7 +93,7 @@ async def admin_targets() -> list[str]:
     chat_id = (await repo.get_setting("orders_chat_id")) or cfg.orders_chat_id
     if chat_id.strip():
         return [chat_id.strip()]
-    return [str(admin_id) for admin_id in cfg.admin_ids]
+    return [str(admin_id) for admin_id in sorted(await admins.ids())]
 
 
 async def send_to_admins(text: str, kb: Optional[list[list[Btn]]] = None) -> list[dict[str, Any]]:
@@ -110,7 +110,7 @@ async def send_to_admins(text: str, kb: Optional[list[list[Btn]]] = None) -> lis
 
     if not sent:
         # рабочий чат недоступен (бот не добавлен, чат удалён) — не теряем заказ
-        personal = [str(admin_id) for admin_id in cfg.admin_ids if str(admin_id) not in targets]
+        personal = [str(a) for a in sorted(await admins.ids()) if str(a) not in targets]
         if personal:
             log.warning("Рабочий чат %s недоступен — шлю заказ лично админам", targets)
         for chat_id in personal:

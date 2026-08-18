@@ -11,7 +11,9 @@ from __future__ import annotations
 DEFAULT_SETTINGS: dict[str, str] = {
     # Каналы
     "tg_enabled": "1",
-    "max_enabled": "1",            # выключатель MAX в админке (без токена всё равно не стартует)
+    "max_enabled": "1",            # выключатель MAX в админке
+    "max_token": "",               # токен бота MAX — вводится в админ-панели
+    "max_username": "",            # username бота MAX без @ (нужен для QR-ссылок)
 
     # Куда падают заказы
     "orders_chat_id": "",          # id рабочего чата/канала Telegram

@@ -3,8 +3,8 @@ from __future__ import annotations
 
 import logging
 
-from . import admin, flow
-from .channels.base import TG, Channel, Event, Out
+from . import admin, admins, flow
+from .channels.base import TG, Btn, Channel, Event, Out
 
 log = logging.getLogger(__name__)
 
@@ -28,7 +28,11 @@ async def _route(ev: Event, ch: Channel) -> None:
 
     is_group = ch.name == TG and str(ev.chat_id) != str(ev.user_id)
 
-    if ch.name == TG and admin.is_admin(ev.user_id):
+    # самый первый написавший боту в личку становится владельцем
+    if ch.name == TG and not is_group:
+        await _claim_owner(ev, ch)
+
+    if ch.name == TG and await admins.is_admin(ev.user_id):
         if ev.kind == "callback" and (ev.payload or "").startswith("a:"):
             await admin.handle_callback(ev, ch)
             return
@@ -42,3 +46,20 @@ async def _route(ev: Event, ch: Channel) -> None:
         return
 
     await flow.handle(ev, ch)
+
+
+async def _claim_owner(ev: Event, ch: Channel) -> None:
+    """Первый пользователь бота получает права владельца."""
+    if not await admins.claim_owner(ev.user_id, ev.username, ev.full_name):
+        return
+    await ch.send(ev.chat_id, Out(
+        text=(
+            "👑 <b>Вы владелец этого бота</b>\n\n"
+            "Вы первый, кто написал боту, поэтому доступ к управлению выдан вам.\n\n"
+            "Откройте админ-панель командой /admin — там настраиваются объекты, "
+            "меню, цены, оплата и всё остальное.\n\n"
+            "Остальных менеджеров добавьте в разделе <b>👑 Доступ</b>: "
+            "права владельца остаются только у вас."
+        ),
+        kb=[[Btn(text="🛠 Открыть админ-панель", data="a:h", intent="positive")]],
+    ))

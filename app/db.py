@@ -164,6 +164,16 @@ CREATE TABLE IF NOT EXISTS digests (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS admins (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id    INTEGER NOT NULL UNIQUE,
+    username   TEXT NOT NULL DEFAULT '',
+    full_name  TEXT NOT NULL DEFAULT '',
+    is_owner   INTEGER NOT NULL DEFAULT 0,
+    added_by   TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS admin_state (
     admin_id INTEGER PRIMARY KEY,
     state    TEXT NOT NULL DEFAULT '',

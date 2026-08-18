@@ -13,7 +13,7 @@ from typing import Any, Callable, Optional
 
 import aiosqlite
 
-from . import courier, notify, orders_service, payments, qrgen, repo, statuses
+from . import admins, courier, notify, orders_service, payments, qrgen, repo, statuses
 from .channels.base import MAX, TG, Btn, Channel, Event, Out
 from .config import cfg
 from .utils import (
@@ -39,11 +39,11 @@ Row = aiosqlite.Row
 PAGE = 6
 
 
-def is_admin(user_id: str | int) -> bool:
-    try:
-        return int(user_id) in cfg.admin_ids
-    except (TypeError, ValueError):
-        return False
+def mask_secret(value: str) -> str:
+    """Показать, что ключ задан, не раскрывая его целиком."""
+    if not value:
+        return ""
+    return f"{value[:6]}…{value[-4:]}" if len(value) > 14 else "•" * len(value)
 
 
 # =========================================================== описания полей
@@ -91,7 +91,9 @@ SETTING_SECTIONS: dict[str, tuple[str, list[FieldSpec]]] = {
         ("orders_paused", "Пауза приёма заказов", "bool"),
     ]),
     "ch": ("📱 Каналы", [
-        ("max_enabled", "Бот в MAX работает", "bool"),
+        ("max_enabled", "Бот в MAX включён", "bool"),
+        ("max_token", "Токен бота MAX", "secret"),
+        ("max_username", "Username бота MAX (без @)", "text"),
     ]),
     "rem": ("🔔 Напоминания", [
         ("reminder_enabled", "Напоминать о брошенном заказе", "bool"),
@@ -114,7 +116,7 @@ SETTING_SECTIONS: dict[str, tuple[str, list[FieldSpec]]] = {
     "pay": ("💳 Оплата", [
         ("pay_enabled", "Онлайн-оплата включена", "bool"),
         ("yk_shop_id", "ЮKassa shopId", "text"),
-        ("yk_secret", "ЮKassa секретный ключ", "text"),
+        ("yk_secret", "ЮKassa секретный ключ", "secret"),
         ("yk_return_url", "Ссылка возврата", "text"),
         ("yk_receipt", "Формировать чек (54-ФЗ)", "bool"),
         ("yk_vat_code", "Код НДС для чека", "int"),
@@ -198,6 +200,7 @@ async def handle_callback(ev: Event, ch: Channel) -> None:
         "t": lambda: _texts_route(ev, ch, args),
         "f": lambda: _offers_route(ev, ch, args),
         "u": lambda: _users_route(ev, ch, args),
+        "acc": lambda: _access_route(ev, ch, args),
         "bc": lambda: _broadcast_route(ev, ch, args),
         "cfg": lambda: _settings_route(ev, ch, args),
         "st": lambda: _stats_route(ev, ch, args),
@@ -263,6 +266,7 @@ async def _home(ev: Event, ch: Channel, new_message: bool = False) -> None:
         [Btn(text="💳 Оплата", data="a:cfg:s:pay"), Btn(text="🍽 Доп. предложения", data="a:f:l")],
         [Btn(text="✍️ Тексты", data="a:t:l"), Btn(text="👥 Гости", data="a:u:l:0")],
         [Btn(text="📢 Рассылка", data="a:bc:m"), Btn(text="⚙️ Настройки", data="a:cfg:m")],
+        [Btn(text="👑 Доступ", data="a:acc:l"), Btn(text="📱 Каналы", data="a:cfg:s:ch")],
         [Btn(text="📤 Выгрузка в CSV", data="a:x:m")],
     ]
     await _show(ev, ch, Out(text=text, kb=kb), new_message=new_message)
@@ -877,6 +881,112 @@ async def _user_card(ev: Event, ch: Channel, user_pk: int) -> None:
     await _show(ev, ch, Out(text=text, kb=kb))
 
 
+# ====================================================================== доступ
+async def _access_route(ev: Event, ch: Channel, args: list[str]) -> None:
+    action = args[0] if args else "l"
+    if action == "l":
+        await _access_list(ev, ch)
+    elif action == "add":
+        await _ask(ev, ch, "admin_add", {},
+                   "👑 Пришлите <b>ID пользователя</b> в Telegram — числом.\n\n"
+                   "Где взять: пусть человек напишет этому боту команду <code>/id</code> "
+                   "и пришлёт вам число.\n\n"
+                   "Либо выберите его из тех, кто уже писал боту, — кнопка ниже.")
+    elif action == "g":
+        await _access_guests(ev, ch, int(args[1]) if len(args) > 1 else 0)
+    elif action == "p":
+        await _access_add_guest(ev, ch, int(args[1]))
+    elif action == "d":
+        await _access_confirm_remove(ev, ch, int(args[1]))
+    elif action == "dd":
+        ok, message = await admins.remove(int(args[1]))
+        await _answer(ev, ch, message)
+        await _access_list(ev, ch)
+
+
+async def _access_list(ev: Event, ch: Channel) -> None:
+    rows = await admins.listing()
+    lines = ["👑 <b>Доступ к админ-панели</b>", ""]
+    kb: list[list[Btn]] = []
+    for row in rows:
+        mark = "👑" if row["is_owner"] else "🛠"
+        name = row["full_name"] or (f"@{row['username']}" if row["username"] else row["user_id"])
+        role = "владелец" if row["is_owner"] else "менеджер"
+        lines.append(f"{mark} <b>{esc(name)}</b> — {role}\n"
+                     f"   ID <code>{row['user_id']}</code> · добавлен {fmt_dt(row['created_at'])}")
+        if not row["is_owner"]:
+            kb.append([Btn(text=f"🗑 Убрать {name}", data=f"a:acc:d:{row['user_id']}",
+                           intent="negative")])
+    if not rows:
+        lines.append("Пока никого — доступ выдан через переменную окружения ADMIN_IDS.")
+    if cfg.admin_ids:
+        lines += ["", f"🔑 Аварийный доступ из переменной ADMIN_IDS: "
+                      f"<code>{', '.join(str(i) for i in cfg.admin_ids)}</code>"]
+    lines += ["", "<i>Владельца убрать нельзя — это защита от потери доступа к боту.</i>"]
+
+    kb.append([Btn(text="➕ Добавить по ID", data="a:acc:add"),
+               Btn(text="👥 Выбрать из гостей", data="a:acc:g:0")])
+    kb.append(_back("a:h", "⬅️ В админку"))
+    await _show(ev, ch, Out(text="\n".join(lines), kb=kb))
+
+
+async def _access_guests(ev: Event, ch: Channel, page: int) -> None:
+    total = await repo.count_users(channel=TG)
+    users = await repo.list_users(limit=PAGE, offset=page * PAGE, channel=TG)
+    current = await admins.ids()
+    kb: list[list[Btn]] = []
+    for user in users:
+        if int(user["ext_id"]) in current:
+            continue
+        name = user["full_name"] or user["username"] or user["ext_id"]
+        kb.append([Btn(text=f"👤 {name}", data=f"a:acc:p:{user['id']}")])
+    nav: list[Btn] = []
+    if page > 0:
+        nav.append(Btn(text="⬅️", data=f"a:acc:g:{page - 1}"))
+    if (page + 1) * PAGE < total:
+        nav.append(Btn(text="➡️", data=f"a:acc:g:{page + 1}"))
+    if nav:
+        kb.append(nav)
+    kb.append(_back("a:acc:l", "⬅️ К доступу"))
+    await _show(ev, ch, Out(
+        text="👥 <b>Кому выдать доступ?</b>\n\nПоказаны те, кто писал боту в Telegram.",
+        kb=kb))
+
+
+async def _access_add_guest(ev: Event, ch: Channel, user_pk: int) -> None:
+    user = await repo.get_user_pk(user_pk)
+    if user is None or user["channel"] != TG:
+        await _access_list(ev, ch)
+        return
+    added = await admins.add(int(user["ext_id"]), user["username"], user["full_name"],
+                             added_by=_actor(ev))
+    await _answer(ev, ch, "Доступ выдан" if added else "У него уже есть доступ")
+    if added:
+        await _notify_new_admin(ch, int(user["ext_id"]))
+    await _access_list(ev, ch)
+
+
+async def _access_confirm_remove(ev: Event, ch: Channel, user_id: int) -> None:
+    row = await admins.get(user_id)
+    name = (row["full_name"] or row["username"] or user_id) if row else user_id
+    kb = [[Btn(text="🗑 Да, убрать", data=f"a:acc:dd:{user_id}", intent="negative")],
+          [Btn(text="✖️ Отмена", data="a:acc:l")]]
+    await _show(ev, ch, Out(
+        text=f"⚠️ Убрать доступ у <b>{esc(name)}</b>?\n\n"
+             "Он перестанет видеть админ-панель и кнопки под заказами.", kb=kb))
+
+
+async def _notify_new_admin(ch: Channel, user_id: int) -> None:
+    """Сообщить человеку, что ему выдали доступ."""
+    try:
+        await ch.send(str(user_id), Out(
+            text="🛠 <b>Вам выдали доступ к админ-панели Fatucci</b>\n\n"
+                 "Откройте её командой /admin.",
+            kb=[[Btn(text="🛠 Открыть админ-панель", data="a:h", intent="positive")]]))
+    except Exception as exc:  # noqa: BLE001
+        log.debug("Не удалось уведомить нового админа %s: %s", user_id, exc)
+
+
 # =================================================================== рассылка
 async def _broadcast_route(ev: Event, ch: Channel, args: list[str]) -> None:
     action = args[0] if args else "m"
@@ -938,11 +1048,27 @@ async def _settings_section(ev: Event, ch: Channel, code: str) -> None:
             lines.append(f"{esc(label)}: {state}")
             kb.append([Btn(text=f"{state} · {label}", data=f"a:cfg:t:{code}:{key}")])
         else:
-            shown = value if len(value) <= 60 else value[:57] + "…"
+            if kind == "secret":
+                shown = mask_secret(value)
+            else:
+                shown = value if len(value) <= 60 else value[:57] + "…"
             lines.append(f"{esc(label)}: <code>{esc(shown) or '—'}</code>")
             kb.append([Btn(text=f"✏️ {label}", data=f"a:cfg:e:{code}:{key}")])
+    if code == "ch":
+        lines += ["", _max_hint(await repo.get_setting("max_token"),
+                                await repo.get_bool("max_enabled", True))]
     kb.append(_back("a:cfg:m", "⬅️ К настройкам"))
     await _show(ev, ch, Out(text="\n".join(lines), kb=kb))
+
+
+def _max_hint(token: str, enabled: bool) -> str:
+    if not token:
+        return ("ℹ️ Чтобы подключить MAX: создайте бота в MasterBot внутри MAX, "
+                "вставьте сюда его токен и username. Перезапускать бота не нужно — "
+                "он поднимет MAX сам в течение минуты.")
+    if not enabled:
+        return "⏸ Токен есть, но канал выключен переключателем выше."
+    return "✅ Токен задан. Если MAX не отвечает — проверьте логи при старте."
 
 
 async def _settings_edit(ev: Event, ch: Channel, code: str, key: str) -> None:
@@ -952,10 +1078,14 @@ async def _settings_edit(ev: Event, ch: Channel, code: str, key: str) -> None:
     label = next((lbl for k, lbl, _ in section[1] if k == key), key)
     kind = next((t for k, _, t in section[1] if k == key), "text")
     value = await repo.get_setting(key)
+    if kind == "secret":
+        value = mask_secret(value)
     hint = {
         "time": "Формат: <code>ЧЧ:ММ</code>, например <code>20:00</code>",
         "int": "Пришлите целое число",
         "money": "Сумма в рублях, например <code>900</code>",
+        "secret": "Значение будет показываться скрытым. Сообщение с ключом "
+                  "лучше удалить из чата после отправки.",
     }.get(kind, "")
     if key.startswith("courier_"):
         hint = ("Доступные подстановки: {date_h}, {date}, {orders_count}, {sets_count}, "
@@ -1087,6 +1217,7 @@ async def _consume_input(ev: Event, ch: Channel, kind: str, ctx: dict[str, Any])
         "setting": _in_setting,
         "reject": _in_reject,
         "broadcast": _in_broadcast,
+        "admin_add": _in_admin_add,
         "find_order": _in_find_order,
         "find_date": _in_find_date,
         "rot_date": _in_rot_date,
@@ -1266,6 +1397,30 @@ async def _in_broadcast(ev: Event, ch: Channel, ctx: dict, text: str, photo: str
     await ch.send(ev.chat_id, Out(
         text=f"✅ Рассылка завершена.\nДоставлено: <b>{ok}</b>\nНе доставлено: {failed}",
         kb=[[Btn(text="🏠 Админка", data="a:h")]]))
+
+
+async def _in_admin_add(ev: Event, ch: Channel, ctx: dict, text: str, photo: str) -> None:
+    raw = text.strip().lstrip("@")
+    if not raw.isdigit():
+        await ch.send(ev.chat_id, Out(
+            text="⚠️ Нужен именно числовой ID, например <code>123456789</code>.\n"
+                 "По @username выдать доступ нельзя — Telegram не даёт ботам "
+                 "разрешать имена.\n\n"
+                 "Пусть человек отправит боту <code>/id</code> и пришлёт вам число.",
+            kb=[[Btn(text="👥 Выбрать из гостей", data="a:acc:g:0")],
+                [Btn(text="✖️ Отмена", data="a:acc:l")]]))
+        return
+    await repo.clear_admin_state(int(ev.user_id))
+    user_id = int(raw)
+    user = await repo.get_user(TG, str(user_id))
+    added = await admins.add(user_id, user["username"] if user else "",
+                             user["full_name"] if user else "", added_by=_actor(ev))
+    if added:
+        await _notify_new_admin(ch, user_id)
+    await ch.send(ev.chat_id, Out(
+        text=(f"✅ Доступ выдан: <code>{user_id}</code>" if added
+              else f"ℹ️ У <code>{user_id}</code> доступ уже был"),
+        kb=[[Btn(text="👑 К списку", data="a:acc:l"), Btn(text="🏠 Админка", data="a:h")]]))
 
 
 async def _in_find_order(ev: Event, ch: Channel, ctx: dict, text: str, photo: str) -> None:

@@ -388,6 +388,77 @@ async def main() -> None:
           "MAX: ссылка для QR собирается верно")
     await mx.close()
 
+    print("\n— MAX подключается из админ-панели —")
+    import main as botmain
+    await repo.set_setting("max_token", "max-token-from-panel")
+    await repo.set_setting("max_username", "fatucci_max_bot")
+    token, username = await botmain.max_credentials()
+    check(token == "max-token-from-panel" and username == "fatucci_max_bot",
+          "токен и username MAX читаются из настроек, а не из .env")
+    check(await botmain.max_still_on("max-token-from-panel"), "канал MAX поднимается")
+    await repo.set_setting("max_enabled", "0")
+    check(not await botmain.max_still_on("max-token-from-panel"),
+          "выключение MAX в админке останавливает опрос")
+    await repo.set_setting("max_enabled", "1")
+    await repo.set_setting("max_token", "another-token")
+    check(not await botmain.max_still_on("max-token-from-panel"),
+          "смена токена в админке перезапускает канал")
+    await repo.set_setting("max_token", "")
+
+    print("\n— Доступ: владелец и менеджеры —")
+    from app import admins
+    from app.config import cfg as app_cfg
+    saved_env_admins = app_cfg.admin_ids
+    app_cfg.admin_ids = []                      # как на чистом хостинге без ADMIN_IDS
+    await db.execute("DELETE FROM admins")
+    admins.invalidate()
+
+    OWNER, MANAGER = "901", "902"
+    ch.clear()
+    await route(Event(channel="tg", user_id=OWNER, chat_id=OWNER, kind="start",
+                      full_name="Первый Написавший"), ch)
+    check(await admins.is_admin(OWNER), "первый написавший боту стал владельцем")
+    check(await admins.is_owner(OWNER), "он помечен именно как владелец")
+    check("владелец" in ch.texts().lower(), "владельцу пришло сообщение о выданном доступе")
+
+    ch.clear()
+    await route(Event(channel="tg", user_id=MANAGER, chat_id=MANAGER, kind="start",
+                      full_name="Второй Гость"), ch)
+    check(not await admins.is_admin(MANAGER), "второй пользователь прав не получает")
+    check("владелец" not in ch.texts().lower(), "второму про владельца не пишут")
+
+    ch.clear()
+    await route(Event(channel="tg", user_id=MANAGER, chat_id=MANAGER, kind="text",
+                      text="/admin"), ch)
+    check("Админ-панель" not in ch.texts(), "не-админ не может открыть админку")
+
+    ch.clear()
+    await route(Event(channel="tg", user_id=OWNER, chat_id=OWNER, kind="callback",
+                      payload="a:acc:add", callback_id="z1"), ch)
+    await route(Event(channel="tg", user_id=OWNER, chat_id=OWNER, kind="text",
+                      text=MANAGER), ch)
+    check(await admins.is_admin(MANAGER), "владелец добавил менеджера через админку")
+    check("доступ к админ-панели" in ch.texts().lower(), "новому админу пришло уведомление")
+
+    ch.clear()
+    await route(Event(channel="tg", user_id=MANAGER, chat_id=MANAGER, kind="text",
+                      text="/admin"), ch)
+    check("Админ-панель" in ch.texts(), "новый менеджер видит админку")
+
+    ok, _ = await admins.remove(int(MANAGER))
+    check(ok and not await admins.is_admin(MANAGER), "менеджера можно убрать")
+    ok, message = await admins.remove(int(OWNER))
+    check(not ok, f"владельца убрать нельзя ({message})")
+
+    ch.clear()
+    await route(Event(channel="tg", user_id=OWNER, chat_id=OWNER, kind="callback",
+                      payload="a:acc:l", callback_id="z2"), ch)
+    check("Доступ к админ-панели" in ch.texts(), "раздел «Доступ» открывается")
+
+    app_cfg.admin_ids = saved_env_admins
+    admins.invalidate()
+    check(await admins.is_admin(ADMIN), "ADMIN_IDS из окружения остаётся аварийным входом")
+
     await db.close()
     print()
     if failures:
