@@ -115,13 +115,8 @@ SETTING_SECTIONS: dict[str, tuple[str, list[FieldSpec]]] = {
     ]),
     "pay": ("💳 Оплата", [
         ("pay_enabled", "Онлайн-оплата включена", "bool"),
-        ("yk_shop_id", "ЮKassa shopId", "text"),
-        ("yk_secret", "ЮKassa секретный ключ", "secret"),
-        ("yk_return_url", "Ссылка возврата", "text"),
-        ("yk_receipt", "Формировать чек (54-ФЗ)", "bool"),
-        ("yk_vat_code", "Код НДС для чека", "int"),
-        ("pay_timeout_min", "Время жизни счёта, мин", "int"),
-        ("pay_check_sec", "Период проверки оплаты, сек", "int"),
+        ("pm_token", "Токен PayMaster от @BotFather", "secret"),
+        ("pm_provider_data", "Доп. данные провайдера (JSON)", "text"),
     ]),
 }
 
@@ -746,11 +741,26 @@ async def _texts_route(ev: Event, ch: Channel, args: list[str]) -> None:
         rows = await repo.all_texts()
         kb = [[Btn(text=TEXT_TITLES.get(row["key"], row["key"]), data=f"a:t:e:{row['key']}")]
               for row in rows]
+        kb.append([Btn(text="♻️ Вернуть стандартные тексты", data="a:t:reset")])
         kb.append(_back("a:h", "⬅️ В админку"))
         await _show(ev, ch, Out(
             text="✍️ <b>Тексты бота</b>\n\nВыберите текст, чтобы изменить. "
                  "Поддерживается HTML: <code>&lt;b&gt;жирный&lt;/b&gt;</code>, "
                  "<code>&lt;i&gt;курсив&lt;/i&gt;</code>.", kb=kb))
+    elif action == "reset":
+        await _show(ev, ch, Out(
+            text="⚠️ <b>Вернуть стандартные тексты?</b>\n\n"
+                 "Все ваши правки текстов будут заменены на исходные. "
+                 "Меню, объекты, цены и заказы это не затронет.",
+            kb=[[Btn(text="♻️ Да, вернуть", data="a:t:resetok", intent="negative")],
+                [Btn(text="✖️ Отмена", data="a:t:l")]]))
+    elif action == "resetok":
+        from .defaults import DEFAULT_TEXTS
+
+        for key, value in DEFAULT_TEXTS.items():
+            await repo.set_text(key, value)
+        await _answer(ev, ch, "Тексты возвращены")
+        await _texts_route(ev, ch, ["l"])
     elif action == "e":
         key = args[1]
         value = await repo.get_text(key)
@@ -1014,7 +1024,7 @@ async def _settings_route(ev: Event, ch: Channel, args: list[str]) -> None:
     if action == "m":
         kb = [[Btn(text=title, data=f"a:cfg:s:{code}")]
               for code, (title, _) in SETTING_SECTIONS.items()]
-        kb.append([Btn(text="🧪 Проверить ЮKassa", data="a:cfg:yk")])
+        kb.append([Btn(text="🧪 Проверить оплату", data="a:cfg:yk")])
         kb.append(_back("a:h", "⬅️ В админку"))
         await _show(ev, ch, Out(text="⚙️ <b>Настройки</b>", kb=kb))
     elif action == "s":
@@ -1028,8 +1038,8 @@ async def _settings_route(ev: Event, ch: Channel, args: list[str]) -> None:
         await _settings_section(ev, ch, args[1])
     elif action == "yk":
         await _answer(ev, ch, "Проверяю…")
-        ok, message = await payments.test_credentials()
-        await ch.send(ev.chat_id, Out(text=("✅ " if ok else "⚠️ ") + esc(message),
+        ok, message = await payments.check_setup()
+        await ch.send(ev.chat_id, Out(text=message if ok else "⚠️ " + message,
                                       kb=[_back("a:cfg:s:pay")]))
 
 
@@ -1080,6 +1090,19 @@ async def _settings_edit(ev: Event, ch: Channel, code: str, key: str) -> None:
     value = await repo.get_setting(key)
     if kind == "secret":
         value = mask_secret(value)
+    if key == "pm_token":
+        hint = (
+            "Токен выдаёт <b>@BotFather</b>: /mybots → ваш бот → "
+            "<b>Payments</b> → PayMaster.\n\n"
+            "Выглядит так: <code>123456789:TEST:abcdef…</code>\n"
+            "<b>TEST</b> — тестовый режим, деньги не списываются.\n"
+            "<b>LIVE</b> — настоящие платежи.\n\n"
+            "После сохранения нажмите «Проверить оплату»."
+        )
+        await _ask(ev, ch, "setting", {"key": key, "kind": kind, "section": code},
+                   f"💳 <b>{esc(label)}</b>\n\n"
+                   f"Сейчас: <code>{esc(value) or 'не задан'}</code>\n\n{hint}")
+        return
     hint = {
         "time": "Формат: <code>ЧЧ:ММ</code>, например <code>20:00</code>",
         "int": "Пришлите целое число",

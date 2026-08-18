@@ -1,147 +1,131 @@
-"""Онлайн-оплата через ЮKassa (REST API).
+"""Оплата через PayMaster — нативными платежами Telegram.
 
-Вебхуки не используются намеренно: на bothost нет публичного адреса,
-поэтому статус платежа проверяется опросом (см. scheduler.payment_watcher).
-Одинаково работает и для Telegram, и для MAX — гость просто получает ссылку.
+Как это работает:
+
+1. Токен провайдера выдаёт @BotFather: /mybots → бот → Payments → PayMaster.
+   Формат токена — ``<id>:TEST:<hash>`` или ``<id>:LIVE:<hash>``.
+2. Когда менеджер принимает заказ в работу, бот отправляет гостю **инвойс** —
+   сообщение со встроенной кнопкой оплаты.
+3. Телеграм спрашивает бота, всё ли в порядке (pre_checkout_query) — отвечаем «да».
+4. После оплаты приходит successful_payment, и заказ автоматически становится
+   «оплачен». Опрашивать ничего не нужно, вебхуки и белый IP тоже не нужны.
+
+Важно: нативные платежи есть только в Telegram. В MAX их нет — там гость
+получает сообщение, что с оплатой поможет менеджер (см. orders_service).
 """
 from __future__ import annotations
 
-import base64
 import logging
-import uuid
-from typing import Any, Optional
+from typing import Optional
 
-import aiohttp
 import aiosqlite
 
-from . import net, repo
+from . import repo
 from .config import cfg
 from .utils import fmt_date
 
 log = logging.getLogger(__name__)
 Row = aiosqlite.Row
 
-API_URL = "https://api.yookassa.ru/v3/payments"
-
-STATUS_SUCCEEDED = "succeeded"
-STATUS_CANCELED = "canceled"
-STATUS_PENDING = "pending"
-STATUS_WAITING = "waiting_for_capture"
+#: минимальная сумма платежа в копейках — Telegram не пропускает совсем мелкие
+MIN_AMOUNT_KOP = 6000
 
 
-async def credentials() -> tuple[str, str]:
-    shop_id = (await repo.get_setting("yk_shop_id")) or cfg.yookassa_shop_id
-    secret = (await repo.get_setting("yk_secret")) or cfg.yookassa_secret
-    return shop_id.strip(), secret.strip()
+async def provider_token() -> str:
+    """Токен провайдера: сначала админ-панель, потом переменная окружения."""
+    token = (await repo.get_setting("pm_token")) or cfg.provider_token
+    return token.strip()
 
 
 async def is_configured() -> bool:
-    shop_id, secret = await credentials()
-    return bool(shop_id and secret)
+    return bool(await provider_token())
 
 
 async def is_enabled() -> bool:
     return await repo.get_bool("pay_enabled", True) and await is_configured()
 
 
-def _auth_header(shop_id: str, secret: str) -> str:
-    token = base64.b64encode(f"{shop_id}:{secret}".encode()).decode()
-    return f"Basic {token}"
+def is_test(token: str) -> bool:
+    return ":TEST:" in token.upper()
 
 
-async def _request(
-    method: str, url: str, json_body: Optional[dict[str, Any]] = None, idempotence: bool = False
-) -> tuple[bool, dict[str, Any]]:
-    shop_id, secret = await credentials()
-    if not (shop_id and secret):
-        return False, {"error": "Не заданы shop_id / секретный ключ ЮKassa"}
-    headers = {"Authorization": _auth_header(shop_id, secret), "Content-Type": "application/json"}
-    if idempotence:
-        headers["Idempotence-Key"] = str(uuid.uuid4())
-    try:
-        timeout = aiohttp.ClientTimeout(total=30)
-        async with aiohttp.ClientSession(
-            timeout=timeout, connector=net.connector(net.default_ssl())
-        ) as session:
-            async with session.request(method, url, headers=headers, json=json_body) as resp:
-                data = await resp.json(content_type=None)
-                if resp.status >= 400:
-                    message = (data or {}).get("description") or str(data)[:200]
-                    log.warning("ЮKassa %s %s -> %s: %s", method, url, resp.status, message)
-                    return False, {"error": message}
-                return True, data or {}
-    except Exception as exc:  # noqa: BLE001
-        log.warning("ЮKassa запрос не удался: %s", exc)
-        return False, {"error": str(exc)}
+def token_looks_valid(token: str) -> bool:
+    parts = token.split(":")
+    return len(parts) == 3 and parts[0].isdigit() and parts[1].upper() in ("TEST", "LIVE")
 
 
-async def _return_url() -> str:
-    custom = (await repo.get_setting("yk_return_url")).strip()
-    if custom:
-        return custom
-    if cfg.telegram_username:
-        return f"https://t.me/{cfg.telegram_username}"
-    return "https://max.ru/"
+async def mode_label() -> str:
+    token = await provider_token()
+    if not token:
+        return "не настроена"
+    return "тестовый режим" if is_test(token) else "боевой режим"
 
 
-def _rub(kop: int) -> str:
-    return f"{kop // 100}.{kop % 100:02d}"
+def invoice_payload(order_id: int) -> str:
+    return f"order:{order_id}"
 
 
-async def _receipt(order: Row) -> Optional[dict[str, Any]]:
-    if not await repo.get_bool("yk_receipt", False):
+def parse_payload(payload: str) -> Optional[int]:
+    if not payload.startswith("order:"):
         return None
-    phone = "".join(ch for ch in (order["phone"] or "") if ch.isdigit())
-    if not phone:
-        return None
-    vat_code = await repo.get_int("yk_vat_code", 1)
-    return {
-        "customer": {"phone": phone},
-        "items": [
-            {
-                "description": (order["set_title"] or "Завтрак")[:128],
-                "quantity": f"{order['qty']}.00",
-                "amount": {"value": _rub(order["price_kop"]), "currency": "RUB"},
-                "vat_code": vat_code,
-                "payment_mode": "full_payment",
-                "payment_subject": "commodity",
-            }
-        ],
-    }
+    tail = payload.split(":", 1)[1]
+    return int(tail) if tail.isdigit() else None
 
 
-async def create_payment(order: Row) -> tuple[str, str, str]:
-    """Создать платёж. Возвращает (payment_id, confirmation_url, error)."""
-    body: dict[str, Any] = {
-        "amount": {"value": _rub(order["total_kop"]), "currency": "RUB"},
-        "capture": True,
-        "confirmation": {"type": "redirect", "return_url": await _return_url()},
-        "description": f"Заказ №{order['number']} · завтрак {fmt_date(order['delivery_date'], False)}",
-        "metadata": {"order_id": str(order["id"]), "number": order["number"]},
-    }
-    receipt = await _receipt(order)
-    if receipt:
-        body["receipt"] = receipt
-
-    ok, data = await _request("POST", API_URL, json_body=body, idempotence=True)
-    if not ok:
-        return "", "", str(data.get("error", "неизвестная ошибка"))
-    payment_id = str(data.get("id", ""))
-    url = str((data.get("confirmation") or {}).get("confirmation_url", ""))
-    if not payment_id or not url:
-        return "", "", "ЮKassa не вернула ссылку на оплату"
-    return payment_id, url, ""
+def invoice_title(order: Row) -> str:
+    """Заголовок инвойса — Telegram разрешает до 32 символов."""
+    return f"Заказ №{order['number']}"[:32]
 
 
-async def payment_status(payment_id: str) -> str:
-    ok, data = await _request("GET", f"{API_URL}/{payment_id}")
-    if not ok:
-        return ""
-    return str(data.get("status", ""))
+def invoice_description(order: Row) -> str:
+    """Описание — до 255 символов."""
+    parts = [
+        f"{order['set_title']} × {order['qty']}",
+        fmt_date(order["delivery_date"], with_weekday=False),
+    ]
+    if order["object_address"]:
+        parts.append(f"{order['object_address']}, апарт. {order['apartment']}")
+    else:
+        parts.append(f"апарт. {order['apartment']}")
+    return " · ".join(parts)[:255]
 
 
-async def test_credentials() -> tuple[bool, str]:
-    ok, data = await _request("GET", f"{API_URL}?limit=1")
-    if ok:
-        return True, "Ключи ЮKassa приняты — оплата будет работать."
-    return False, f"Ошибка: {data.get('error', 'неизвестно')}"
+async def provider_data() -> str:
+    """Необязательный JSON для провайдера (например, чек по 54-ФЗ).
+
+    Формат задаёт PayMaster, поэтому строку не собираем сами, а отдаём как есть —
+    её можно вписать в админ-панели, если этого требует ваша схема.
+    """
+    return (await repo.get_setting("pm_provider_data")).strip()
+
+
+async def check_setup() -> tuple[bool, str]:
+    """Диагностика для кнопки «Проверить оплату» в админ-панели."""
+    token = await provider_token()
+    if not token:
+        return False, (
+            "Токен не задан.\n\n"
+            "Получить: @BotFather → /mybots → ваш бот → Payments → PayMaster.\n"
+            "Затем вставьте выданный токен в это поле."
+        )
+    if not token_looks_valid(token):
+        return False, (
+            "Это не похоже на токен провайдера.\n\n"
+            "Он выглядит так: <code>123456789:TEST:abcdef…</code> — "
+            "число, слово TEST или LIVE и хеш через двоеточия.\n"
+            "Выдаёт его @BotFather в разделе Payments, а не личный кабинет PayMaster."
+        )
+    if is_test(token):
+        return True, (
+            "✅ Токен принят — <b>тестовый режим</b>.\n\n"
+            "Деньги не списываются, платить нужно тестовой картой "
+            "<code>4111 1111 1111 1111</code>, срок — любой будущий, CVC любой.\n\n"
+            "⚠️ В тестовом режиме Telegram присылает счёт только тем, кто есть "
+            "во взаимных контактах у владельца бота. Для проверки добавьте "
+            "тестировщика в контакты.\n\n"
+            "Для приёма настоящих денег получите у @BotFather токен LIVE."
+        )
+    return True, (
+        "✅ Токен принят — <b>боевой режим</b>.\n\n"
+        "Деньги будут списываться по-настоящему. Проверьте на маленькой сумме."
+    )

@@ -3,9 +3,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import timedelta
 
-from . import courier, orders_service, payments, repo
+from . import courier, repo
 from .channels.base import Btn, Out, get_channel
 from .utils import fmt_date_iso, now, parse_time
 
@@ -16,7 +16,6 @@ async def run_all() -> None:
     await asyncio.gather(
         _loop("courier", courier_tick, 60),
         _loop("reminders", reminder_tick, 300),
-        _loop("payments", payment_tick, 20),
     )
 
 
@@ -80,36 +79,3 @@ async def reminder_tick() -> int:
         await repo.mark_reminded(session["channel"], session["ext_id"])
         await asyncio.sleep(0.3)
     return 300
-
-
-# ------------------------------------------------------------ контроль оплат
-async def payment_tick() -> int:
-    delay = max(10, await repo.get_int("pay_check_sec", 20))
-    if not await payments.is_enabled():
-        return 120
-    orders = await repo.pending_payments()
-    if not orders:
-        return delay
-
-    timeout_min = await repo.get_int("pay_timeout_min", 180)
-    for order in orders:
-        status = await payments.payment_status(order["payment_id"])
-        if status == payments.STATUS_SUCCEEDED:
-            log.info("Заказ %s оплачен", order["number"])
-            await orders_service.apply_payment_success(order)
-        elif status == payments.STATUS_CANCELED:
-            await repo.update_order(order["id"], payment_id="", payment_url="")
-            await repo.add_event(order["id"], order["status"], "ЮKassa", "Платёж отменён")
-        elif _too_old(order["updated_at"], timeout_min):
-            # ссылка протухла — очищаем, гость сможет запросить новую
-            await repo.update_order(order["id"], payment_id="", payment_url="")
-        await asyncio.sleep(0.2)
-    return delay
-
-
-def _too_old(updated_at: str, minutes: int) -> bool:
-    try:
-        moment = datetime.strptime(str(updated_at)[:19], "%Y-%m-%d %H:%M:%S")
-    except (TypeError, ValueError):
-        return False
-    return datetime.utcnow() - moment > timedelta(minutes=minutes)

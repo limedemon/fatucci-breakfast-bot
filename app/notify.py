@@ -19,37 +19,35 @@ Row = aiosqlite.Row
 
 # ------------------------------------------------------------------ карточки
 async def order_card(order: Row, for_admin: bool = True) -> str:
-    """Текст карточки заказа."""
+    """Карточка заказа: сверху главное, ниже детали, в конце — служебное."""
     lines = [
         f"<b>Заказ №{esc(order['number'])}</b>",
-        f"Статус: <b>{statuses.label(order['status'])}</b>",
+        statuses.label(order["status"]),
         "",
-        f"📅 Доставка: <b>{fmt_date(order['delivery_date'])}</b>",
-        f"🏢 Объект: {esc(order['object_title'])}",
+        f"📅 {fmt_date(order['delivery_date'])}",
+        f"🥐 {esc(order['set_title'])} × {order['qty']}",
     ]
     if order["object_address"]:
-        lines.append(f"📍 Адрес: {esc(order['object_address'])}")
+        lines.append(f"📍 {esc(order['object_address'])}")
+    else:
+        lines.append(f"📍 {esc(order['object_title'])}")
+    lines.append(f"🚪 Апартаменты {esc(order['apartment'])}")
+    if for_admin:
+        lines.append(f"📞 {esc(fmt_phone(order['phone']))}")
+    if order["comment"]:
+        lines.append(f"💬 {esc(order['comment'])}")
     lines += [
-        f"🚪 Апартаменты: <b>{esc(order['apartment'])}</b>",
-        f"🥐 Сет: {esc(order['set_title'])}",
-        f"🔢 Количество: {order['qty']}",
+        "",
+        f"💰 {fmt_money(order['price_kop'])} × {order['qty']} = "
+        f"<b>{fmt_money(order['total_kop'])}</b>",
     ]
     if for_admin:
-        lines.append(f"📞 Телефон: {esc(fmt_phone(order['phone']))}")
-    if order["comment"]:
-        lines.append(f"💬 Комментарий: {esc(order['comment'])}")
-    lines.append(
-        f"💰 {fmt_money(order['price_kop'])} × {order['qty']} = <b>{fmt_money(order['total_kop'])}</b>"
-    )
-    if for_admin:
-        lines += [
-            "",
-            f"🕗 Оформлен: {fmt_dt(order['created_at'])} · {channel_title(order['channel'])}",
-        ]
+        lines += ["", f"🏢 {esc(order['object_title'])}",
+                  f"🕗 {fmt_dt(order['created_at'])} · {channel_title(order['channel'])}"]
         if order["source_code"]:
-            lines.append(f"🔗 QR: <code>{esc(order['source_code'])}</code>")
+            lines.append(f"🔗 <code>{esc(order['source_code'])}</code>")
         if order["paid_at"]:
-            lines.append(f"✅ Оплачен: {fmt_dt(order['paid_at'])}")
+            lines.append(f"✅ Оплачен {fmt_dt(order['paid_at'])}")
     return "\n".join(lines)
 
 

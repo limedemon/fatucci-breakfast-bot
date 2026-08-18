@@ -12,7 +12,7 @@ from typing import Any, Optional
 
 import aiosqlite
 
-from . import availability, notify, orders_service, repo, statuses
+from . import availability, notify, orders_service, payments, repo, statuses
 from .channels.base import Btn, Channel, Event, Out
 from .utils import (
     chunk,
@@ -53,6 +53,10 @@ async def handle(ev: Event, ch: Channel) -> None:
     if user["is_blocked"]:
         await _answer(ev, ch)
         await ch.send(ev.chat_id, Out(text=await repo.render_text("blocked")))
+        return
+
+    if ev.kind == "payment":
+        await _on_payment(ev, ch)
         return
 
     if ev.kind == "start":
@@ -248,7 +252,7 @@ async def _rotation_hint(items: list[Row]) -> str:
             lines.append(f"{WEEKDAYS_SHORT[weekday - 1]} — {esc(titles[set_id])}")
     if not lines:
         return ""
-    return "<b>Расписание на неделю:</b>\n" + "\n".join(lines)
+    return "🗓 <b>Расписание недели</b>\n" + "\n".join(lines)
 
 
 async def _show_set(ev: Event, ch: Channel, set_id: int) -> None:
@@ -259,7 +263,9 @@ async def _show_set(ev: Event, ch: Channel, set_id: int) -> None:
     session = await repo.get_session(ev.channel, ev.user_id)
     obj = await repo.get_object(session["object_id"] if session else None)
     price = availability.price_for(obj, item) if obj is not None else (item["price_kop"] or 0)
-    text = f"<b>{esc(item['title'])}</b>\n\n{esc(item['description'])}"
+    text = f"🥐 <b>{esc(item['title'])}</b>"
+    if item["description"]:
+        text += "\n\n" + esc(item["description"])
     if price:
         text += f"\n\n💰 <b>{fmt_money(price)}</b> за сет"
     kb = [[Btn(text="🥐 Заказать", data="g:order")],
@@ -301,18 +307,20 @@ async def _show_my_orders(ev: Event, ch: Channel) -> None:
                                    kb=[[Btn(text="🥐 Заказать завтрак", data="g:order")],
                                        [Btn(text="⬅️ В меню", data="g:menu")]]))
         return
-    lines = ["<b>📦 Ваши заказы</b>", ""]
+    lines = ["📦 <b>Ваши заказы</b>", ""]
     kb: list[list[Btn]] = []
     for order in orders:
         lines.append(
-            f"№{esc(order['number'])} · {fmt_date(order['delivery_date'], False)} · "
-            f"{order['qty']} шт · {fmt_money(order['total_kop'])}\n"
-            f"   {statuses.label(order['status'])}"
+            f"<b>№{esc(order['number'])}</b> · {fmt_date(order['delivery_date'], False)}\n"
+            f"{statuses.label(order['status'])} · {order['qty']} × "
+            f"{esc(order['set_title'])} · {fmt_money(order['total_kop'])}"
         )
         kb.append([Btn(text=f"№{order['number']} · {fmt_date(order['delivery_date'], False)}",
                        data=f"g:ord:{order['id']}")])
-    kb.append([Btn(text="⬅️ В меню", data="g:menu")])
-    await _respond(ev, ch, Out(text="\n".join(lines), kb=kb))
+    lines.append("\n<i>Нажмите на заказ, чтобы открыть его.</i>")
+    kb.append([Btn(text="🥐 Заказать ещё", data="g:order"),
+               Btn(text="⬅️ В меню", data="g:menu")])
+    await _respond(ev, ch, Out(text="\n\n".join(lines), kb=kb))
 
 
 async def _show_my_order(ev: Event, ch: Channel, order_id: int) -> None:
@@ -346,20 +354,31 @@ async def _confirm_received(ev: Event, ch: Channel, order_id: int) -> None:
 
 
 async def _pay_again(ev: Event, ch: Channel, order_id: int) -> None:
+    """Гость нажал «Оплатить» в своих заказах — выставляем счёт заново."""
     order = await repo.get_order(order_id)
     if order is None or order["ext_id"] != str(ev.user_id):
         await _show_my_orders(ev, ch)
         return
-    url, error = await orders_service.ensure_payment_link(order)
-    if url:
-        await ch.send(ev.chat_id, Out(
-            text=f"💳 Оплата заказа <b>№{esc(order['number'])}</b> на сумму "
-                 f"<b>{fmt_money(order['total_kop'])}</b>.",
-            kb=[[Btn(text="Перейти к оплате", url=url)]]))
-    else:
+    ok, error = await orders_service.send_invoice(order)
+    if not ok:
         await ch.send(ev.chat_id, Out(
             text=await repo.render_text("payment_unavailable", number=order["number"])))
-        log.warning("Не удалось выдать ссылку на оплату заказа %s: %s", order["number"], error)
+        if error:
+            log.warning("Счёт по заказу %s не выставлен: %s", order["number"], error)
+
+
+async def _on_payment(ev: Event, ch: Channel) -> None:
+    """Telegram сообщил об успешной оплате."""
+    order_id = payments.parse_payload(ev.payload)
+    if order_id is None:
+        log.warning("Оплата с неизвестной меткой: %r", ev.payload)
+        return
+    order = await repo.get_order(order_id)
+    if order is None:
+        log.warning("Оплата по несуществующему заказу: %s", order_id)
+        return
+    log.info("Заказ %s оплачен (%s)", order["number"], ev.raw.get("charge_id", ""))
+    await orders_service.apply_payment_success(order, str(ev.raw.get("charge_id", "")))
 
 
 # ================================================================ оформление
@@ -424,12 +443,13 @@ async def _ask_date(ev: Event, ch: Channel) -> None:
     kb = [[Btn(text=f"{fmt_date_btn(day)} · {breakfast['title']}", data=f"g:date:{fmt_date_iso(day)}")]
           for day, breakfast in dates]
     kb.append([Btn(text="⬅️ В меню", data="g:menu")])
-    price = fmt_money(obj["price_kop"])
     text = (
-        "📅 <b>Выберите дату доставки</b>\n\n"
-        f"Объект: {esc(obj['title'])}\n"
-        f"Стоимость сета: <b>{price}</b>\n\n"
-        f"Приём заказов — до {esc(obj['cutoff_time'])} накануне."
+        "📅 <b>На какой день привезти завтрак?</b>\n\n"
+        f"📍 {esc(obj['address'] or obj['title'])}\n"
+        f"💰 {fmt_money(obj['price_kop'])} за сет\n\n"
+        "Рядом с датой — сет, который подадут в этот день.\n"
+        f"<i>Показаны только те дни, на которые заказ ещё принимается "
+        f"(до {esc(obj['cutoff_time'])} накануне).</i>"
     )
     await _respond(ev, ch, Out(text=text, kb=kb))
 
@@ -469,13 +489,13 @@ async def _ask_qty(ev: Event, ch: Channel) -> None:
     await _set_state(ev, S_QTY, data)
 
     text = (
-        f"📅 <b>{fmt_date(data['date'])}</b>\n"
-        f"🥐 Сет дня: <b>{esc(breakfast['title'] if breakfast else '—')}</b>\n"
+        f"📅 <b>{fmt_date(data['date'])}</b>\n\n"
+        f"🥐 <b>{esc(breakfast['title'] if breakfast else '—')}</b>"
     )
     if breakfast and breakfast["description"]:
-        text += f"\n{esc(breakfast['description'])}\n"
+        text += "\n" + esc(breakfast["description"])
     text += (
-        f"\n💰 {fmt_money(price)} за сет\n\n"
+        f"\n\n💰 {fmt_money(price)} за сет\n\n"
         f"🔢 <b>Сколько наборов привезти?</b>"
     )
     numbers = [Btn(text=str(n), data=f"g:qty:{n}") for n in range(low, high + 1)]
@@ -584,24 +604,20 @@ async def _show_confirm(ev: Event, ch: Channel) -> None:
     lines = [
         "🧾 <b>Проверьте заказ</b>",
         "",
-        f"📅 Дата: <b>{fmt_date(data['date'])}</b>",
-        f"🥐 Сет: <b>{esc(breakfast['title'] if breakfast else '—')}</b>",
-        f"🔢 Количество: <b>{qty}</b> {plural(qty, 'набор', 'набора', 'наборов')}",
-        f"🏢 Объект: {esc(obj['title'])}",
-    ]
-    if obj["address"]:
-        lines.append(f"📍 Адрес: {esc(obj['address'])}")
-    lines += [
-        f"🚪 Апартаменты: <b>{esc(data.get('apartment', ''))}</b>",
-        f"📞 Телефон: {esc(fmt_phone(data.get('phone', '')))}",
+        f"📅 <b>{fmt_date(data['date'])}</b>",
+        f"🥐 {esc(breakfast['title'] if breakfast else '—')}",
+        f"🔢 {qty} {plural(qty, 'набор', 'набора', 'наборов')}",
+        f"📍 {esc(obj['address'] or obj['title'])}",
+        f"🚪 Апартаменты {esc(data.get('apartment', ''))}",
+        f"📞 {esc(fmt_phone(data.get('phone', '')))}",
     ]
     if data.get("comment"):
-        lines.append(f"💬 Комментарий: {esc(data['comment'])}")
+        lines.append(f"💬 {esc(data['comment'])}")
     lines += [
         "",
         f"💰 {fmt_money(price)} × {qty} = <b>{fmt_money(total)}</b>",
         "",
-        "Всё верно?",
+        "Всё верно? Любой пункт ещё можно поменять.",
     ]
     kb = [
         [Btn(text="✅ Подтвердить заказ", data="g:confirm", intent="positive")],

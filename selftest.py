@@ -28,7 +28,7 @@ from app import courier, db, repo, statuses  # noqa: E402
 from app.channels import base  # noqa: E402
 from app.channels.base import Channel, Event, Out  # noqa: E402
 from app.router import route  # noqa: E402
-from app.utils import today  # noqa: E402
+from app.utils import fmt_date_iso, today  # noqa: E402
 
 OK, FAIL = "✅", "❌"
 failures: list[str] = []
@@ -48,6 +48,7 @@ class FakeChannel(Channel):
         self.title = name
         self.username = "fatucci_test_bot"
         self.sent: list[tuple[str, Out]] = []
+        self.invoices: list[dict] = []
         self._id = 0
 
     async def send(self, chat_id: str, out: Out) -> str:
@@ -76,6 +77,14 @@ class FakeChannel(Channel):
     async def download_photo(self, file_id: str, dest) -> bool:
         return False
 
+    async def send_invoice(self, chat_id, title, description, payload, amount_kop,
+                           provider_token, label="К оплате", provider_data="") -> tuple[bool, str]:
+        self.invoices.append({"chat_id": str(chat_id), "title": title,
+                              "description": description, "payload": payload,
+                              "amount": amount_kop, "token": provider_token})
+        self.sent.append((str(chat_id), Out(text=f"[счёт] {title} — {amount_kop} коп.")))
+        return True, ""
+
     # --- помощники теста ---
     def last(self) -> Out:
         return self.sent[-1][1]
@@ -97,6 +106,7 @@ class FakeChannel(Channel):
 
     def clear(self) -> None:
         self.sent.clear()
+        self.invoices.clear()
 
 
 GUEST = "555"
@@ -117,7 +127,7 @@ async def main() -> None:
     ch = FakeChannel("tg")
     base.REGISTRY["tg"] = ch
     await db.init_db()
-    await repo.set_setting("pay_enabled", "0")   # ЮKassa в тесте не дёргаем
+    await repo.set_setting("pay_enabled", "0")   # оплату включаем ниже, отдельным блоком
 
     print("\n— Сценарий гостя —")
     await route(guest_event("start", payload="demo1"), ch)
@@ -387,6 +397,76 @@ async def main() -> None:
     check(mx.start_link("demo1") == "https://max.ru/fatucci_max_bot?start=demo1",
           "MAX: ссылка для QR собирается верно")
     await mx.close()
+
+    print("\n— Оплата через PayMaster —")
+    from app import orders_service, payments
+    TEST_TOKEN = "123456789:TEST:abcdef0123456789abcd"
+    check(payments.token_looks_valid(TEST_TOKEN), "токен провайдера распознан")
+    check(payments.is_test(TEST_TOKEN), "режим определён как тестовый")
+    check(not payments.token_looks_valid("test_abc"), "чужой формат ключа отбраковывается")
+    check(payments.parse_payload(payments.invoice_payload(42)) == 42,
+          "метка заказа в счёте читается обратно")
+
+    await repo.set_setting("pm_token", TEST_TOKEN)
+    await repo.set_setting("pay_enabled", "1")
+    ok, message = await payments.check_setup()
+    check(ok and "тестовый" in message.lower(), "проверка настройки предупреждает о тест-режиме")
+
+    ch.clear()
+    await route(guest_event("start", payload="demo1"), ch)
+    await route(guest_event("callback", payload="g:order", callback_id="p1"), ch)
+    date_btn = ch.find_button("g:date:")
+    await route(guest_event("callback", payload=date_btn, callback_id="p2"), ch)
+    await route(guest_event("callback", payload="g:qty:1", callback_id="p3"), ch)
+    await route(guest_event("callback", payload="g:reapt", callback_id="p4"), ch)
+    await route(guest_event("callback", payload="g:rephone", callback_id="p5"), ch)
+    await route(guest_event("callback", payload="g:skip", callback_id="p6"), ch)
+    await route(guest_event("callback", payload="g:confirm", callback_id="p7"), ch)
+    pay_order = (await repo.list_orders(limit=1))[0]
+
+    ch.clear()
+    await route(admin_event("callback", chat_id="-100777",
+                            payload=f"a:ord:{pay_order['id']}:{statuses.ACCEPTED}",
+                            callback_id="p8"), ch)
+    check(len(ch.invoices) == 1, "при принятии в работу гостю выставлен счёт")
+    if ch.invoices:
+        inv = ch.invoices[0]
+        check(inv["amount"] == pay_order["total_kop"], "сумма счёта совпадает с заказом")
+        check(inv["token"] == TEST_TOKEN, "счёт выставлен с токеном провайдера")
+        check(len(inv["title"]) <= 32 and len(inv["description"]) <= 255,
+              "заголовок и описание счёта укладываются в лимиты Telegram")
+        check(inv["chat_id"] == GUEST, "счёт ушёл именно гостю")
+
+    ch.clear()
+    await route(guest_event("payment", payload=payments.invoice_payload(pay_order["id"]),
+                            text=""), ch)
+    pay_order = await repo.get_order(pay_order["id"])
+    check(pay_order["status"] == statuses.PAID, "после оплаты заказ автоматически «оплачен»")
+    check(pay_order["paid_at"] != "", "время оплаты зафиксировано")
+    check("оплачено" in ch.texts().lower(), "гостю пришло подтверждение оплаты")
+
+    ch.clear()
+    await route(guest_event("payment", payload="order:999999"), ch)
+    check(len(ch.sent) == 0, "оплата по несуществующему заказу не роняет бота")
+
+    max_ch = FakeChannel("max")
+    base.REGISTRY["max"] = max_ch
+    max_order = await repo.create_order(
+        channel="max", ext_id="42", chat_id="900", object_id=1,
+        object_title="Тест", object_address="Адрес", set_id=1, set_title="Сет",
+        delivery_date=fmt_date_iso(today()), qty=1, apartment="7", phone="+79990000000",
+        price_kop=90000, total_kop=90000, status=statuses.NEW, source_code="demo1")
+    ok, error = await orders_service.send_invoice(max_order)
+    check(not ok and not error, "в MAX счёт не выставляется — там нет встроенных платежей")
+    check(len(max_ch.invoices) == 0, "и не пытается: гостю MAX счёт не уходит")
+
+    max_ch.clear()
+    await orders_service.change_status(max_order["id"], statuses.ACCEPTED, actor="тест")
+    check("менеджер свяжется" in max_ch.texts().lower(),
+          "гость в MAX получает сообщение, что с оплатой поможет менеджер")
+    base.REGISTRY.pop("max", None)
+
+    await repo.set_setting("pay_enabled", "0")
 
     print("\n— MAX подключается из админ-панели —")
     import main as botmain

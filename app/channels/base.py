@@ -45,7 +45,7 @@ class Event:
     channel: str
     user_id: str
     chat_id: str
-    kind: str                     # start | text | callback | contact
+    kind: str                     # start | text | callback | contact | payment
     text: str = ""
     payload: str = ""             # start-payload или callback-данные
     phone: str = ""
@@ -97,6 +97,12 @@ class Channel(ABC):
     async def send_file(self, chat_id: str, path: str, caption: str = "") -> bool:
         """Отправить файл (нужно только админ-панели, поэтому не обязателен для канала)."""
         return False
+
+    async def send_invoice(self, chat_id: str, title: str, description: str, payload: str,
+                           amount_kop: int, provider_token: str, label: str = "К оплате",
+                           provider_data: str = "") -> tuple[bool, str]:
+        """Счёт на оплату. Есть только в Telegram — в MAX встроенных платежей нет."""
+        return False, "В этом мессенджере встроенная оплата недоступна"
 
 
 #: Заполняется при старте в main.py — {'tg': TelegramChannel, 'max': MaxChannel}

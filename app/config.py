@@ -87,11 +87,9 @@ class Config:
     orders_chat_id: str = field(default_factory=lambda: env("ORDERS_CHAT_ID", "ORDERS_CHAT"))
     tz_offset: int = field(default_factory=lambda: env_int("TZ_OFFSET", default=3))
 
-    yookassa_shop_id: str = field(
-        default_factory=lambda: env("YOOKASSA_SHOP_ID", "YK_SHOP_ID")
-    )
-    yookassa_secret: str = field(
-        default_factory=lambda: env("YOOKASSA_SECRET_KEY", "YK_SECRET_KEY")
+    # Токен платёжного провайдера от @BotFather (PayMaster)
+    provider_token: str = field(
+        default_factory=lambda: env("PAYMENT_PROVIDER_TOKEN", "PROVIDER_TOKEN", "PAYMASTER_TOKEN")
     )
 
     db_path: Path = field(

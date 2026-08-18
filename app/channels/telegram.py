@@ -14,10 +14,12 @@ from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
     FSInputFile,
+    LabeledPrice,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
     Message,
+    PreCheckoutQuery,
     ReplyKeyboardMarkup,
     ReplyKeyboardRemove,
 )
@@ -141,6 +143,36 @@ class TelegramChannel(Channel):
             log.warning("TG send_file error: %s", exc)
             return False
 
+    async def send_invoice(
+        self,
+        chat_id: str,
+        title: str,
+        description: str,
+        payload: str,
+        amount_kop: int,
+        provider_token: str,
+        label: str = "К оплате",
+        provider_data: str = "",
+    ) -> tuple[bool, str]:
+        """Счёт на оплату встроенными платежами Telegram. -> (успех, текст ошибки)."""
+        try:
+            await self.bot.send_invoice(
+                chat_id=chat_id,
+                title=title,
+                description=description,
+                payload=payload,
+                provider_token=provider_token,
+                currency="RUB",
+                prices=[LabeledPrice(label=label[:32], amount=int(amount_kop))],
+                provider_data=provider_data or None,
+                need_phone_number=False,
+                is_flexible=False,
+            )
+            return True, ""
+        except TelegramAPIError as exc:
+            log.warning("TG send_invoice error (%s): %s", chat_id, exc)
+            return False, str(exc)
+
     async def send_bytes(self, chat_id: str, data: bytes, filename: str, caption: str = "") -> bool:
         try:
             await self.bot.send_photo(
@@ -229,6 +261,23 @@ class TelegramChannel(Channel):
         @dp.message(F.text)
         async def _text(message: Message) -> None:
             await route(self._event(message, "text", text=message.text or ""), self)
+
+        @dp.pre_checkout_query()
+        async def _pre_checkout(query: PreCheckoutQuery) -> None:
+            """Telegram спрашивает, можно ли проводить платёж. Отвечаем в течение 10 секунд."""
+            try:
+                await query.answer(ok=True)
+            except TelegramAPIError as exc:
+                log.warning("TG pre_checkout error: %s", exc)
+
+        @dp.message(F.successful_payment)
+        async def _paid(message: Message) -> None:
+            payment = message.successful_payment
+            ev = self._event(message, "payment", text="")
+            ev.payload = payment.invoice_payload
+            ev.raw["charge_id"] = payment.provider_payment_charge_id or ""
+            ev.raw["amount"] = payment.total_amount
+            await route(ev, self)
 
         @dp.callback_query()
         async def _callback(query: CallbackQuery) -> None:

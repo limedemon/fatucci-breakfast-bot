@@ -6,7 +6,7 @@ import logging
 import aiosqlite
 
 from . import notify, payments, repo, statuses
-from .channels.base import Btn
+from .channels.base import TG, Btn, Out, get_channel
 from .utils import fmt_money, now
 
 log = logging.getLogger(__name__)
@@ -78,42 +78,64 @@ async def _notify_guest(order: Row, note: str = "") -> None:
 
 async def _send_payment_request(order: Row) -> None:
     """Заказ принят в работу — просим гостя оплатить."""
-    payment_url, error = await ensure_payment_link(order)
     text = await notify.guest_status_text(order, "status_accepted")
-    if payment_url:
-        kb = [[Btn(text=f"💳 Оплатить {fmt_money(order['total_kop'])}", url=payment_url)]]
-        kb.append([Btn(text="❌ Отменить заказ", data=f"g:cancel:{order['id']}", intent="negative")])
-        await notify.notify_guest(order, text, kb)
+    ok, error = await send_invoice(order, text)
+    if ok:
         return
 
     fallback = await repo.render_text("payment_unavailable", number=order["number"])
     await notify.notify_guest(order, fallback)
-    await notify.send_to_admins(
-        f"⚠️ Заказ №{order['number']}: не удалось создать ссылку на оплату.\n"
-        f"{error}\n\nПроверьте /admin → 💳 Оплата."
-    )
+    if error:
+        await notify.send_to_admins(
+            f"⚠️ Заказ <b>№{order['number']}</b>: счёт на оплату не выставлен.\n"
+            f"{error}\n\nГостю отправлено сообщение, что с оплатой поможет менеджер."
+        )
 
 
-async def ensure_payment_link(order: Row) -> tuple[str, str]:
-    """Вернуть действующую ссылку на оплату, создав платёж при необходимости."""
+async def send_invoice(order: Row, intro: str = "") -> tuple[bool, str]:
+    """Выставить гостю счёт. Возвращает (получилось, причина отказа)."""
+    channel = get_channel(order["channel"])
+    if channel is None:
+        return False, "Канал недоступен"
+
     if not await payments.is_enabled():
-        return "", "Онлайн-оплата выключена или не настроена."
-    if order["payment_url"] and order["payment_id"]:
-        status = await payments.payment_status(order["payment_id"])
-        if status in ("", payments.STATUS_PENDING, payments.STATUS_WAITING):
-            return order["payment_url"], ""
-    payment_id, url, error = await payments.create_payment(order)
-    if not url:
-        return "", error
-    await repo.update_order(order["id"], payment_id=payment_id, payment_url=url)
-    return url, ""
+        return False, "Онлайн-оплата выключена или токен не задан (/admin → 💳 Оплата)"
+
+    if order["channel"] != TG:
+        # в MAX встроенных платежей нет — счёт выставить физически нечем
+        return False, ""
+
+    if order["total_kop"] < payments.MIN_AMOUNT_KOP:
+        return False, (f"Сумма {fmt_money(order['total_kop'])} меньше минимальной "
+                       f"для оплаты ({fmt_money(payments.MIN_AMOUNT_KOP)})")
+
+    target = order["chat_id"] or order["ext_id"]
+    if intro:
+        await channel.send(target, Out(text=intro))
+
+    ok, error = await channel.send_invoice(
+        chat_id=target,
+        title=payments.invoice_title(order),
+        description=payments.invoice_description(order),
+        payload=payments.invoice_payload(order["id"]),
+        amount_kop=order["total_kop"],
+        provider_token=await payments.provider_token(),
+        label=f"{order['set_title']} × {order['qty']}"[:32] or "Завтрак",
+        provider_data=await payments.provider_data(),
+    )
+    if ok:
+        await repo.add_event(order["id"], order["status"], "бот", "Выставлен счёт на оплату")
+    return ok, error
 
 
-async def apply_payment_success(order: Row) -> None:
-    """Платёж подтверждён ЮKassa."""
+async def apply_payment_success(order: Row, charge_id: str = "") -> None:
+    """Платёж подтверждён Telegram/PayMaster."""
     if order["status"] in (statuses.PAID, statuses.DELIVERED, statuses.RECEIVED):
         return
-    await change_status(order["id"], statuses.PAID, actor="ЮKassa", note="Оплата подтверждена")
+    if charge_id:
+        await repo.update_order(order["id"], payment_id=charge_id)
+    await change_status(order["id"], statuses.PAID, actor="PayMaster",
+                        note="Оплата подтверждена Telegram")
 
 
 async def guest_cancel(order_id: int, ext_id: str, channel: str) -> tuple[bool, str]:

@@ -7,10 +7,10 @@
    ни в большинстве сборок Linux, ни в certifi — без него бот к MAX не
    подключится вообще. Корневые сертификаты лежат в `app/certs/` и
    добавляются в доверенные **только для соединений с MAX**; для Telegram
-   и ЮKassa остаётся обычный набор.
+   остаётся обычный набор.
 
-2. **ЮKassa**. `api.yookassa.ru` подписан HARICA — этого корня тоже может не быть
-   в системном хранилище Windows, зато он есть в certifi.
+2. **Windows**. Системное хранилище сертификатов бывает неполным, поэтому
+   всему процессу подставляется набор certifi — иначе падает даже aiogram.
 
 Проверка сертификатов нигде не отключается: мы только добавляем доверенные
 корни, а не ослабляем защиту.
@@ -42,7 +42,7 @@ def apply_ca_bundle() -> None:
 
 
 def default_ssl() -> ssl.SSLContext:
-    """Обычное доверие (certifi): Telegram, ЮKassa."""
+    """Обычное доверие (certifi): Telegram и всё остальное."""
     global _default_ctx
     if _default_ctx is None:
         _default_ctx = ssl.create_default_context(cafile=certifi.where())
