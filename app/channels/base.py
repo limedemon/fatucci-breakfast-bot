@@ -1,0 +1,111 @@
+"""Общий контракт для каналов (Telegram и MAX).
+
+Вся бизнес-логика написана против этих типов, поэтому один и тот же сценарий
+работает в обоих мессенджерах без дублирования кода.
+"""
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from typing import Optional
+
+TG = "tg"
+MAX = "max"
+
+CHANNEL_TITLES = {TG: "Telegram", MAX: "MAX"}
+
+
+@dataclass
+class Btn:
+    """Кнопка под сообщением."""
+
+    text: str
+    data: str = ""            # callback-данные
+    url: str = ""             # кнопка-ссылка
+    contact: bool = False     # запрос контакта (телефона)
+    intent: str = ""          # 'positive' / 'negative' — подсветка кнопки в MAX
+
+
+@dataclass
+class Out:
+    """Исходящее сообщение в канало-независимом виде."""
+
+    text: str = ""
+    kb: Optional[list[list[Btn]]] = None
+    photo: str = ""               # путь к локальному файлу
+    reply_contact: str = ""       # подпись кнопки «Поделиться контактом»
+    remove_reply_kb: bool = False
+    disable_preview: bool = True
+
+
+@dataclass
+class Event:
+    """Входящее событие в канало-независимом виде."""
+
+    channel: str
+    user_id: str
+    chat_id: str
+    kind: str                     # start | text | callback | contact
+    text: str = ""
+    payload: str = ""             # start-payload или callback-данные
+    phone: str = ""
+    username: str = ""
+    full_name: str = ""
+    message_id: str = ""
+    callback_id: str = ""
+    raw: dict = field(default_factory=dict)
+
+    @property
+    def key(self) -> tuple[str, str]:
+        return self.channel, str(self.user_id)
+
+
+class Channel(ABC):
+    """Адаптер конкретного мессенджера."""
+
+    name: str = ""
+    title: str = ""
+    username: str = ""   # username бота в этом мессенджере (нужен для QR-ссылок)
+
+    @abstractmethod
+    async def send(self, chat_id: str, out: Out) -> str:
+        """Отправить сообщение. Возвращает id сообщения (или '' если недоступно)."""
+
+    @abstractmethod
+    async def edit(self, chat_id: str, message_id: str, out: Out) -> bool:
+        """Отредактировать сообщение. False — если не получилось (тогда шлём новое)."""
+
+    @abstractmethod
+    async def answer_callback(self, callback_id: str, text: str = "") -> None:
+        """Ответить на нажатие кнопки (всплывающее уведомление)."""
+
+    @abstractmethod
+    def start_link(self, payload: str = "") -> str:
+        """Ссылка на бота с deep-link параметром (для QR-кодов)."""
+
+    async def send_or_edit(self, chat_id: str, message_id: str, out: Out) -> str:
+        """Отредактировать, а если не вышло — отправить заново."""
+        if message_id and not out.photo and not out.reply_contact:
+            if await self.edit(chat_id, message_id, out):
+                return message_id
+        return await self.send(chat_id, out)
+
+    async def reply_to_callback(self, ev: "Event", out: Out) -> str:
+        """Обновить сообщение, к которому прикреплена нажатая кнопка."""
+        return await self.send_or_edit(ev.chat_id, ev.message_id, out)
+
+    async def send_file(self, chat_id: str, path: str, caption: str = "") -> bool:
+        """Отправить файл (нужно только админ-панели, поэтому не обязателен для канала)."""
+        return False
+
+
+#: Заполняется при старте в main.py — {'tg': TelegramChannel, 'max': MaxChannel}
+REGISTRY: dict[str, Channel] = {}
+
+
+def get_channel(name: str) -> Optional[Channel]:
+    return REGISTRY.get(name)
+
+
+def channel_title(name: str) -> str:
+    return CHANNEL_TITLES.get(name, name)
