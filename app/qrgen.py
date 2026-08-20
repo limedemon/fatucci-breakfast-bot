@@ -1,15 +1,16 @@
 """Генерация QR-кодов для объектов."""
 from __future__ import annotations
 
+from typing import Any
+
 import io
 
-import aiosqlite
 import qrcode
 from qrcode.constants import ERROR_CORRECT_H
 
 from .channels.base import MAX, TG, get_channel
 
-Row = aiosqlite.Row
+Row = Any
 
 
 def make_qr(url: str, box_size: int = 12) -> bytes:

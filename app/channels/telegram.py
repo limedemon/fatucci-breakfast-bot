@@ -1,8 +1,8 @@
 """Адаптер Telegram (aiogram 3)."""
 from __future__ import annotations
 
+import io
 import logging
-from pathlib import Path
 from typing import Awaitable, Callable, Optional
 
 from aiogram import Bot, Dispatcher, F
@@ -13,7 +13,6 @@ from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
     BufferedInputFile,
     CallbackQuery,
-    FSInputFile,
     LabeledPrice,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -24,7 +23,7 @@ from aiogram.types import (
     ReplyKeyboardRemove,
 )
 
-from .. import repo
+from .. import media, repo
 from .base import TG, Btn, Channel, Event, Out
 
 log = logging.getLogger(__name__)
@@ -68,15 +67,16 @@ class TelegramChannel(Channel):
         return ""
 
     async def _send_photo(self, chat_id: str, out: Out) -> str:
-        path = Path(out.photo)
-        if not path.exists():
+        key = out.photo
+        cached = await repo.get_media_ref(key, TG)
+        data = None if cached else await media.load(key)
+        if not cached and data is None:          # картинки нет — отправим просто текст
             plain = Out(text=out.text, kb=out.kb, reply_contact=out.reply_contact,
                         remove_reply_kb=out.remove_reply_kb)
             plain.photo = ""
             return await self.send(chat_id, plain)
 
-        cached = await repo.get_media_ref(str(path), TG)
-        photo: object = cached or FSInputFile(str(path))
+        photo: object = cached or BufferedInputFile(data or b"", _filename(key))
         long_text = len(out.text) > CAPTION_LIMIT
         caption = "" if long_text else out.text
         markup = None if long_text else self._markup(out)
@@ -85,19 +85,23 @@ class TelegramChannel(Channel):
                 chat_id=chat_id, photo=photo, caption=caption or None, reply_markup=markup
             )
         except TelegramAPIError as exc:
-            if cached:  # протухший file_id — грузим файл заново
-                await repo.drop_media(str(path), TG)
-                msg = await self.bot.send_photo(
-                    chat_id=chat_id,
-                    photo=FSInputFile(str(path)),
-                    caption=caption or None,
-                    reply_markup=markup,
-                )
-            else:
+            if not cached:
                 log.warning("TG send_photo error: %s", exc)
                 return ""
+            # протухший file_id — берём картинку из базы и шлём заново
+            await repo.drop_media(key, TG)
+            data = await media.load(key)
+            if data is None:
+                log.warning("TG send_photo: картинка %s недоступна (%s)", key, exc)
+                return ""
+            msg = await self.bot.send_photo(
+                chat_id=chat_id,
+                photo=BufferedInputFile(data, _filename(key)),
+                caption=caption or None,
+                reply_markup=markup,
+            )
         if msg.photo:
-            await repo.set_media_ref(str(path), TG, msg.photo[-1].file_id)
+            await repo.set_media_ref(key, TG, msg.photo[-1].file_id)
         if long_text:
             tail = await self.bot.send_message(
                 chat_id=chat_id, text=_cut(out.text, TEXT_LIMIT), reply_markup=self._markup(out)
@@ -135,12 +139,14 @@ class TelegramChannel(Channel):
         except TelegramAPIError:
             pass
 
-    async def send_file(self, chat_id: str, path: str, caption: str = "") -> bool:
+    async def send_document(self, chat_id: str, data: bytes, filename: str,
+                            caption: str = "") -> bool:
         try:
-            await self.bot.send_document(chat_id, FSInputFile(path), caption=caption or None)
+            await self.bot.send_document(
+                chat_id, BufferedInputFile(data, filename), caption=caption or None)
             return True
         except TelegramAPIError as exc:
-            log.warning("TG send_file error: %s", exc)
+            log.warning("TG send_document error: %s", exc)
             return False
 
     async def send_invoice(
@@ -183,14 +189,15 @@ class TelegramChannel(Channel):
             log.warning("TG send_bytes error: %s", exc)
             return False
 
-    async def download_photo(self, file_id: str, dest: Path) -> bool:
+    async def download_bytes(self, file_id: str) -> bytes:
+        """Скачать присланное фото в память — на диск ничего не кладём."""
         try:
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            await self.bot.download(file_id, destination=dest)
-            return True
+            buffer = io.BytesIO()
+            await self.bot.download(file_id, destination=buffer)
+            return buffer.getvalue()
         except TelegramAPIError as exc:
             log.warning("TG download error: %s", exc)
-            return False
+            return b""
 
     def start_link(self, payload: str = "") -> str:
         base = f"https://t.me/{self.username}" if self.username else "https://t.me/"
@@ -324,6 +331,11 @@ class TelegramChannel(Channel):
 
     async def close(self) -> None:
         await self.bot.session.close()
+
+
+def _filename(key: str) -> str:
+    """Имя файла для Telegram — из ключа картинки."""
+    return (key.replace(":", "_").replace("/", "_").replace("\\", "_") or "photo") + ".jpg"
 
 
 def _full_name(first: Optional[str], last: Optional[str]) -> str:

@@ -6,12 +6,11 @@ import uuid
 from datetime import date
 from typing import Any, Optional, Sequence
 
-import aiosqlite
-
 from . import db, statuses
-from .utils import fmt_money, safe_format
+from .utils import fmt_money, safe_format, utc_stamp
 
-Row = aiosqlite.Row
+#: строка результата: aiosqlite.Row или asyncpg.Record — обе ведут себя как словарь
+Row = Any
 
 
 # =========================================================== настройки/тексты
@@ -106,12 +105,12 @@ async def get_object(object_id: int | None) -> Optional[Row]:
 
 
 async def get_object_by_code(code: str) -> Optional[Row]:
-    return await db.fetchone("SELECT * FROM objects WHERE code = ? COLLATE NOCASE", (code,))
+    return await db.fetchone("SELECT * FROM objects WHERE LOWER(code) = LOWER(?)", (code.strip(),))
 
 
 async def code_taken(code: str, exclude_id: int = 0) -> bool:
     row = await db.fetchone(
-        "SELECT id FROM objects WHERE code = ? COLLATE NOCASE AND id <> ?", (code, exclude_id)
+        "SELECT id FROM objects WHERE LOWER(code) = LOWER(?) AND id <> ?", (code.strip(), exclude_id)
     )
     return row is not None
 
@@ -120,7 +119,7 @@ async def create_object(**fields: Any) -> int:
     data = {k: v for k, v in fields.items() if k in OBJECT_FIELDS}
     cols = ", ".join(data)
     marks = ", ".join("?" for _ in data)
-    return await db.execute(f"INSERT INTO objects ({cols}) VALUES ({marks})", list(data.values()))
+    return await db.insert(f"INSERT INTO objects ({cols}) VALUES ({marks})", list(data.values()))
 
 
 async def update_object(object_id: int, **fields: Any) -> None:
@@ -157,7 +156,7 @@ async def create_set(**fields: Any) -> int:
     data = {k: v for k, v in fields.items() if k in SET_FIELDS}
     cols = ", ".join(data)
     marks = ", ".join("?" for _ in data)
-    return await db.execute(f"INSERT INTO sets ({cols}) VALUES ({marks})", list(data.values()))
+    return await db.insert(f"INSERT INTO sets ({cols}) VALUES ({marks})", list(data.values()))
 
 
 async def update_set(set_id: int, **fields: Any) -> None:
@@ -244,8 +243,8 @@ async def upsert_user(
                chat_id   = CASE WHEN excluded.chat_id   <> '' THEN excluded.chat_id   ELSE users.chat_id   END,
                username  = CASE WHEN excluded.username  <> '' THEN excluded.username  ELSE users.username  END,
                full_name = CASE WHEN excluded.full_name <> '' THEN excluded.full_name ELSE users.full_name END,
-               last_seen = datetime('now')""",
-        (channel, str(ext_id), str(chat_id), username, full_name),
+               last_seen = ?""",
+        (channel, str(ext_id), str(chat_id), username, full_name, utc_stamp()),
     )
     row = await db.fetchone(
         "SELECT * FROM users WHERE channel = ? AND ext_id = ?", (channel, str(ext_id))
@@ -344,7 +343,7 @@ async def save_session(
     await db.execute(
         """INSERT INTO sessions (channel, ext_id, chat_id, state, data, object_id,
                                  last_msg_id, reminded, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
            ON CONFLICT(channel, ext_id) DO UPDATE SET
                chat_id     = CASE WHEN excluded.chat_id <> '' THEN excluded.chat_id ELSE sessions.chat_id END,
                state       = excluded.state,
@@ -352,17 +351,17 @@ async def save_session(
                object_id   = excluded.object_id,
                last_msg_id = excluded.last_msg_id,
                reminded    = excluded.reminded,
-               updated_at  = datetime('now')""",
+               updated_at  = excluded.updated_at""",
         (channel, str(ext_id), str(chat_id), state, json.dumps(data, ensure_ascii=False),
-         object_id, last_msg_id, reminded),
+         object_id, last_msg_id, reminded, utc_stamp()),
     )
 
 
 async def clear_session(channel: str, ext_id: str) -> None:
     await db.execute(
-        "UPDATE sessions SET state = '', data = '{}', reminded = 0, updated_at = datetime('now') "
+        "UPDATE sessions SET state = '', data = '{}', reminded = 0, updated_at = ? "
         "WHERE channel = ? AND ext_id = ?",
-        (channel, str(ext_id)),
+        (utc_stamp(), channel, str(ext_id)),
     )
 
 
@@ -376,9 +375,9 @@ async def stale_sessions(older_than_min: int, max_hours: int) -> list[Row]:
     return await db.fetchall(
         """SELECT * FROM sessions
            WHERE state <> '' AND reminded = 0
-             AND updated_at <= datetime('now', ?)
-             AND updated_at >= datetime('now', ?)""",
-        (f"-{max(1, older_than_min)} minutes", f"-{max(2, max_hours)} hours"),
+             AND updated_at <= ?
+             AND updated_at >= ?""",
+        (utc_stamp(minutes=-max(1, older_than_min)), utc_stamp(hours=-max(2, max_hours))),
     )
 
 
@@ -398,7 +397,7 @@ async def create_order(**fields: Any) -> Row:
     data["number"] = f"tmp-{uuid.uuid4().hex[:16]}"
     cols = ", ".join(data)
     marks = ", ".join("?" for _ in data)
-    order_id = await db.execute(
+    order_id = await db.insert(
         f"INSERT INTO orders ({cols}) VALUES ({marks})", list(data.values())
     )
     prefix = await get_setting("order_prefix", "F")
@@ -416,8 +415,8 @@ async def update_order(order_id: int, **fields: Any) -> None:
         return
     sets = ", ".join(f"{k} = ?" for k in data)
     await db.execute(
-        f"UPDATE orders SET {sets}, updated_at = datetime('now') WHERE id = ?",
-        [*data.values(), order_id],
+        f"UPDATE orders SET {sets}, updated_at = ? WHERE id = ?",
+        [*data.values(), utc_stamp(), order_id],
     )
 
 
@@ -427,7 +426,7 @@ async def get_order(order_id: int) -> Optional[Row]:
 
 async def get_order_by_number(number: str) -> Optional[Row]:
     return await db.fetchone(
-        "SELECT * FROM orders WHERE number = ? COLLATE NOCASE", (number.strip(),)
+        "SELECT * FROM orders WHERE LOWER(number) = LOWER(?)", (number.strip(),)
     )
 
 
@@ -437,8 +436,8 @@ async def get_order_by_payment(payment_id: str) -> Optional[Row]:
 
 async def set_status(order_id: int, status: str, actor: str = "", note: str = "") -> None:
     await db.execute(
-        "UPDATE orders SET status = ?, updated_at = datetime('now') WHERE id = ?",
-        (status, order_id),
+        "UPDATE orders SET status = ?, updated_at = ? WHERE id = ?",
+        (status, utc_stamp(), order_id),
     )
     await add_event(order_id, status, actor, note)
 
@@ -537,7 +536,7 @@ async def orders_for_delivery(day: str, status_list: Sequence[str]) -> list[Row]
         f"""SELECT * FROM orders
             WHERE delivery_date = ? AND status IN ({marks})
             ORDER BY object_address, object_title,
-                     CAST(apartment AS INTEGER), apartment, id""",
+                     LENGTH(apartment), apartment, id""",
         [day, *status_list],
     )
 
@@ -552,8 +551,8 @@ async def pending_payments() -> list[Row]:
 async def stats_by_object(date_from: str, date_to: str) -> list[Row]:
     return await db.fetchall(
         """SELECT o.object_id,
-                  COALESCE(ob.title, o.object_title) AS title,
-                  COALESCE(ob.group_title, '')       AS group_title,
+                  COALESCE(MAX(ob.title), MAX(o.object_title)) AS title,
+                  COALESCE(MAX(ob.group_title), '')            AS group_title,
                   COUNT(*)                           AS orders_count,
                   SUM(o.qty)                         AS sets_count,
                   SUM(CASE WHEN o.status IN ('paid','delivered','received')
@@ -614,7 +613,7 @@ async def create_offer(**fields: Any) -> int:
     data = {k: v for k, v in fields.items() if k in OFFER_FIELDS}
     cols = ", ".join(data)
     marks = ", ".join("?" for _ in data)
-    return await db.execute(f"INSERT INTO offers ({cols}) VALUES ({marks})", list(data.values()))
+    return await db.insert(f"INSERT INTO offers ({cols}) VALUES ({marks})", list(data.values()))
 
 
 async def update_offer(offer_id: int, **fields: Any) -> None:
@@ -654,15 +653,15 @@ async def drop_media(path: str, channel: str = "") -> None:
 
 # ================================================================== выгрузки
 async def save_digest(day: str, body: str, auto: bool) -> int:
-    return await db.execute(
+    return await db.insert(
         "INSERT INTO digests (d, body, auto) VALUES (?, ?, ?)", (day, body, 1 if auto else 0)
     )
 
 
 async def digest_exists_today(day: str) -> bool:
     row = await db.fetchone(
-        "SELECT id FROM digests WHERE d = ? AND auto = 1 AND created_at >= datetime('now', '-20 hours')",
-        (day,),
+        "SELECT id FROM digests WHERE d = ? AND auto = 1 AND created_at >= ?",
+        (day, utc_stamp(hours=-20)),
     )
     return row is not None
 

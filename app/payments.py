@@ -16,16 +16,14 @@
 from __future__ import annotations
 
 import logging
-from typing import Optional
-
-import aiosqlite
+from typing import Any, Optional
 
 from . import repo
 from .config import cfg
 from .utils import fmt_date
 
 log = logging.getLogger(__name__)
-Row = aiosqlite.Row
+Row = Any
 
 #: минимальная сумма платежа в копейках — Telegram не пропускает совсем мелкие
 MIN_AMOUNT_KOP = 6000

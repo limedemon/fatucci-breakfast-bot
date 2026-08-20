@@ -6,15 +6,14 @@
 from __future__ import annotations
 
 import csv
+import io
 import logging
 import re
 from datetime import timedelta
 from typing import Any, Callable, Optional
 
-import aiosqlite
-
-from . import (admins, courier, guide, notify, orders_service, payments, pricing,
-               qrgen, repo, statuses)
+from . import (admins, courier, guide, media, notify, orders_service, payments,
+               pricing, qrgen, repo, statuses)
 from .channels.base import MAX, TG, Btn, Channel, Event, Out
 from .config import cfg
 from .utils import (
@@ -35,7 +34,7 @@ from .utils import (
 )
 
 log = logging.getLogger(__name__)
-Row = aiosqlite.Row
+Row = Any
 
 PAGE = 6
 
@@ -1314,9 +1313,9 @@ async def _export_route(ev: Event, ch: Channel, args: list[str]) -> None:
         label = f"{days} дн."
 
     orders = await repo.list_orders(date_from=date_from, date_to=date_to, limit=100000)
-    path = cfg.export_dir / f"orders_{today().strftime('%Y%m%d')}.csv"
-    with path.open("w", newline="", encoding="utf-8-sig") as handle:
-        writer = csv.writer(handle, delimiter=";")
+    buffer = io.StringIO()
+    writer = csv.writer(buffer, delimiter=";", lineterminator="\r\n")
+    if True:
         writer.writerow([
             "Номер", "Создан", "Дата доставки", "Статус", "Канал", "Объект", "Адрес",
             "Апартаменты", "Сет", "Кол-во", "Цена", "Сумма", "Телефон", "Комментарий",
@@ -1332,8 +1331,10 @@ async def _export_route(ev: Event, ch: Channel, args: list[str]) -> None:
                 order["phone"], order["comment"], order["source_code"],
                 fmt_dt(order["paid_at"]) if order["paid_at"] else "",
             ])
-    sent = await ch.send_file(ev.chat_id, str(path),
-                             caption=f"📤 Заказы ({label}) — {len(orders)} шт.")
+    name = f"orders_{today().strftime('%Y%m%d')}.csv"
+    payload = buffer.getvalue().encode("utf-8-sig")
+    sent = await ch.send_document(ev.chat_id, payload, name,
+                                  caption=f"📤 Заказы ({label}) — {len(orders)} шт.")
     if not sent:
         await ch.send(ev.chat_id, Out(text="⚠️ Не удалось отправить файл."))
 
@@ -1467,13 +1468,12 @@ async def _in_field(ev: Event, ch: Channel, ctx: dict, text: str, photo: str) ->
         if not photo:
             await ch.send(ev.chat_id, Out(text="⚠️ Пришлите именно фотографию."))
             return
-        path = cfg.photos_dir / f"{entity}_{entity_id}.jpg"
-        ok = await ch.download_photo(photo, path)
-        if not ok:
+        data = await ch.download_bytes(photo)
+        key = media.key_for(entity, entity_id)
+        if not data or not await media.save(key, data):
             await ch.send(ev.chat_id, Out(text="⚠️ Не удалось сохранить фото."))
             return
-        await repo.drop_media(str(path))
-        value: Any = str(path)
+        value: Any = key
     else:
         value = _parse_value(kind, text)
         if value is None:
@@ -1534,9 +1534,9 @@ async def _in_broadcast(ev: Event, ch: Channel, ctx: dict, text: str, photo: str
     channels = [TG, MAX] if target == "all" else [target]
     photo_path = ""
     if photo:
-        photo_path = str(cfg.photos_dir / "broadcast.jpg")
-        await ch.download_photo(photo, cfg.photos_dir / "broadcast.jpg")
-        await repo.drop_media(photo_path)
+        data = await ch.download_bytes(photo)
+        if data and await media.save("broadcast", data):
+            photo_path = "broadcast"
     await ch.send(ev.chat_id, Out(text="📤 Рассылка запущена…"))
     ok, failed = await notify.broadcast(text, channels, photo_path)
     await ch.send(ev.chat_id, Out(

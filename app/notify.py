@@ -6,15 +6,13 @@ import json
 import logging
 from typing import Any, Iterable, Optional
 
-import aiosqlite
-
 from . import admins, repo, statuses
 from .channels.base import MAX, TG, Btn, Out, channel_title, get_channel
 from .config import cfg
 from .utils import esc, fmt_date, fmt_dt, fmt_money, fmt_phone
 
 log = logging.getLogger(__name__)
-Row = aiosqlite.Row
+Row = Any
 
 
 # ------------------------------------------------------------------ карточки

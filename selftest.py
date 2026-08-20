@@ -15,12 +15,21 @@ import sys
 import tempfile
 
 TMP = tempfile.mkdtemp(prefix="fatucci_test_")
-os.environ["DB_PATH"] = os.path.join(TMP, "test.db")
-os.environ.setdefault("TELEGRAM_TOKEN", "0:test")
-os.environ.setdefault("TELEGRAM_BOT_USERNAME", "fatucci_test_bot")
-os.environ.setdefault("MAX_BOT_USERNAME", "fatucci_test_bot")
-os.environ.setdefault("ADMIN_IDS", "777")
-os.environ.setdefault("ORDERS_CHAT_ID", "-100777")
+# Тест полностью задаёт своё окружение, чтобы .env разработчика на него не влиял.
+# На PostgreSQL тест идёт только из selftest_pg.py — он задаёт DB_SCHEMA
+# и работает во временной схеме. Во всех остальных случаях принудительно
+# гасим DATABASE_URL, иначе .env увёл бы тест в боевую базу.
+if not os.getenv("DB_SCHEMA"):
+    for name in ("DATABASE_URL", "POSTGRES_URL", "POSTGRESQL_URL", "DB_URL"):
+        os.environ[name] = ""
+    os.environ["DB_PATH"] = os.path.join(TMP, "test.db")
+os.environ["TELEGRAM_TOKEN"] = "0:test"
+os.environ["TELEGRAM_BOT_USERNAME"] = "fatucci_test_bot"
+os.environ["MAX_BOT_USERNAME"] = "fatucci_test_bot"
+os.environ["MAX_TOKEN"] = ""
+os.environ["ADMIN_IDS"] = "777"
+os.environ["ORDERS_CHAT_ID"] = "-100777"
+os.environ["PAYMENT_PROVIDER_TOKEN"] = ""
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -66,16 +75,17 @@ class FakeChannel(Channel):
     def start_link(self, payload: str = "") -> str:
         return f"https://t.me/fatucci_test_bot?start={payload}"
 
-    async def send_file(self, chat_id: str, path: str, caption: str = "") -> bool:
-        self.sent.append((str(chat_id), Out(text=f"[файл] {path} {caption}")))
+    async def send_document(self, chat_id: str, data: bytes, filename: str,
+                            caption: str = "") -> bool:
+        self.sent.append((str(chat_id), Out(text=f"[файл] {filename} {len(data)}b {caption}")))
         return True
 
     async def send_bytes(self, chat_id: str, data: bytes, filename: str, caption: str = "") -> bool:
         self.sent.append((str(chat_id), Out(text=f"[png {len(data)}b] {filename}")))
         return True
 
-    async def download_photo(self, file_id: str, dest) -> bool:
-        return False
+    async def download_bytes(self, file_id: str) -> bytes:
+        return bytes([0x89]) + b"PNG" + b"0" * 64
 
     async def send_invoice(self, chat_id, title, description, payload, amount_kop,
                            provider_token, label="К оплате", provider_data="") -> tuple[bool, str]:
@@ -385,8 +395,9 @@ async def main() -> None:
     await route(guest_event("callback", payload=date_btn, callback_id="e2"), ch)
     session = await repo.get_session("tg", GUEST)
     check(session is not None and session["state"] != "", "черновик заказа сохранён в базе")
-    await db.execute("UPDATE sessions SET updated_at = datetime('now', '-90 minutes') "
-                     "WHERE channel = 'tg' AND ext_id = ?", (GUEST,))
+    from app.utils import utc_stamp
+    await db.execute("UPDATE sessions SET updated_at = ? "
+                     "WHERE channel = 'tg' AND ext_id = ?", (utc_stamp(minutes=-90), GUEST))
     from app import scheduler
     ch.clear()
     await scheduler.reminder_tick()

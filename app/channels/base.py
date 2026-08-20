@@ -32,7 +32,7 @@ class Out:
 
     text: str = ""
     kb: Optional[list[list[Btn]]] = None
-    photo: str = ""               # путь к локальному файлу
+    photo: str = ""               # ключ картинки в базе (см. app/media.py)
     reply_contact: str = ""       # подпись кнопки «Поделиться контактом»
     remove_reply_kb: bool = False
     disable_preview: bool = True
@@ -94,9 +94,14 @@ class Channel(ABC):
         """Обновить сообщение, к которому прикреплена нажатая кнопка."""
         return await self.send_or_edit(ev.chat_id, ev.message_id, out)
 
-    async def send_file(self, chat_id: str, path: str, caption: str = "") -> bool:
-        """Отправить файл (нужно только админ-панели, поэтому не обязателен для канала)."""
+    async def send_document(self, chat_id: str, data: bytes, filename: str,
+                            caption: str = "") -> bool:
+        """Отправить файл из памяти (нужно только админ-панели)."""
         return False
+
+    async def download_bytes(self, file_id: str) -> bytes:
+        """Скачать присланный файл в память."""
+        return b''
 
     async def send_invoice(self, chat_id: str, title: str, description: str, payload: str,
                            amount_kop: int, provider_token: str, label: str = "К оплате",

@@ -1,17 +1,36 @@
-"""SQLite-хранилище: соединение, схема, первичное наполнение."""
+"""Хранилище: PostgreSQL на хостинге, SQLite — для локальной работы и тестов.
+
+Какой движок использовать, решает переменная окружения ``DATABASE_URL``:
+задана — работаем с PostgreSQL, не задана — с файлом SQLite рядом с кодом.
+
+Весь SQL в проекте написан в одном диалекте (SQLite-подобном) и при работе
+с PostgreSQL переводится здесь:
+
+* плейсхолдеры ``?`` превращаются в ``$1, $2 …``;
+* ``INTEGER PRIMARY KEY AUTOINCREMENT`` — в ``SERIAL PRIMARY KEY``;
+* ``datetime('now')`` в схеме — в серверное время в том же текстовом формате;
+* ``BLOB`` — в ``BYTEA``.
+
+Времени вида ``datetime('now', '-45 minutes')`` в запросах намеренно нет:
+такие метки считаются в Python и передаются параметром (см. utils.utc_stamp).
+Так один и тот же запрос работает в обоих движках.
+"""
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from typing import Any, Iterable, Optional, Sequence
-
-import aiosqlite
 
 from .config import cfg
 
 log = logging.getLogger(__name__)
 
-_conn: Optional[aiosqlite.Connection] = None
+#: True — работаем с PostgreSQL
+IS_PG = bool(cfg.database_url)
+
+_sqlite_conn: Any = None
+_pg_pool: Any = None
 _lock = asyncio.Lock()
 
 SCHEMA = """
@@ -66,20 +85,20 @@ CREATE TABLE IF NOT EXISTS rotation_date (
 );
 
 CREATE TABLE IF NOT EXISTS users (
-    id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    channel     TEXT NOT NULL,
-    ext_id      TEXT NOT NULL,
-    chat_id     TEXT NOT NULL DEFAULT '',
-    username    TEXT NOT NULL DEFAULT '',
-    full_name   TEXT NOT NULL DEFAULT '',
-    phone       TEXT NOT NULL DEFAULT '',
-    apartment   TEXT NOT NULL DEFAULT '',
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel       TEXT NOT NULL,
+    ext_id        TEXT NOT NULL,
+    chat_id       TEXT NOT NULL DEFAULT '',
+    username      TEXT NOT NULL DEFAULT '',
+    full_name     TEXT NOT NULL DEFAULT '',
+    phone         TEXT NOT NULL DEFAULT '',
+    apartment     TEXT NOT NULL DEFAULT '',
     customer_name TEXT NOT NULL DEFAULT '',
-    object_id   INTEGER,
-    source_code TEXT NOT NULL DEFAULT '',
-    is_blocked  INTEGER NOT NULL DEFAULT 0,
-    created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-    last_seen   TEXT NOT NULL DEFAULT (datetime('now')),
+    object_id     INTEGER,
+    source_code   TEXT NOT NULL DEFAULT '',
+    is_blocked    INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+    last_seen     TEXT NOT NULL DEFAULT (datetime('now')),
     UNIQUE (channel, ext_id)
 );
 
@@ -153,6 +172,13 @@ CREATE TABLE IF NOT EXISTS offers (
     sort_order  INTEGER NOT NULL DEFAULT 100
 );
 
+CREATE TABLE IF NOT EXISTS media (
+    key        TEXT PRIMARY KEY,
+    data       BLOB NOT NULL,
+    mime       TEXT NOT NULL DEFAULT 'image/jpeg',
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS media_cache (
     path    TEXT NOT NULL,
     channel TEXT NOT NULL,
@@ -185,30 +211,89 @@ CREATE TABLE IF NOT EXISTS admin_state (
 );
 """
 
+#: серверное «сейчас» в том же текстовом виде, что и у SQLite
+PG_NOW = "to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')"
 
-async def connect() -> aiosqlite.Connection:
-    global _conn
-    if _conn is None:
+
+def _pg_schema(schema: str) -> str:
+    schema = schema.replace("INTEGER PRIMARY KEY AUTOINCREMENT", "SERIAL PRIMARY KEY")
+    schema = schema.replace("(datetime('now'))", PG_NOW)
+    schema = re.sub(r"\bBLOB\b", "BYTEA", schema)
+    return schema
+
+
+def _to_pg(sql: str) -> str:
+    """Заменить ? на $1, $2 … не трогая содержимое строковых литералов."""
+    out: list[str] = []
+    index = 0
+    in_string = False
+    for char in sql:
+        if char == "'":
+            in_string = not in_string
+            out.append(char)
+        elif char == "?" and not in_string:
+            index += 1
+            out.append(f"${index}")
+        else:
+            out.append(char)
+    return "".join(out)
+
+
+# ------------------------------------------------------------------ соединение
+async def connect() -> Any:
+    global _sqlite_conn, _pg_pool
+    if IS_PG:
+        if _pg_pool is None:
+            import asyncpg
+
+            settings = {"search_path": cfg.db_schema} if cfg.db_schema else None
+            _pg_pool = await asyncpg.create_pool(
+                cfg.database_url, min_size=1, max_size=5, command_timeout=30,
+                max_inactive_connection_lifetime=180, server_settings=settings,
+            )
+        return _pg_pool
+
+    if _sqlite_conn is None:
+        import aiosqlite
+
         pending = aiosqlite.connect(cfg.db_path)
         # поток соединения не должен удерживать процесс при аварийном выходе
         pending.daemon = True
-        _conn = await pending
-        _conn.row_factory = aiosqlite.Row
-        await _conn.execute("PRAGMA journal_mode=WAL")
-        await _conn.execute("PRAGMA busy_timeout=5000")
-        await _conn.commit()
-    return _conn
+        _sqlite_conn = await pending
+        _sqlite_conn.row_factory = aiosqlite.Row
+        await _sqlite_conn.execute("PRAGMA journal_mode=WAL")
+        await _sqlite_conn.execute("PRAGMA busy_timeout=5000")
+        await _sqlite_conn.commit()
+    return _sqlite_conn
 
 
 async def close() -> None:
-    global _conn
-    if _conn is not None:
-        await _conn.close()
-        _conn = None
+    global _sqlite_conn, _pg_pool
+    if _pg_pool is not None:
+        await _pg_pool.close()
+        _pg_pool = None
+    if _sqlite_conn is not None:
+        await _sqlite_conn.close()
+        _sqlite_conn = None
 
 
+# --------------------------------------------------------------------- запросы
 async def execute(sql: str, params: Sequence[Any] = ()) -> int:
     conn = await connect()
+    if IS_PG:
+        await conn.execute(_to_pg(sql), *params)
+        return 0
+    async with _lock:
+        cur = await conn.execute(sql, params)
+        await conn.commit()
+        return cur.lastrowid or 0
+
+
+async def insert(sql: str, params: Sequence[Any] = ()) -> int:
+    """INSERT, который возвращает id новой строки."""
+    conn = await connect()
+    if IS_PG:
+        return int(await conn.fetchval(_to_pg(sql) + " RETURNING id", *params))
     async with _lock:
         cur = await conn.execute(sql, params)
         await conn.commit()
@@ -217,21 +302,31 @@ async def execute(sql: str, params: Sequence[Any] = ()) -> int:
 
 async def executemany(sql: str, seq: Iterable[Sequence[Any]]) -> None:
     conn = await connect()
+    rows = [tuple(item) for item in seq]
+    if not rows:
+        return
+    if IS_PG:
+        await conn.executemany(_to_pg(sql), rows)
+        return
     async with _lock:
-        await conn.executemany(sql, list(seq))
+        await conn.executemany(sql, rows)
         await conn.commit()
 
 
-async def fetchall(sql: str, params: Sequence[Any] = ()) -> list[aiosqlite.Row]:
+async def fetchall(sql: str, params: Sequence[Any] = ()) -> list[Any]:
     conn = await connect()
+    if IS_PG:
+        return list(await conn.fetch(_to_pg(sql), *params))
     cur = await conn.execute(sql, params)
     rows = await cur.fetchall()
     await cur.close()
     return list(rows)
 
 
-async def fetchone(sql: str, params: Sequence[Any] = ()) -> Optional[aiosqlite.Row]:
+async def fetchone(sql: str, params: Sequence[Any] = ()) -> Optional[Any]:
     conn = await connect()
+    if IS_PG:
+        return await conn.fetchrow(_to_pg(sql), *params)
     cur = await conn.execute(sql, params)
     row = await cur.fetchone()
     await cur.close()
@@ -239,6 +334,10 @@ async def fetchone(sql: str, params: Sequence[Any] = ()) -> Optional[aiosqlite.R
 
 
 async def fetchval(sql: str, params: Sequence[Any] = (), default: Any = None) -> Any:
+    conn = await connect()
+    if IS_PG:
+        value = await conn.fetchval(_to_pg(sql), *params)
+        return default if value is None else value
     row = await fetchone(sql, params)
     if row is None:
         return default
@@ -246,6 +345,7 @@ async def fetchval(sql: str, params: Sequence[Any] = (), default: Any = None) ->
     return default if value is None else value
 
 
+# ------------------------------------------------------------------- миграции
 #: Колонки, добавленные уже после первого релиза.
 #: CREATE TABLE IF NOT EXISTS их не добавит, поэтому доливаем отдельно.
 MIGRATIONS: list[tuple[str, str, str]] = [
@@ -256,24 +356,46 @@ MIGRATIONS: list[tuple[str, str, str]] = [
 ]
 
 
+async def _columns(table: str) -> set[str]:
+    if IS_PG:
+        rows = await fetchall(
+            "SELECT column_name AS name FROM information_schema.columns "
+            "WHERE table_schema = current_schema() AND table_name = ?", (table,))
+    else:
+        rows = await fetchall(f"PRAGMA table_info({table})")
+    return {row["name"] for row in rows}
+
+
 async def _migrate() -> None:
     """Добавить недостающие колонки в уже работающую базу."""
     for table, column, ddl in MIGRATIONS:
-        rows = await fetchall(f"PRAGMA table_info({table})")
-        if any(row["name"] == column for row in rows):
+        if column in await _columns(table):
             continue
         log.info("Миграция: добавляю %s.%s", table, column)
         await execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
 
 
 async def init_db() -> None:
+    schema = _pg_schema(SCHEMA) if IS_PG else SCHEMA
     conn = await connect()
-    async with _lock:
-        await conn.executescript(SCHEMA)
-        await conn.commit()
+    if IS_PG:
+        async with conn.acquire() as pg:
+            await pg.execute(schema)
+    else:
+        async with _lock:
+            await conn.executescript(schema)
+            await conn.commit()
     await _migrate()
     await _seed()
-    log.info("База данных готова: %s", cfg.db_path)
+    log.info("База данных готова: %s", where())
+
+
+def where() -> str:
+    """Человекочитаемое описание хранилища — без пароля."""
+    if not IS_PG:
+        return f"SQLite {cfg.db_path}"
+    match = re.match(r"^\w+://[^:]+:[^@]*@(.+)$", cfg.database_url)
+    return f"PostgreSQL {match.group(1) if match else '(адрес скрыт)'}"
 
 
 async def _seed() -> None:
@@ -281,25 +403,28 @@ async def _seed() -> None:
     from .defaults import DEFAULT_SETTINGS, DEFAULT_TEXTS, DEMO_OBJECTS, DEMO_OFFERS, DEMO_SETS
 
     for key, value in DEFAULT_SETTINGS.items():
-        await execute("INSERT OR IGNORE INTO settings (key, value) VALUES (?, ?)", (key, value))
+        await execute("INSERT INTO settings (key, value) VALUES (?, ?) "
+                      "ON CONFLICT (key) DO NOTHING", (key, value))
     for key, value in DEFAULT_TEXTS.items():
-        await execute("INSERT OR IGNORE INTO texts (key, value) VALUES (?, ?)", (key, value))
+        await execute("INSERT INTO texts (key, value) VALUES (?, ?) "
+                      "ON CONFLICT (key) DO NOTHING", (key, value))
 
-    if not await fetchval("SELECT COUNT(*) FROM sets"):
+    if not await fetchval("SELECT COUNT(*) FROM sets", (), 0):
         for item in DEMO_SETS:
             await execute(
                 "INSERT INTO sets (title, description, price_kop, sort_order) VALUES (?, ?, ?, ?)",
                 (item["title"], item["description"], item.get("price_kop"), item["sort_order"]),
             )
         rows = await fetchall("SELECT id FROM sets ORDER BY sort_order, id")
-        set_ids = [r["id"] for r in rows]
+        set_ids = [row["id"] for row in rows]
         for weekday in range(1, 8):
             await execute(
-                "INSERT OR REPLACE INTO rotation_week (weekday, set_id) VALUES (?, ?)",
+                "INSERT INTO rotation_week (weekday, set_id) VALUES (?, ?) "
+                "ON CONFLICT (weekday) DO UPDATE SET set_id = excluded.set_id",
                 (weekday, set_ids[(weekday - 1) % len(set_ids)] if set_ids else None),
             )
 
-    if not await fetchval("SELECT COUNT(*) FROM objects"):
+    if not await fetchval("SELECT COUNT(*) FROM objects", (), 0):
         for obj in DEMO_OBJECTS:
             await execute(
                 """INSERT INTO objects (code, title, group_title, address, price_kop,
@@ -309,7 +434,7 @@ async def _seed() -> None:
                  obj["price_kop"], obj["is_general"], obj["note"]),
             )
 
-    if not await fetchval("SELECT COUNT(*) FROM offers"):
+    if not await fetchval("SELECT COUNT(*) FROM offers", (), 0):
         for offer in DEMO_OFFERS:
             await execute(
                 """INSERT INTO offers (title, description, url, button_text, sort_order)

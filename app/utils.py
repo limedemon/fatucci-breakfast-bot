@@ -4,7 +4,7 @@ from __future__ import annotations
 import html
 import re
 import unicodedata
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Any, Iterable, Optional, Sequence, TypeVar
 
 from .config import cfg
@@ -35,6 +35,12 @@ def now() -> datetime:
 
 def today() -> date:
     return now().date()
+
+
+def utc_stamp(minutes: int = 0, hours: int = 0) -> str:
+    """Метка времени в UTC в формате базы. Сдвиг — для запросов «старше чем…»."""
+    moment = datetime.now(timezone.utc) + timedelta(minutes=minutes, hours=hours)
+    return moment.strftime("%Y-%m-%d %H:%M:%S")
 
 
 def parse_time(value: str, fallback: str = "20:00") -> time:

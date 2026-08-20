@@ -12,15 +12,13 @@ ADMIN_IDS из окружения остаётся запасным входом
 from __future__ import annotations
 
 import logging
-from typing import Optional
-
-import aiosqlite
+from typing import Any, Optional
 
 from . import db
 from .config import cfg
 
 log = logging.getLogger(__name__)
-Row = aiosqlite.Row
+Row = Any
 
 _cache: Optional[set[int]] = None
 _has_any = False   # чтобы не дёргать базу на каждое сообщение после назначения владельца

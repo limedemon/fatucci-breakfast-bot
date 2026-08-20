@@ -10,14 +10,12 @@ import logging
 from datetime import date, timedelta
 from typing import Any
 
-import aiosqlite
-
 from . import notify, repo
 from .channels.base import Btn
 from .utils import esc, fmt_date, fmt_date_iso, fmt_money, fmt_phone, now, safe_format, strip_html
 
 log = logging.getLogger(__name__)
-Row = aiosqlite.Row
+Row = Any
 
 
 def _guest_name(order: Row) -> str:

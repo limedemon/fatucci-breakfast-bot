@@ -92,22 +92,29 @@ class Config:
         default_factory=lambda: env("PAYMENT_PROVIDER_TOKEN", "PROVIDER_TOKEN", "PAYMASTER_TOKEN")
     )
 
+    # Хранилище. Задан DATABASE_URL — работаем с PostgreSQL, иначе с файлом SQLite.
+    database_url: str = field(
+        default_factory=lambda: env("DATABASE_URL", "POSTGRES_URL", "POSTGRESQL_URL", "DB_URL")
+    )
+    #: схема PostgreSQL (по умолчанию public) — пригодится, если база общая
+    db_schema: str = field(default_factory=lambda: env("DB_SCHEMA", default=""))
     db_path: Path = field(
         default_factory=lambda: BASE_DIR / env("DB_PATH", default="data/bot.db")
     )
     log_level: str = field(default_factory=lambda: env("LOG_LEVEL", default="INFO").upper())
 
+    # Папка нужна только под файл SQLite: при работе с PostgreSQL на диск
+    # не пишется ничего — фото и выгрузки живут в базе и в памяти.
     data_dir: Path = BASE_DIR / "data"
-    photos_dir: Path = BASE_DIR / "data" / "photos"
-    export_dir: Path = BASE_DIR / "data" / "export"
 
     @property
     def tz(self) -> timezone:
         return timezone(timedelta(hours=self.tz_offset))
 
     def ensure_dirs(self) -> None:
-        for path in (self.data_dir, self.photos_dir, self.export_dir):
-            path.mkdir(parents=True, exist_ok=True)
+        if self.database_url:
+            return                       # PostgreSQL — локальные папки не нужны
+        self.data_dir.mkdir(parents=True, exist_ok=True)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
     def describe(self) -> list[str]:
@@ -121,7 +128,17 @@ class Config:
         lines.append(f"Админы: {self.admin_ids or 'не заданы'}")
         lines.append(f"Чат заказов: {self.orders_chat_id or 'не задан (укажите в /admin)'}")
         lines.append(f"Часовой пояс: UTC+{self.tz_offset}")
+        lines.append(f"Хранилище: {self.storage()}")
         return lines
+
+    def storage(self) -> str:
+        """Где лежат данные — без пароля в строке подключения."""
+        if not self.database_url:
+            return f"SQLite, файл {self.db_path.name}"
+        import re as _re
+
+        match = _re.match(r"^\w+://[^:]+:[^@]*@(.+)$", self.database_url)
+        return f"PostgreSQL {match.group(1) if match else '(адрес скрыт)'}"
 
 
 def _mask(secret: str) -> str:

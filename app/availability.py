@@ -2,15 +2,13 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
-from typing import Optional
-
-import aiosqlite
+from typing import Any, Optional
 
 from . import repo
 from .config import cfg
 from .utils import now, parse_days, parse_time, today
 
-Row = aiosqlite.Row
+Row = Any
 
 
 def order_deadline(day: date, obj: Row) -> datetime:

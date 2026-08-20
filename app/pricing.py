@@ -18,14 +18,12 @@
 from __future__ import annotations
 
 import re
-from typing import NamedTuple, Optional
-
-import aiosqlite
+from typing import Any, NamedTuple, Optional
 
 from . import repo
 from .utils import fmt_money
 
-Row = aiosqlite.Row
+Row = Any
 
 MAX_PERCENT = 90
 

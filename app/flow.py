@@ -10,8 +10,6 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-import aiosqlite
-
 from . import availability, notify, orders_service, payments, pricing, repo, statuses
 from .channels.base import Btn, Channel, Event, Out
 from .utils import (
@@ -28,7 +26,7 @@ from .utils import (
 )
 
 log = logging.getLogger(__name__)
-Row = aiosqlite.Row
+Row = Any
 
 # состояния
 S_NONE = ""

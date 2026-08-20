@@ -1,16 +1,16 @@
 """Жизненный цикл заказа: смена статусов и все связанные с ней действия."""
 from __future__ import annotations
 
-import logging
+from typing import Any
 
-import aiosqlite
+import logging
 
 from . import notify, payments, repo, statuses
 from .channels.base import TG, Btn, Out, get_channel
 from .utils import fmt_money, now
 
 log = logging.getLogger(__name__)
-Row = aiosqlite.Row
+Row = Any
 
 
 async def change_status(

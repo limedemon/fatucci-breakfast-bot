@@ -15,12 +15,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
-from pathlib import Path
 from typing import Any, Awaitable, Callable, Optional
 
 import aiohttp
 
-from .. import net, repo
+from .. import media, net, repo
 from ..utils import strip_html
 from .base import MAX, Btn, Channel, Event, Out
 
@@ -215,13 +214,13 @@ class MaxChannel(Channel):
             return None
         return {"type": "inline_keyboard", "payload": {"buttons": rows}}
 
-    async def _image_token(self, path_str: str) -> str:
-        path = Path(path_str)
-        if not path.exists():
-            return ""
-        cached = await repo.get_media_ref(str(path), MAX)
+    async def _image_token(self, key: str) -> str:
+        cached = await repo.get_media_ref(key, MAX)
         if cached:
             return cached
+        data = await media.load(key)
+        if not data:
+            return ""
         try:
             upload = await self._request("POST", "/uploads", params={"type": "image"})
             url = upload.get("url", "")
@@ -229,16 +228,16 @@ class MaxChannel(Channel):
                 return ""
             session = await self.session()
             form = aiohttp.FormData()
-            form.add_field("data", path.read_bytes(), filename=path.name,
+            form.add_field("data", data, filename=key.replace(":", "_") + ".jpg",
                            content_type="application/octet-stream")
             async with session.post(url, data=form) as resp:
                 payload = await resp.json(content_type=None)
             token = _extract_photo_token(payload) or upload.get("token", "")
             if token:
-                await repo.set_media_ref(str(path), MAX, token)
+                await repo.set_media_ref(key, MAX, token)
             return token
         except Exception as exc:  # noqa: BLE001
-            log.warning("MAX: не удалось загрузить фото %s: %s", path, exc)
+            log.warning("MAX: не удалось загрузить картинку %s: %s", key, exc)
             return ""
 
     # -------------------------------------------------------------- события
