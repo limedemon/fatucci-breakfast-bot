@@ -18,6 +18,15 @@ Row = aiosqlite.Row
 
 
 # ------------------------------------------------------------------ карточки
+def _field(row: Row, name: str, default: Any = "") -> Any:
+    """Значение колонки, которой может не быть в старой записи."""
+    try:
+        value = row[name]
+    except (IndexError, KeyError):
+        return default
+    return default if value is None else value
+
+
 async def order_card(order: Row, for_admin: bool = True) -> str:
     """Карточка заказа: сверху главное, ниже детали, в конце — служебное."""
     lines = [
@@ -33,14 +42,22 @@ async def order_card(order: Row, for_admin: bool = True) -> str:
         lines.append(f"📍 {esc(order['object_title'])}")
     lines.append(f"🚪 Апартаменты {esc(order['apartment'])}")
     if for_admin:
-        lines.append(f"📞 {esc(fmt_phone(order['phone']))}")
+        contact = esc(fmt_phone(order["phone"]))
+        name = _field(order, "customer_name")
+        lines.append(f"📞 {contact}" + (f", {esc(name)}" if name else ""))
     if order["comment"]:
         lines.append(f"💬 {esc(order['comment'])}")
-    lines += [
-        "",
-        f"💰 {fmt_money(order['price_kop'])} × {order['qty']} = "
-        f"<b>{fmt_money(order['total_kop'])}</b>",
-    ]
+    lines.append("")
+    discount = int(_field(order, "discount_pct") or 0)
+    if discount:
+        base = int(_field(order, "base_price_kop") or order["price_kop"])
+        lines.append(f"💰 {fmt_money(base)} × {order['qty']} = {fmt_money(base * order['qty'])}")
+        lines.append(f"🎁 Скидка −{discount}% → <b>{fmt_money(order['total_kop'])}</b>")
+    else:
+        lines.append(
+            f"💰 {fmt_money(order['price_kop'])} × {order['qty']} = "
+            f"<b>{fmt_money(order['total_kop'])}</b>"
+        )
     if for_admin:
         lines += ["", f"🏢 {esc(order['object_title'])}",
                   f"🕗 {fmt_dt(order['created_at'])} · {channel_title(order['channel'])}"]

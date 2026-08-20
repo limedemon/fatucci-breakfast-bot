@@ -12,7 +12,7 @@ from typing import Any, Optional
 
 import aiosqlite
 
-from . import availability, notify, orders_service, payments, repo, statuses
+from . import availability, notify, orders_service, payments, pricing, repo, statuses
 from .channels.base import Btn, Channel, Event, Out
 from .utils import (
     chunk,
@@ -129,13 +129,13 @@ async def _show_main_menu(ev: Event, ch: Channel, new_message: bool = False) -> 
 
     kb = [
         [Btn(text="🥐 Заказать завтрак", data="g:order", intent="positive")],
-        [Btn(text="📋 Состав сетов", data="g:sets"), Btn(text="🚚 Доставка", data="g:delivery")],
+        [Btn(text="📋 Меню и цены", data="g:sets"), Btn(text="🚚 Доставка", data="g:delivery")],
         [Btn(text="❓ Как заказать", data="g:how"), Btn(text="💬 Вопросы", data="g:faq")],
     ]
-    if await repo.list_offers(active_only=True):
-        kb.append([Btn(text="🍽 Ещё от Fatucci", data="g:offers")])
     if await repo.count_orders(user_key=(ev.channel, ev.user_id)):
         kb.append([Btn(text="📦 Мои заказы", data="g:my")])
+    if await repo.list_offers(active_only=True):
+        kb.append([Btn(text="🍽 Ещё от Fatucci", data="g:offers")])
 
     out = Out(text=text, kb=kb, remove_reply_kb=True)
     await _respond(ev, ch, out, new_message=new_message)
@@ -172,6 +172,8 @@ async def _on_callback(ev: Event, ch: Channel, user: Row) -> None:
         "rephone": lambda: _reuse_phone(ev, ch),
         "cmt": lambda: _ask_comment(ev, ch),
         "skip": lambda: _skip_comment(ev, ch),
+        "edit": lambda: _show_edit(ev, ch),
+        "back": lambda: _show_confirm(ev, ch),
         "confirm": lambda: _confirm_order(ev, ch),
         "resume": lambda: _resume_draft(ev, ch),
         "drop": lambda: _drop_draft(ev, ch),
@@ -494,15 +496,32 @@ async def _ask_qty(ev: Event, ch: Channel) -> None:
     )
     if breakfast and breakfast["description"]:
         text += "\n" + esc(breakfast["description"])
-    text += (
-        f"\n\n💰 {fmt_money(price)} за сет\n\n"
-        f"🔢 <b>Сколько наборов привезти?</b>"
-    )
-    numbers = [Btn(text=str(n), data=f"g:qty:{n}") for n in range(low, high + 1)]
+    text += f"\n\n💰 {fmt_money(price)} за сет"
+
+    tiers = await pricing.tiers()
+    if tiers:
+        text += "\n\n🎁 <b>Чем больше наборов, тем дешевле каждый:</b>\n"
+        text += "\n".join(
+            f"от {t.qty} наборов — −{t.percent}%, "
+            f"{fmt_money(pricing.calc(price, t.qty, tiers).per_set)} за сет"
+            for t in sorted(tiers, key=lambda t: t.qty)
+        )
+    text += "\n\n🔢 <b>Сколько наборов привезти?</b>"
+
+    numbers = [
+        Btn(text=_qty_label(n, price, tiers), data=f"g:qty:{n}")
+        for n in range(low, high + 1)
+    ]
     kb = chunk(numbers, 5)
     kb.append([Btn(text="⬅️ Другая дата", data="g:order"), Btn(text="🏠 В меню", data="g:menu")])
     await _respond(ev, ch, Out(text=text, kb=kb, photo=breakfast["photo_path"] if breakfast else ""),
                    new_message=bool(breakfast and breakfast["photo_path"]))
+
+
+def _qty_label(qty: int, base_price: int, tiers: list) -> str:
+    """Подпись кнопки количества: со скидкой показываем её прямо на кнопке."""
+    percent = pricing.percent_for(qty, tiers)
+    return f"{qty} · −{percent}%" if percent else str(qty)
 
 
 async def _pick_qty(ev: Event, ch: Channel, qty: int) -> None:
@@ -563,7 +582,7 @@ async def _reuse_phone(ev: Event, ch: Channel) -> None:
     if not (user and user["phone"]):
         await _ask_phone(ev, ch)
         return
-    await _input_phone(ev, ch, user["phone"], data)
+    await _input_phone(ev, ch, user["phone"], data, user["customer_name"])
 
 
 async def _ask_comment(ev: Event, ch: Channel) -> None:
@@ -596,9 +615,9 @@ async def _show_confirm(ev: Event, ch: Channel) -> None:
         await _resume_incomplete(ev, ch, data)
         return
     breakfast = await repo.get_set(data.get("set_id"))
-    price = availability.price_for(obj, breakfast)
+    base_price = availability.price_for(obj, breakfast)
     qty = int(data.get("qty", 1))
-    total = price * qty
+    price = await pricing.price_for_order(base_price, qty)
     await _set_state(ev, S_CONFIRM, data)
 
     lines = [
@@ -611,21 +630,38 @@ async def _show_confirm(ev: Event, ch: Channel) -> None:
         f"🚪 Апартаменты {esc(data.get('apartment', ''))}",
         f"📞 {esc(fmt_phone(data.get('phone', '')))}",
     ]
+    if data.get("name"):
+        lines.append(f"👤 {esc(data['name'])}")
     if data.get("comment"):
         lines.append(f"💬 {esc(data['comment'])}")
-    lines += [
-        "",
-        f"💰 {fmt_money(price)} × {qty} = <b>{fmt_money(total)}</b>",
-        "",
-        "Всё верно? Любой пункт ещё можно поменять.",
-    ]
+    lines.append("")
+    if price.percent:
+        lines += [
+            f"💰 {fmt_money(price.base_per_set)} × {qty} = {fmt_money(base_price * qty)}",
+            f"🎁 Скидка −{price.percent}% = <b>−{fmt_money(price.saved)}</b>",
+            f"<b>К оплате: {fmt_money(price.total)}</b>",
+        ]
+    else:
+        lines.append(f"💰 {fmt_money(price.per_set)} × {qty} = <b>{fmt_money(price.total)}</b>")
+    lines += ["", "Всё верно? Любой пункт ещё можно поменять."]
     kb = [
         [Btn(text="✅ Подтвердить заказ", data="g:confirm", intent="positive")],
-        [Btn(text="📅 Дата", data="g:order"), Btn(text="🔢 Количество", data="g:qty")],
-        [Btn(text="🚪 Апартаменты", data="g:apt"), Btn(text="📞 Телефон", data="g:phone")],
-        [Btn(text="❌ Отменить", data="g:menu", intent="negative")],
+        [Btn(text="✏️ Изменить", data="g:edit"),
+         Btn(text="❌ Отменить", data="g:menu", intent="negative")],
     ]
     await _respond(ev, ch, Out(text="\n".join(lines), kb=kb, remove_reply_kb=True))
+
+
+async def _show_edit(ev: Event, ch: Channel) -> None:
+    """Что именно поменять в заказе — отдельным экраном, чтобы не пугать кнопками."""
+    kb = [
+        [Btn(text="📅 Дату доставки", data="g:order")],
+        [Btn(text="🔢 Количество наборов", data="g:qty")],
+        [Btn(text="🚪 Номер апартаментов", data="g:apt")],
+        [Btn(text="📞 Телефон", data="g:phone")],
+        [Btn(text="⬅️ Назад к заказу", data="g:back")],
+    ]
+    await _respond(ev, ch, Out(text="✏️ <b>Что поправить?</b>", kb=kb))
 
 
 async def _resume_incomplete(ev: Event, ch: Channel, data: dict[str, Any]) -> None:
@@ -659,9 +695,12 @@ async def _confirm_order(ev: Event, ch: Channel) -> None:
         return
 
     breakfast = await repo.set_for_date(day)
-    price = availability.price_for(obj, breakfast)
+    base_price = availability.price_for(obj, breakfast)
     qty = int(data["qty"])
+    price = await pricing.price_for_order(base_price, qty)
     user = await repo.get_user(ev.channel, ev.user_id)
+    name = str(data.get("name") or (user["customer_name"] if user else "")
+               or (user["full_name"] if user else "") or ev.full_name)
 
     order = await repo.create_order(
         user_pk=user["id"] if user else None,
@@ -677,15 +716,19 @@ async def _confirm_order(ev: Event, ch: Channel) -> None:
         qty=qty,
         apartment=str(data["apartment"]),
         phone=str(data["phone"]),
+        customer_name=name,
         comment=str(data.get("comment", "")),
-        price_kop=price,
-        total_kop=price * qty,
+        base_price_kop=price.base_per_set,
+        discount_pct=price.percent,
+        price_kop=price.per_set,
+        total_kop=price.total,
         status=statuses.NEW,
         source_code=(user["source_code"] if user else "") or obj["code"],
     )
 
     await repo.update_user(ev.channel, ev.user_id, phone=data["phone"],
-                           apartment=str(data["apartment"]), object_id=obj["id"])
+                           apartment=str(data["apartment"]), customer_name=name,
+                           object_id=obj["id"])
     await repo.clear_session(ev.channel, ev.user_id)
 
     text = await notify.guest_status_text(order, "order_accepted")
@@ -727,7 +770,7 @@ async def _on_text(ev: Event, ch: Channel, user: Row) -> None:
         return
     if state == S_PHONE:
         phone = ev.phone if ev.kind == "contact" else text
-        await _input_phone(ev, ch, phone, data)
+        await _input_phone(ev, ch, phone, data, str(ev.raw.get("contact_name", "")))
         return
     if state == S_COMMENT:
         await _input_comment(ev, ch, text, data)
@@ -759,7 +802,8 @@ async def _input_apartment(ev: Event, ch: Channel, text: str, data: dict[str, An
     await _ask_phone(ev, ch)
 
 
-async def _input_phone(ev: Event, ch: Channel, raw: str, data: dict[str, Any]) -> None:
+async def _input_phone(ev: Event, ch: Channel, raw: str, data: dict[str, Any],
+                       name: str = "") -> None:
     phone = norm_phone(raw)
     if not phone:
         await ch.send(ev.chat_id, Out(
@@ -767,6 +811,9 @@ async def _input_phone(ev: Event, ch: Channel, raw: str, data: dict[str, Any]) -
                  "<b>+7 999 123-45-67</b> или нажмите кнопку «Поделиться контактом»."))
         return
     data["phone"] = phone
+    if name.strip():
+        # имя из карточки контакта — его требует форма курьерской службы
+        data["name"] = name.strip()
     await _set_state(ev, S_COMMENT, data)
     await _ask_comment(ev, ch)
 

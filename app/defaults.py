@@ -29,18 +29,33 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "comment_enabled": "1",        # спрашивать комментарий к заказу
     "orders_paused": "0",          # аварийная пауза приёма заказов
 
-    # Курьерская выгрузка
+    # Скидка за количество наборов в одном заказе.
+    # Формат: «3=5, 5=10» — от 3 наборов −5%, от 5 наборов −10%. Пусто — скидок нет.
+    "discount_tiers": "",
+
+    # Курьерская выгрузка. Шаблон повторяет форму курьерской службы Fatucci.
     "courier_enabled": "1",
     "courier_time": "20:00",       # во сколько формировать сводку
     "courier_day_offset": "1",     # на какой день: 1 = завтра
     "courier_statuses": "accepted,paid",   # какие статусы включать
+    "courier_from": "Fatucci fine food, Фабрициуса 58/2, павильон 26",
+    "courier_pickup": "08:00",     # во сколько курьеру забирать заказ
+    "courier_note": "отчитаться о доставке",
     "courier_header": (
-        "🚚 <b>Доставка завтраков · {date_h}</b>\n"
-        "Заказов: {orders_count}   Сетов: {sets_count}   Сумма: {total}\n"
+        "🚚 <b>Доставка {date_h}</b>\n"
+        "Заказов: {orders_count} · Сетов: {sets_count}\n"
     ),
-    "courier_object": "\n📍 <b>{address}</b>\n<i>{object_title}</i>",
-    "courier_line": "   кв. {apartment} — {set_title} × {qty} — {phone}{comment}",
-    "courier_footer": "\n———\nВсего сетов: {sets_count}\nСформировано {now}",
+    "courier_object": "",          # пусто: блоки заказов идут подряд
+    "courier_line": (
+        "\n📥 Откуда: {from}\n"
+        "📍 Адрес: {address}, апарт. {apartment}\n"
+        "👥 Получатель: {phone}, {name}\n"
+        "⏰ Когда: {pickup}\n"
+        "🥐 Заказ: {set_title} × {qty}\n"
+        "✏️ Комментарий: {note}{comment}\n"
+        "Доставка:\n"
+    ),
+    "courier_footer": "\n———\nВсего сетов: {sets_count} · Сумма: {total}",
     "courier_empty": "На {date_h} подтверждённых заказов нет.",
 
     # Напоминание о незавершённом заказе

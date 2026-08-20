@@ -264,7 +264,8 @@ async def get_user_pk(user_pk: int) -> Optional[Row]:
     return await db.fetchone("SELECT * FROM users WHERE id = ?", (user_pk,))
 
 
-USER_FIELDS = ("phone", "apartment", "object_id", "source_code", "is_blocked", "chat_id")
+USER_FIELDS = ("phone", "apartment", "customer_name", "object_id", "source_code",
+               "is_blocked", "chat_id")
 
 
 async def update_user(channel: str, ext_id: str, **fields: Any) -> None:
@@ -385,6 +386,7 @@ async def stale_sessions(older_than_min: int, max_hours: int) -> list[Row]:
 ORDER_FIELDS = (
     "user_pk", "channel", "ext_id", "chat_id", "object_id", "object_title", "object_address",
     "set_id", "set_title", "delivery_date", "qty", "apartment", "phone", "comment",
+    "customer_name", "discount_pct", "base_price_kop",
     "price_kop", "total_kop", "status", "source_code", "payment_id", "payment_url",
     "paid_at", "admin_msgs",
 )

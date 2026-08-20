@@ -249,8 +249,13 @@ class TelegramChannel(Channel):
 
         @dp.message(F.contact)
         async def _contact(message: Message) -> None:
-            phone = message.contact.phone_number if message.contact else ""
-            await route(self._event(message, "contact", phone=phone), self)
+            contact = message.contact
+            phone = contact.phone_number if contact else ""
+            ev = self._event(message, "contact", phone=phone)
+            if contact:
+                # имя из карточки контакта — его просит форма курьерской службы
+                ev.raw["contact_name"] = _full_name(contact.first_name, contact.last_name)
+            await route(ev, self)
 
         @dp.message(F.photo)
         async def _photo(message: Message) -> None:

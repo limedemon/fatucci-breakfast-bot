@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS users (
     full_name   TEXT NOT NULL DEFAULT '',
     phone       TEXT NOT NULL DEFAULT '',
     apartment   TEXT NOT NULL DEFAULT '',
+    customer_name TEXT NOT NULL DEFAULT '',
     object_id   INTEGER,
     source_code TEXT NOT NULL DEFAULT '',
     is_blocked  INTEGER NOT NULL DEFAULT 0,
@@ -98,6 +99,9 @@ CREATE TABLE IF NOT EXISTS orders (
     qty            INTEGER NOT NULL DEFAULT 1,
     apartment      TEXT NOT NULL DEFAULT '',
     phone          TEXT NOT NULL DEFAULT '',
+    customer_name  TEXT NOT NULL DEFAULT '',
+    discount_pct   INTEGER NOT NULL DEFAULT 0,
+    base_price_kop INTEGER NOT NULL DEFAULT 0,
     comment        TEXT NOT NULL DEFAULT '',
     price_kop      INTEGER NOT NULL DEFAULT 0,
     total_kop      INTEGER NOT NULL DEFAULT 0,
@@ -242,11 +246,32 @@ async def fetchval(sql: str, params: Sequence[Any] = (), default: Any = None) ->
     return default if value is None else value
 
 
+#: Колонки, добавленные уже после первого релиза.
+#: CREATE TABLE IF NOT EXISTS их не добавит, поэтому доливаем отдельно.
+MIGRATIONS: list[tuple[str, str, str]] = [
+    ("orders", "customer_name", "TEXT NOT NULL DEFAULT ''"),
+    ("orders", "discount_pct", "INTEGER NOT NULL DEFAULT 0"),
+    ("orders", "base_price_kop", "INTEGER NOT NULL DEFAULT 0"),
+    ("users", "customer_name", "TEXT NOT NULL DEFAULT ''"),
+]
+
+
+async def _migrate() -> None:
+    """Добавить недостающие колонки в уже работающую базу."""
+    for table, column, ddl in MIGRATIONS:
+        rows = await fetchall(f"PRAGMA table_info({table})")
+        if any(row["name"] == column for row in rows):
+            continue
+        log.info("Миграция: добавляю %s.%s", table, column)
+        await execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+
+
 async def init_db() -> None:
     conn = await connect()
     async with _lock:
         await conn.executescript(SCHEMA)
         await conn.commit()
+    await _migrate()
     await _seed()
     log.info("База данных готова: %s", cfg.db_path)
 

@@ -20,6 +20,15 @@ log = logging.getLogger(__name__)
 Row = aiosqlite.Row
 
 
+def _guest_name(order: Row) -> str:
+    """Имя получателя для курьера: как гость представился, иначе «Гость»."""
+    try:
+        name = (order["customer_name"] or "").strip()
+    except (IndexError, KeyError):
+        name = ""
+    return name or "гость"
+
+
 async def digest_statuses() -> list[str]:
     raw = await repo.get_setting("courier_statuses", "accepted,paid")
     return [s.strip() for s in raw.split(",") if s.strip()]
@@ -33,6 +42,10 @@ async def build_digest(day: date) -> str:
         "date": day.strftime("%d.%m.%Y"),
         "date_h": fmt_date(day),
         "now": now().strftime("%d.%m.%Y %H:%M"),
+        # поля формы курьерской службы
+        "from": await repo.get_setting("courier_from"),
+        "pickup": await repo.get_setting("courier_pickup", "08:00"),
+        "note": await repo.get_setting("courier_note"),
     }
 
     if not orders:
@@ -75,10 +88,11 @@ async def build_digest(day: date) -> str:
                 set_title=esc(order["set_title"]),
                 qty=order["qty"],
                 phone=fmt_phone(order["phone"]),
+                name=esc(_guest_name(order)),
                 comment=esc(comment),
                 comment_raw=esc(order["comment"]),
                 total=fmt_money(order["total_kop"]),
-                address=esc(order["object_address"]),
+                address=esc(order["object_address"] or order["object_title"]),
                 object_title=esc(order["object_title"]),
                 **common,
             ))

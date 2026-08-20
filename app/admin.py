@@ -13,7 +13,8 @@ from typing import Any, Callable, Optional
 
 import aiosqlite
 
-from . import admins, courier, notify, orders_service, payments, qrgen, repo, statuses
+from . import (admins, courier, guide, notify, orders_service, payments, pricing,
+               qrgen, repo, statuses)
 from .channels.base import MAX, TG, Btn, Channel, Event, Out
 from .config import cfg
 from .utils import (
@@ -100,11 +101,17 @@ SETTING_SECTIONS: dict[str, tuple[str, list[FieldSpec]]] = {
         ("reminder_after_min", "Через сколько минут", "int"),
         ("reminder_max_hours", "Не старше скольких часов", "int"),
     ]),
+    "price": ("💰 Скидки за количество", [
+        ("discount_tiers", "Пороги скидок", "text"),
+    ]),
     "cur": ("🚚 Выгрузка курьерам", [
         ("courier_enabled", "Автовыгрузка включена", "bool"),
         ("courier_time", "Время формирования", "time"),
         ("courier_day_offset", "На какой день (1 = завтра)", "int"),
         ("courier_statuses", "Статусы в выгрузке", "text"),
+        ("courier_from", "Откуда забирать заказ", "text"),
+        ("courier_pickup", "Во сколько забирать", "time"),
+        ("courier_note", "Комментарий курьеру", "text"),
     ]),
     "tpl": ("📋 Шаблон выгрузки", [
         ("courier_header", "Шапка", "text"),
@@ -185,6 +192,8 @@ async def handle_callback(ev: Event, ch: Channel) -> None:
 
     routes: dict[str, Callable[[], Any]] = {
         "h": lambda: _home(ev, ch),
+        "hp": lambda: _guide(ev, ch, args),
+        "g": lambda: _group(ev, ch, args),
         "o": lambda: _orders_route(ev, ch, args),
         "ord": lambda: _order_action(ev, ch, args),
         "m": lambda: _sets_route(ev, ch, args),
@@ -231,40 +240,106 @@ async def _show(ev: Event, ch: Channel, out: Out, new_message: bool = False) -> 
 
 
 def _back(target: str, title: str = "⬅️ Назад") -> list[Btn]:
+    if target == "a:h":                     # не дублируем одну и ту же кнопку
+        return [Btn(text="🏠 В админку", data="a:h")]
     return [Btn(text=title, data=target), Btn(text="🏠 Админка", data="a:h")]
+
+
+def _help(topic: str) -> Btn:
+    """Кнопка «как это работает» рядом с разделом."""
+    return Btn(text="❓ Как это работает", data=f"a:hp:{topic}")
+
+
+# ==================================================================== справка
+async def _guide(ev: Event, ch: Channel, args: list[str]) -> None:
+    topic = args[0] if args else ""
+    if not topic:
+        kb = [[Btn(text=guide.title(key), data=f"a:hp:{key}")] for key in guide.ORDER]
+        kb.append(_back("a:h", "⬅️ В админку"))
+        await _show(ev, ch, Out(
+            text="❓ <b>Справка по админ-панели</b>\n\n"
+                 "Короткие пояснения к каждому разделу: что он делает, "
+                 "как им пользоваться и на что обратить внимание.\n\n"
+                 "Начните с «🚀 С чего начать» — там пошаговая настройка бота.",
+            kb=kb))
+        return
+    kb = [[Btn(text="📖 Все разделы справки", data="a:hp")], _back("a:h", "⬅️ В админку")]
+    await _show(ev, ch, Out(text=guide.body(topic), kb=kb))
+
+
+# ============================================================ группы разделов
+GROUPS: dict[str, tuple[str, str, list[tuple[str, str]]]] = {
+    "menu": ("🥐 Меню и цены", "Что и почём предлагаем гостям.", [
+        ("🥐 Сеты (завтраки)", "a:m:l"),
+        ("🗓 Ротация по дням", "a:r:l"),
+        ("💰 Скидки за количество", "a:cfg:s:price"),
+        ("🍽 Доп. предложения", "a:f:l"),
+    ]),
+    "obj": ("🏢 Объекты и QR", "Дома, адреса, цены и коды для тейбл-тентов.", [
+        ("🏢 Объекты (дома)", "a:b:l"),
+        ("🔗 QR-коды", "a:q:l"),
+    ]),
+    "rep": ("📊 Отчёты", "Как идут дела и выгрузка для бухгалтерии.", [
+        ("📈 Статистика", "a:st:m"),
+        ("📤 Выгрузка в CSV", "a:x:m"),
+        ("👥 Гости и чёрный список", "a:u:l:0"),
+    ]),
+}
+
+GROUP_HELP = {"menu": "prices", "obj": "objects", "rep": "reports"}
+
+
+async def _group(ev: Event, ch: Channel, args: list[str]) -> None:
+    code = args[0] if args else ""
+    group = GROUPS.get(code)
+    if group is None:
+        await _home(ev, ch)
+        return
+    title, subtitle, items = group
+    kb = [[Btn(text=label, data=target)] for label, target in items]
+    kb.append([_help(GROUP_HELP.get(code, "start"))])
+    kb.append(_back("a:h", "⬅️ В админку"))
+    await _show(ev, ch, Out(text=f"<b>{title}</b>\n\n{subtitle}", kb=kb))
 
 
 # ==================================================================== главная
 async def _home(ev: Event, ch: Channel, new_message: bool = False) -> None:
     new_count = await repo.count_orders(status=statuses.NEW)
-    today_count = await repo.count_orders(date_from=fmt_date_iso(today()),
-                                          date_to=fmt_date_iso(today()))
-    pay_ready = "включена" if await payments.is_enabled() else "не настроена"
-    max_on = "включён" if await repo.get_bool("max_enabled") else "выключен"
-    paused = await repo.get_bool("orders_paused")
+    work_count = await repo.count_orders(status=f"{statuses.ACCEPTED},{statuses.PAID}")
+    tomorrow = fmt_date_iso(today() + timedelta(days=1))
+    tomorrow_count = await repo.count_orders(date_from=tomorrow, date_to=tomorrow,
+                                             status=f"{statuses.ACCEPTED},{statuses.PAID}")
 
-    text = (
-        "🛠 <b>Админ-панель Fatucci</b>\n\n"
-        f"🆕 Новых заказов: <b>{new_count}</b>\n"
-        f"📅 Доставок сегодня: <b>{today_count}</b>\n"
-        f"💳 Онлайн-оплата: {pay_ready}\n"
-        f"📱 MAX: {max_on}\n"
-    )
-    if paused:
-        text += "\n⏸ <b>Приём заказов на паузе</b>"
+    lines = ["🛠 <b>Админ-панель Fatucci</b>", ""]
+    if new_count:
+        lines.append(f"🆕 <b>Новых заказов: {new_count}</b> — ждут вашего решения")
+    else:
+        lines.append("🆕 Новых заказов нет")
+    lines.append(f"🔧 В работе: {work_count}")
+    lines.append(f"🚚 На завтра: {tomorrow_count}")
+
+    warnings = []
+    if await repo.get_bool("orders_paused"):
+        warnings.append("⏸ Приём заказов на паузе")
+    if not await payments.is_configured():
+        warnings.append("💳 Оплата не подключена")
+    if not (await repo.get_setting("orders_chat_id") or cfg.orders_chat_id):
+        warnings.append("💬 Не задан рабочий чат для заказов")
+    if warnings:
+        lines += ["", *warnings]
 
     kb = [
-        [Btn(text=f"📦 Заказы ({new_count})", data="a:o:l:new:0")],
-        [Btn(text="🥐 Меню и сеты", data="a:m:l"), Btn(text="🗓 Ротация", data="a:r:l")],
-        [Btn(text="🏢 Объекты", data="a:b:l"), Btn(text="🔗 QR-коды", data="a:q:l")],
-        [Btn(text="🚚 Курьерам", data="a:cur:m"), Btn(text="📊 Статистика", data="a:st:m")],
-        [Btn(text="💳 Оплата", data="a:cfg:s:pay"), Btn(text="🍽 Доп. предложения", data="a:f:l")],
-        [Btn(text="✍️ Тексты", data="a:t:l"), Btn(text="👥 Гости", data="a:u:l:0")],
-        [Btn(text="📢 Рассылка", data="a:bc:m"), Btn(text="⚙️ Настройки", data="a:cfg:m")],
-        [Btn(text="👑 Доступ", data="a:acc:l"), Btn(text="📱 Каналы", data="a:cfg:s:ch")],
-        [Btn(text="📤 Выгрузка в CSV", data="a:x:m")],
+        [Btn(text=f"📦 Заказы{f' · {new_count} новых' if new_count else ''}",
+             data="a:o:l:new:0", intent="positive" if new_count else "")],
+        [Btn(text="🥐 Меню и цены", data="a:g:menu"),
+         Btn(text="🏢 Объекты и QR", data="a:g:obj")],
+        [Btn(text="🚚 Курьерам", data="a:cur:m"),
+         Btn(text="📊 Отчёты", data="a:g:rep")],
+        [Btn(text="⚙️ Настройки", data="a:cfg:m"),
+         Btn(text="📢 Рассылка", data="a:bc:m")],
+        [Btn(text="❓ Справка — что где находится", data="a:hp")],
     ]
-    await _show(ev, ch, Out(text=text, kb=kb), new_message=new_message)
+    await _show(ev, ch, Out(text="\n".join(lines), kb=kb), new_message=new_message)
 
 
 # ==================================================================== заказы
@@ -350,6 +425,7 @@ async def _orders_list(ev: Event, ch: Channel, code: str, page: int) -> None:
     if nav:
         kb.append(nav)
     kb.append([Btn(text="🔎 Фильтры", data="a:o:f"), Btn(text="🔢 Найти", data="a:o:find")])
+    kb.append([_help("orders")])
     kb.append(_back("a:h", "⬅️ В админку"))
     await _show(ev, ch, Out(text="\n".join(lines), kb=kb))
 
@@ -471,6 +547,7 @@ async def _sets_list(ev: Event, ch: Channel) -> None:
     if not items:
         lines.append("Пока пусто.")
     kb.append([Btn(text="➕ Добавить сет", data="a:m:n")])
+    kb.append([_help("sets")])
     kb.append(_back("a:h", "⬅️ В админку"))
     await _show(ev, ch, Out(text="\n".join(lines), kb=kb))
 
@@ -534,6 +611,7 @@ async def _rotation_week(ev: Event, ch: Channel) -> None:
         lines.append(f"<b>{WEEKDAYS_FULL[weekday - 1].capitalize()}</b> — {esc(title)}")
         kb.append([Btn(text=f"{WEEKDAYS_SHORT[weekday - 1]}: {title}", data=f"a:r:w:{weekday}")])
     kb.append([Btn(text="📅 Особые даты", data="a:r:d")])
+    kb.append([_help("rotation")])
     kb.append(_back("a:h", "⬅️ В админку"))
     await _show(ev, ch, Out(text="\n".join(lines), kb=kb))
 
@@ -606,6 +684,7 @@ async def _objects_list(ev: Event, ch: Channel) -> None:
     if not objects:
         lines.append("Пока пусто.")
     kb.append([Btn(text="➕ Добавить объект", data="a:b:n")])
+    kb.append([_help("objects")])
     kb.append(_back("a:h", "⬅️ В админку"))
     await _show(ev, ch, Out(text="\n".join(lines), kb=kb))
 
@@ -1022,11 +1101,17 @@ async def _broadcast_route(ev: Event, ch: Channel, args: list[str]) -> None:
 async def _settings_route(ev: Event, ch: Channel, args: list[str]) -> None:
     action = args[0] if args else "m"
     if action == "m":
+        hidden = {"price"}          # живёт в разделе «Меню и цены»
         kb = [[Btn(text=title, data=f"a:cfg:s:{code}")]
-              for code, (title, _) in SETTING_SECTIONS.items()]
+              for code, (title, _) in SETTING_SECTIONS.items() if code not in hidden]
+        kb.append([Btn(text="✍️ Тексты бота", data="a:t:l"),
+                   Btn(text="👑 Доступ", data="a:acc:l")])
         kb.append([Btn(text="🧪 Проверить оплату", data="a:cfg:yk")])
+        kb.append([_help("settings")])
         kb.append(_back("a:h", "⬅️ В админку"))
-        await _show(ev, ch, Out(text="⚙️ <b>Настройки</b>", kb=kb))
+        await _show(ev, ch, Out(
+            text="⚙️ <b>Настройки</b>\n\nВыберите раздел. Если непонятно, "
+                 "что делает пункт — загляните в справку внизу.", kb=kb))
     elif action == "s":
         await _settings_section(ev, ch, args[1])
     elif action == "e":
@@ -1067,8 +1152,34 @@ async def _settings_section(ev: Event, ch: Channel, code: str) -> None:
     if code == "ch":
         lines += ["", _max_hint(await repo.get_setting("max_token"),
                                 await repo.get_bool("max_enabled", True))]
+    if code == "price":
+        lines += ["", await _discount_preview()]
+    topic = SECTION_HELP.get(code)
+    if topic:
+        kb.append([_help(topic)])
     kb.append(_back("a:cfg:m", "⬅️ К настройкам"))
     await _show(ev, ch, Out(text="\n".join(lines), kb=kb))
+
+
+SECTION_HELP = {
+    "gen": "settings", "ch": "channels", "rem": "settings",
+    "cur": "courier", "tpl": "courier", "pay": "payment", "price": "prices",
+}
+
+
+async def _discount_preview() -> str:
+    """Показать скидки в рублях на примере реального объекта — так понятнее."""
+    tiers = await pricing.tiers()
+    if not tiers:
+        return ("ℹ️ Скидок сейчас нет — цена одинаковая при любом количестве.\n\n"
+                "Чтобы включить, впишите пороги в формате <code>3=5, 5=10</code>:\n"
+                "от 3 наборов −5%, от 5 наборов −10%.")
+    objects = await repo.list_objects(active_only=True, selectable=True)
+    if not objects:
+        return f"Пороги: {pricing.format_tiers(tiers)}"
+    obj = objects[0]
+    return (f"<b>Пример для «{esc(obj['title'])}»</b>\n"
+            f"{pricing.table(obj['price_kop'], tiers, int(obj['max_qty'] or 10))}")
 
 
 def _max_hint(token: str, enabled: bool) -> str:
@@ -1090,6 +1201,17 @@ async def _settings_edit(ev: Event, ch: Channel, code: str, key: str) -> None:
     value = await repo.get_setting(key)
     if kind == "secret":
         value = mask_secret(value)
+    if key == "discount_tiers":
+        await _ask(ev, ch, "setting", {"key": key, "kind": kind, "section": code},
+                   "💰 <b>Скидки за количество</b>\n\n"
+                   f"Сейчас: <code>{esc(value) or 'скидок нет'}</code>\n\n"
+                   "Пришлите пороги в формате <code>3=5, 5=10, 10=15</code> — это значит:\n"
+                   "• от 3 наборов — минус 5%\n"
+                   "• от 5 наборов — минус 10%\n"
+                   "• от 10 наборов — минус 15%\n\n"
+                   "Скидка считается только внутри одного заказа на один день.\n"
+                   "Чтобы убрать скидки — отправьте <code>-</code>.")
+        return
     if key == "pm_token":
         hint = (
             "Токен выдаёт <b>@BotFather</b>: /mybots → ваш бот → "

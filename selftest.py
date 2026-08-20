@@ -210,9 +210,16 @@ async def main() -> None:
     digest = await courier.build_digest(order["delivery_date"] and
                                         __import__("datetime").date.fromisoformat(
                                             order["delivery_date"]))
-    check("кв. 45" in digest, "в сводке есть номер апартаментов")
+    check("апарт. 45" in digest, "в сводке есть номер апартаментов")
     check("Северная" in digest, "в сводке есть адрес объекта")
     check(digest.count("\n") > 2, "сводка — одно многострочное сообщение")
+    # форма курьерской службы, присланная заказчиком 18.08
+    for field in ("📥 Откуда:", "📍 Адрес:", "👥 Получатель:", "⏰ Когда:",
+                  "✏️ Комментарий:", "Доставка:"):
+        check(field in digest, f"в сводке есть поле формы курьера «{field}»")
+    check("Fatucci fine food" in digest, "подставлен адрес, откуда забирать заказ")
+    check("отчитаться о доставке" in digest, "подставлен комментарий курьеру")
+    check("+7 (999) 123-45-67" in digest, "телефон получателя в читаемом виде")
 
     print("\n— Админ-панель —")
     ch.clear()
@@ -226,6 +233,38 @@ async def main() -> None:
         ch.clear()
         await route(admin_event("callback", payload=section, callback_id="x"), ch)
         check(len(ch.sent) > 0 and len(ch.last().text) > 10, f"раздел админки: {title}")
+
+    print("\n— Справка в админке —")
+    from app import guide
+    ch.clear()
+    await route(admin_event("callback", payload="a:hp", callback_id="h0"), ch)
+    check("Справка по админ-панели" in ch.texts(), "оглавление справки открывается")
+    check(len(ch.last().kb) >= len(guide.ORDER), "в оглавлении есть все разделы")
+    missing = [k for k in guide.ORDER if not guide.body(k).strip()]
+    check(not missing, f"у каждого раздела есть текст (пустых: {len(missing)})")
+    broken: list[str] = []
+    for key in guide.ORDER:
+        ch.clear()
+        await route(admin_event("callback", payload=f"a:hp:{key}", callback_id="h"), ch)
+        text = ch.texts()
+        has_nav = any("a:hp" == (b.data or "") for r in (ch.last().kb or []) for b in r)
+        if len(text) < 150 or not has_nav:
+            broken.append(guide.title(key))
+    check(not broken, f"все {len(guide.ORDER)} разделов справки открываются "
+                      f"с текстом и навигацией{' — сломаны: ' + ', '.join(broken) if broken else ''}")
+
+    ch.clear()
+    await route(admin_event("callback", payload="a:g:menu", callback_id="g1"), ch)
+    check("Скидки за количество" in ch.texts() or
+          any("cfg:s:price" in (b.data or "") for r in ch.last().kb for b in r),
+          "группа «Меню и цены» ведёт к скидкам")
+    ch.clear()
+    await route(admin_event("callback", payload="a:cfg:s:price", callback_id="g2"), ch)
+    check("скидк" in ch.texts().lower(), "раздел скидок открывается")
+
+    ch.clear()
+    await route(admin_event("callback", payload="a:cfg:s:cur", callback_id="g3"), ch)
+    check("Откуда забирать" in ch.texts(), "настройки формы курьера доступны")
 
     ch.clear()
     await route(admin_event("callback", payload="a:st:d30", callback_id="x"), ch)
@@ -397,6 +436,57 @@ async def main() -> None:
     check(mx.start_link("demo1") == "https://max.ru/fatucci_max_bot?start=demo1",
           "MAX: ссылка для QR собирается верно")
     await mx.close()
+
+    print("\n— Скидки за количество —")
+    from app import pricing
+    tiers = pricing.parse_tiers("3=5, 5=10, 10=15")
+    check([t.qty for t in tiers] == [10, 5, 3], "пороги разобраны и отсортированы")
+    check(pricing.percent_for(1, tiers) == 0, "на 1 набор скидки нет")
+    check(pricing.percent_for(3, tiers) == 5, "от 3 наборов — 5%")
+    check(pricing.percent_for(4, tiers) == 5, "между порогами держится нижний")
+    check(pricing.percent_for(12, tiers) == 15, "выше верхнего порога — максимальная скидка")
+    check(pricing.parse_tiers("ерунда") == [], "мусор в настройке скидок игнорируется")
+
+    price = pricing.calc(90000, 5, tiers)
+    check(price.percent == 10 and price.per_set == 81000,
+          "цена сета со скидкой 10%: 900 ₽ → 810 ₽")
+    check(price.total == 405000 and price.saved == 45000,
+          "итог и экономия посчитаны верно")
+    check(pricing.calc(90000, 1, tiers).total == 90000, "без скидки итог не меняется")
+
+    await repo.set_setting("discount_tiers", "2=10")
+    ch.clear()
+    await route(guest_event("start", payload="demo1"), ch)
+    await route(guest_event("callback", payload="g:order", callback_id="s1"), ch)
+    date_btn = ch.find_button("g:date:")
+    await route(guest_event("callback", payload=date_btn, callback_id="s2"), ch)
+    check("−10%" in ch.texts(), "гостю показана скидка на шаге количества")
+    await route(guest_event("callback", payload="g:qty:2", callback_id="s3"), ch)
+    await route(guest_event("callback", payload="g:reapt", callback_id="s4"), ch)
+    await route(guest_event("callback", payload="g:rephone", callback_id="s5"), ch)
+    ch.clear()
+    await route(guest_event("callback", payload="g:skip", callback_id="s6"), ch)
+    check("Скидка −10%" in ch.texts(), "скидка видна в карточке проверки заказа")
+    check(len(ch.last().kb) == 2, "на экране подтверждения всего две строки кнопок")
+    ch.clear()
+    await route(guest_event("callback", payload="g:edit", callback_id="s6e"), ch)
+    check("Что поправить" in ch.texts(), "кнопка «Изменить» открывает список правок")
+    ch.clear()
+    await route(guest_event("callback", payload="g:back", callback_id="s6b"), ch)
+    check("Проверьте заказ" in ch.texts(), "возврат к карточке заказа работает")
+    await route(guest_event("callback", payload="g:confirm", callback_id="s7"), ch)
+    disc_order = (await repo.list_orders(limit=1))[0]
+    obj_now = await repo.get_object_by_code("demo1")
+    expect_base = obj_now["price_kop"]
+    expect_set = round(expect_base * 0.9 / 100) * 100
+    check(disc_order["discount_pct"] == 10, "скидка сохранена в заказе")
+    check(disc_order["base_price_kop"] == expect_base
+          and disc_order["price_kop"] == expect_set,
+          "в заказе есть и базовая цена, и цена со скидкой")
+    check(disc_order["total_kop"] == expect_set * 2,
+          f"итог заказа со скидкой посчитан верно ({expect_set * 2 / 100:.0f} ₽)")
+    check(disc_order["customer_name"] != "", "имя получателя записано в заказ")
+    await repo.set_setting("discount_tiers", "")
 
     print("\n— Оплата через PayMaster —")
     from app import orders_service, payments
