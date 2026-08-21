@@ -22,6 +22,9 @@ TMP = tempfile.mkdtemp(prefix="fatucci_test_")
 if not os.getenv("DB_SCHEMA"):
     for name in ("DATABASE_URL", "POSTGRES_URL", "POSTGRESQL_URL", "DB_URL"):
         os.environ[name] = ""
+    # адрес базы зашит в коде, поэтому гасим его явным маркером —
+    # иначе тест ушёл бы в боевую базу
+    os.environ["FATUCCI_DATABASE_URL"] = "sqlite"
     os.environ["DB_PATH"] = os.path.join(TMP, "test.db")
 os.environ["TELEGRAM_TOKEN"] = "0:test"
 os.environ["TELEGRAM_BOT_USERNAME"] = "fatucci_test_bot"

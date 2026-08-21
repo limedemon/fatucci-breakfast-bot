@@ -56,6 +56,13 @@ def env_int(*names: str, default: int = 0) -> int:
         return default
 
 
+def _database_url() -> str:
+    """Адрес базы: зашитая строка или переменная окружения (см. app/dsn.py)."""
+    from .dsn import resolve
+
+    return resolve()
+
+
 def _int_list(raw: str) -> list[int]:
     out: list[int] = []
     for part in (raw or "").replace(";", ",").replace(" ", ",").split(","):
@@ -92,10 +99,10 @@ class Config:
         default_factory=lambda: env("PAYMENT_PROVIDER_TOKEN", "PROVIDER_TOKEN", "PAYMASTER_TOKEN")
     )
 
-    # Хранилище. Задан DATABASE_URL — работаем с PostgreSQL, иначе с файлом SQLite.
-    database_url: str = field(
-        default_factory=lambda: env("DATABASE_URL", "POSTGRES_URL", "POSTGRESQL_URL", "DB_URL")
-    )
+    # Хранилище. Адрес берётся из app/dsn.py: там зашита рабочая строка
+    # подключения, а переменная FATUCCI_DATABASE_URL может её перебить.
+    # Пусто — бот работает с локальным файлом SQLite.
+    database_url: str = field(default_factory=lambda: _database_url())
     #: схема PostgreSQL (по умолчанию public) — пригодится, если база общая
     db_schema: str = field(default_factory=lambda: env("DB_SCHEMA", default=""))
     db_path: Path = field(
@@ -135,10 +142,12 @@ class Config:
         """Где лежат данные — без пароля в строке подключения."""
         if not self.database_url:
             return f"SQLite, файл {self.db_path.name}"
+        source = "переменная FATUCCI_DATABASE_URL" if os.getenv("FATUCCI_DATABASE_URL")             else "адрес зашит в коде"
         import re as _re
 
         match = _re.match(r"^\w+://[^:]+:[^@]*@(.+)$", self.database_url)
-        return f"PostgreSQL {match.group(1) if match else '(адрес скрыт)'}"
+        where = match.group(1) if match else "(адрес скрыт)"
+        return f"PostgreSQL {where} — {source}"
 
 
 def _mask(secret: str) -> str:
