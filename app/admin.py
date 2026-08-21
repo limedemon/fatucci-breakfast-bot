@@ -12,7 +12,7 @@ import re
 from datetime import timedelta
 from typing import Any, Callable, Optional
 
-from . import (admins, courier, guide, media, notify, orders_service, payments,
+from . import (admins, courier, db, guide, media, notify, orders_service, payments,
                pricing, qrgen, repo, statuses)
 from .channels.base import MAX, TG, Btn, Channel, Event, Out
 from .config import cfg
@@ -204,6 +204,7 @@ async def handle_callback(ev: Event, ch: Channel) -> None:
         "f": lambda: _offers_route(ev, ch, args),
         "u": lambda: _users_route(ev, ch, args),
         "acc": lambda: _access_route(ev, ch, args),
+        "db": lambda: _db_check(ev, ch),
         "bc": lambda: _broadcast_route(ev, ch, args),
         "cfg": lambda: _settings_route(ev, ch, args),
         "st": lambda: _stats_route(ev, ch, args),
@@ -302,7 +303,18 @@ async def _group(ev: Event, ch: Channel, args: list[str]) -> None:
 
 
 # ==================================================================== главная
+async def _ensure_admin_button(ev: Event, ch: Channel) -> None:
+    """Закрепить кнопку «Админ-панель» под полем ввода — один раз на чат."""
+    if str(ev.chat_id) != str(ev.user_id):
+        return                                   # в рабочем чате кнопка не нужна
+    await ch.show_admin_button(
+        str(ev.chat_id),
+        "🛠 Кнопка админ-панели закреплена внизу — открывайте её оттуда в любой момент.",
+    )
+
+
 async def _home(ev: Event, ch: Channel, new_message: bool = False) -> None:
+    await _ensure_admin_button(ev, ch)
     new_count = await repo.count_orders(status=statuses.NEW)
     work_count = await repo.count_orders(status=f"{statuses.ACCEPTED},{statuses.PAID}")
     tomorrow = fmt_date_iso(today() + timedelta(days=1))
@@ -1075,6 +1087,66 @@ async def _notify_new_admin(ch: Channel, user_id: int) -> None:
         log.debug("Не удалось уведомить нового админа %s: %s", user_id, exc)
 
 
+# ================================================================ база данных
+def _size(num: int) -> str:
+    for unit in ("Б", "КБ", "МБ", "ГБ"):
+        if num < 1024 or unit == "ГБ":
+            return f"{num:.0f} {unit}" if unit == "Б" else f"{num:.1f} {unit}"
+        num /= 1024.0
+    return f"{num:.1f} ГБ"
+
+
+async def _db_check(ev: Event, ch: Channel) -> None:
+    """Проверка хранилища: на месте ли база, что в ней и сколько весит."""
+    await _answer(ev, ch, "Проверяю базу…")
+    report = await db.health()
+
+    if not report["ok"]:
+        text = (
+            "🗄 <b>База данных</b>\n\n"
+            "⛔ <b>Нет связи с базой</b>\n\n"
+            f"Хранилище: <code>{esc(report['where'])}</code>\n"
+            f"Ошибка: <code>{esc(report['error'])}</code>\n\n"
+            "Проверьте переменную <code>DATABASE_URL</code> в панели хостинга: "
+            "адрес и пароль должны быть скопированы целиком, без переносов строк.\n\n"
+            "Пока связи нет, бот не может принимать заказы."
+        )
+        kb = [[Btn(text="🔄 Проверить ещё раз", data="a:db")], _back("a:cfg:m", "⬅️ К настройкам")]
+        await _show(ev, ch, Out(text=text, kb=kb), new_message=True)
+        return
+
+    address = report["where"].replace(report["engine"], "", 1).strip()
+    lines = [
+        "🗄 <b>База данных</b>",
+        "",
+        "✅ <b>Связь есть</b>",
+        f"Тип: {report['engine']}",
+        f"Адрес: <code>{esc(address)}</code>",
+    ]
+    if report["schema"]:
+        lines.append(f"Схема: <code>{esc(report['schema'])}</code>")
+    lines.append(f"Отклик: {report['ping_ms']} мс")
+    if report["size"]:
+        lines.append(f"Размер: {_size(report['size'])}")
+    if report["media_bytes"]:
+        lines.append(f"Из них картинки: {_size(report['media_bytes'])}")
+
+    lines += ["", "<b>Что внутри:</b>"]
+    for title, count in report["tables"]:
+        lines.append(f"• {title}: <b>{count}</b>")
+
+    lines += ["", "<i>Здесь хранится всё: заказы, меню, цены, тексты, настройки, "
+                  "фото сетов и незавершённые заказы гостей. Бэкап базы — "
+                  "это бэкап всего бота.</i>"]
+
+    kb = [
+        [Btn(text="🔄 Проверить ещё раз", data="a:db")],
+        [_help("database")],
+        _back("a:cfg:m", "⬅️ К настройкам"),
+    ]
+    await _show(ev, ch, Out(text="\n".join(lines), kb=kb), new_message=True)
+
+
 # =================================================================== рассылка
 async def _broadcast_route(ev: Event, ch: Channel, args: list[str]) -> None:
     action = args[0] if args else "m"
@@ -1105,6 +1177,7 @@ async def _settings_route(ev: Event, ch: Channel, args: list[str]) -> None:
               for code, (title, _) in SETTING_SECTIONS.items() if code not in hidden]
         kb.append([Btn(text="✍️ Тексты бота", data="a:t:l"),
                    Btn(text="👑 Доступ", data="a:acc:l")])
+        kb.append([Btn(text="🗄 Проверить базу данных", data="a:db")])
         kb.append([Btn(text="🧪 Проверить оплату", data="a:cfg:yk")])
         kb.append([_help("settings")])
         kb.append(_back("a:h", "⬅️ В админку"))

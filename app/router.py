@@ -5,6 +5,7 @@ import logging
 
 from . import admin, admins, flow
 from .channels.base import TG, Btn, Channel, Event, Out
+from .channels.telegram import ADMIN_BUTTON
 
 log = logging.getLogger(__name__)
 
@@ -18,6 +19,9 @@ async def route(ev: Event, ch: Channel) -> None:
 
 async def _route(ev: Event, ch: Channel) -> None:
     text = (ev.text or "").strip()
+    if text == ADMIN_BUTTON:
+        # нажали постоянную кнопку под полем ввода — это то же самое, что /admin
+        ev.text = text = "/admin"
 
     # служебная команда: узнать ID чата (нужно, чтобы задать рабочий чат заказов)
     if text.startswith("/id"):
@@ -52,6 +56,10 @@ async def _claim_owner(ev: Event, ch: Channel) -> None:
     """Первый пользователь бота получает права владельца."""
     if not await admins.claim_owner(ev.user_id, ev.username, ev.full_name):
         return
+    await ch.show_admin_button(
+        str(ev.chat_id),
+        "🛠 Кнопка админ-панели закреплена внизу — она всегда под рукой.",
+    )
     await ch.send(ev.chat_id, Out(
         text=(
             "👑 <b>Вы владелец этого бота</b>\n\n"

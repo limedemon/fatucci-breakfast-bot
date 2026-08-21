@@ -398,6 +398,71 @@ def where() -> str:
     return f"PostgreSQL {match.group(1) if match else '(адрес скрыт)'}"
 
 
+#: таблицы, которые показываем в проверке базы: (таблица, подпись)
+HEALTH_TABLES = [
+    ("orders", "Заказов"),
+    ("order_events", "Записей истории"),
+    ("users", "Гостей"),
+    ("objects", "Объектов"),
+    ("sets", "Сетов"),
+    ("offers", "Доп. предложений"),
+    ("sessions", "Незавершённых заказов"),
+    ("admins", "Администраторов"),
+    ("media", "Картинок"),
+    ("digests", "Выгрузок курьерам"),
+]
+
+
+async def health() -> dict[str, Any]:
+    """Проверка хранилища для админ-панели: связь, объём, содержимое."""
+    import time
+
+    report: dict[str, Any] = {
+        "engine": "PostgreSQL" if IS_PG else "SQLite",
+        "where": where(),
+        "schema": cfg.db_schema or ("public" if IS_PG else ""),
+        "ok": False,
+        "ping_ms": 0,
+        "error": "",
+        "tables": [],
+        "size": 0,
+        "media_bytes": 0,
+        "version": "",
+    }
+
+    started = time.perf_counter()
+    try:
+        await fetchval("SELECT 1")
+        report["ok"] = True
+    except Exception as exc:  # noqa: BLE001
+        report["error"] = str(exc)[:300]
+        return report
+    finally:
+        report["ping_ms"] = round((time.perf_counter() - started) * 1000)
+
+    for table, title in HEALTH_TABLES:
+        try:
+            count = int(await fetchval(f"SELECT COUNT(*) FROM {table}", (), 0))
+        except Exception:  # noqa: BLE001 — таблицы может не быть на старой базе
+            continue
+        report["tables"].append((title, count))
+
+    try:
+        if IS_PG:
+            report["version"] = str(await fetchval("SELECT version()", (), ""))[:40]
+            report["size"] = int(await fetchval(
+                "SELECT pg_database_size(current_database())", (), 0))
+        else:
+            report["version"] = "SQLite"
+            report["size"] = cfg.db_path.stat().st_size if cfg.db_path.exists() else 0
+        report["media_bytes"] = int(await fetchval(
+            "SELECT COALESCE(SUM(LENGTH(data)), 0) FROM media", (), 0))
+    except Exception as exc:  # noqa: BLE001
+        log.debug("Не удалось собрать размеры базы: %s", exc)
+
+    return report
+
+
 async def _seed() -> None:
     """Первичное наполнение: настройки, тексты, демо-объекты, демо-сеты, допредложения."""
     from .defaults import DEFAULT_SETTINGS, DEFAULT_TEXTS, DEMO_OBJECTS, DEMO_OFFERS, DEMO_SETS

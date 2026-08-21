@@ -58,6 +58,7 @@ class FakeChannel(Channel):
         self.username = "fatucci_test_bot"
         self.sent: list[tuple[str, Out]] = []
         self.invoices: list[dict] = []
+        self.admin_button_shown = False
         self._id = 0
 
     async def send(self, chat_id: str, out: Out) -> str:
@@ -114,9 +115,15 @@ class FakeChannel(Channel):
                         return btn.data
         return ""
 
+    async def show_admin_button(self, chat_id: str, text: str) -> bool:
+        self.admin_button_shown = True
+        self.sent.append((str(chat_id), Out(text=text)))
+        return True
+
     def clear(self) -> None:
         self.sent.clear()
         self.invoices.clear()
+        self.admin_button_shown = False
 
 
 GUEST = "555"
@@ -243,6 +250,35 @@ async def main() -> None:
         ch.clear()
         await route(admin_event("callback", payload=section, callback_id="x"), ch)
         check(len(ch.sent) > 0 and len(ch.last().text) > 10, f"раздел админки: {title}")
+
+    print("\n— Проверка базы данных —")
+    ch.clear()
+    await route(admin_event("callback", payload="a:db", callback_id="db1"), ch)
+    text = ch.texts()
+    check("База данных" in text, "раздел проверки базы открывается")
+    check("Связь есть" in text, "связь с базой подтверждена")
+    check("Заказов:" in text and "Гостей:" in text, "показано содержимое таблиц")
+    check("Отклик:" in text, "измерено время отклика базы")
+    check(any("a:db" == (b.data or "") for r in ch.last().kb for b in r),
+          "есть кнопка повторной проверки")
+    report = await db.health()
+    check(report["ok"] and report["ping_ms"] >= 0, "health() отдаёт исправный отчёт")
+    check(any(title == "Заказов" for title, _ in report["tables"]),
+          "в отчёте есть таблица заказов")
+    check(report["engine"] in ("SQLite", "PostgreSQL"), f"движок определён: {report['engine']}")
+    check("@" not in report["where"], "пароль базы в отчёт не попадает")
+
+    print("\n— Кнопка админ-панели —")
+    from app.channels.telegram import ADMIN_BUTTON
+    ch.clear()
+    await route(admin_event("callback", payload="a:h", callback_id="k1"), ch)
+    check(ch.admin_button_shown, "при входе в админку кнопка закрепляется")
+    ch.clear()
+    await route(admin_event("text", text=ADMIN_BUTTON), ch)
+    check("Админ-панель" in ch.texts(), "нажатие кнопки открывает админку")
+    ch.clear()
+    await route(guest_event("text", text=ADMIN_BUTTON), ch)
+    check("Админ-панель" not in ch.texts(), "у гостя эта кнопка админку не открывает")
 
     print("\n— Справка в админке —")
     from app import guide

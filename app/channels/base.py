@@ -103,6 +103,10 @@ class Channel(ABC):
         """Скачать присланный файл в память."""
         return b''
 
+    async def show_admin_button(self, chat_id: str, text: str) -> bool:
+        """Закрепить кнопку админ-панели под полем ввода (есть только в Telegram)."""
+        return False
+
     async def send_invoice(self, chat_id: str, title: str, description: str, payload: str,
                            amount_kop: int, provider_token: str, label: str = "К оплате",
                            provider_data: str = "") -> tuple[bool, str]:

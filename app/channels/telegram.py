@@ -31,6 +31,9 @@ log = logging.getLogger(__name__)
 CAPTION_LIMIT = 1024
 TEXT_LIMIT = 4096
 
+#: подпись постоянной кнопки админа под полем ввода
+ADMIN_BUTTON = "🛠 Админ-панель"
+
 Router = Callable[[Event, Channel], Awaitable[None]]
 
 
@@ -45,6 +48,8 @@ class TelegramChannel(Channel):
         )
         self.username = username
         self.dp = Dispatcher()
+        #: чаты, где кнопка админ-панели уже закреплена (сбрасывается при рестарте)
+        self._admin_kb_chats: set[str] = set()
 
     # ------------------------------------------------------------- отправка
     async def send(self, chat_id: str, out: Out) -> str:
@@ -109,13 +114,43 @@ class TelegramChannel(Channel):
             return str(tail.message_id)
         return str(msg.message_id)
 
-    async def _drop_reply_keyboard(self, chat_id: str) -> None:
-        """Снять reply-клавиатуру: служебное сообщение, которое сразу удаляем."""
+    # ------------------------------------------------ кнопка админ-панели
+    def _admin_markup(self) -> ReplyKeyboardMarkup:
+        """Постоянная кнопка под полем ввода — только для администраторов."""
+        return ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text=ADMIN_BUTTON)]],
+            resize_keyboard=True,
+            is_persistent=True,
+        )
+
+    async def show_admin_button(self, chat_id: str, text: str) -> bool:
+        """Закрепить кнопку админ-панели. Возвращает False, если она уже стоит."""
+        if chat_id in self._admin_kb_chats:
+            return False
         try:
-            msg = await self.bot.send_message(chat_id, "⌛", reply_markup=ReplyKeyboardRemove())
+            await self.bot.send_message(chat_id, text, reply_markup=self._admin_markup())
+            self._admin_kb_chats.add(chat_id)
+            return True
+        except TelegramAPIError as exc:
+            log.debug("Не удалось закрепить кнопку админки: %s", exc)
+            return False
+
+    async def _drop_reply_keyboard(self, chat_id: str) -> None:
+        """Снять reply-клавиатуру: служебное сообщение, которое сразу удаляем.
+
+        У администратора вместо снятия возвращаем кнопку админ-панели —
+        иначе она пропадала бы после каждого запроса телефона.
+        """
+        from .. import admins
+
+        is_admin = await admins.is_admin(chat_id)
+        markup = self._admin_markup() if is_admin else ReplyKeyboardRemove()
+        try:
+            msg = await self.bot.send_message(chat_id, "⌛", reply_markup=markup)
             await self.bot.delete_message(chat_id, msg.message_id)
         except TelegramAPIError:
-            pass
+            # не получилось — пусть следующий вход в админку поставит кнопку заново
+            self._admin_kb_chats.discard(chat_id)
 
     async def edit(self, chat_id: str, message_id: str, out: Out) -> bool:
         try:
