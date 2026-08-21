@@ -122,7 +122,18 @@ async def main() -> None:
             "рядом с main.py. Запускать нечего."
         )
         return
-    await db.init_db()
+    try:
+        await db.init_db()
+    except db.StorageError as exc:
+        log.error("Не удалось подключиться к базе данных.")
+        for line in str(exc).split("\n"):
+            log.error("  %s", line.replace("<code>", "").replace("</code>", ""))
+        log.error("Бот не может работать без базы — останавливаюсь.")
+        return
+    except Exception as exc:  # noqa: BLE001
+        log.error("Ошибка базы данных при запуске: %s", exc)
+        log.error("Проверьте DATABASE_URL в панели хостинга. Останавливаюсь.")
+        return
 
     admin_count = await admins.count()
     if admin_count:

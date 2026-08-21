@@ -239,18 +239,77 @@ def _to_pg(sql: str) -> str:
     return "".join(out)
 
 
+class StorageError(RuntimeError):
+    """Понятная ошибка подключения к базе — с подсказкой, что чинить."""
+
+
+def dsn_hint() -> str:
+    """Приметы строки подключения, по которым её можно сверить с панелью хостинга.
+
+    Пароль целиком не показываем — только длину и края, этого хватает,
+    чтобы поймать обрезанное или лишний раз скопированное значение.
+    """
+    match = re.match(r"^(\w+)://([^:]+):([^@]*)@([^/]+)/(.+)$", cfg.database_url)
+    if not match:
+        return ("Строка подключения не похожа на адрес PostgreSQL. Ожидается вид:\n"
+                "<code>postgresql://пользователь:пароль@хост:порт/база</code>")
+    _, user, password, host, database = match.groups()
+    edges = f"{password[:2]}…{password[-2:]}" if len(password) > 6 else "(очень короткий)"
+    return (f"Пользователь: {user}\n"
+            f"Сервер: {host}\n"
+            f"База: {database}\n"
+            f"Пароль: {len(password)} символов, {edges}")
+
+
+async def _open_pool() -> Any:
+    """Пул PostgreSQL с понятными ошибками и повтором при сетевых сбоях."""
+    import asyncpg
+
+    settings = {"search_path": cfg.db_schema} if cfg.db_schema else None
+    last: Optional[Exception] = None
+
+    for attempt in range(3):
+        try:
+            return await asyncpg.create_pool(
+                cfg.database_url, min_size=1, max_size=5, command_timeout=30,
+                max_inactive_connection_lifetime=180, server_settings=settings,
+            )
+        except asyncpg.InvalidPasswordError as exc:
+            raise StorageError(
+                "Пароль базы не принят.\n\n"
+                "Сервер отвечает, значит адрес верный — не совпадает именно пароль "
+                "в переменной DATABASE_URL.\n\n"
+                "Скопируйте строку подключения из панели хостинга заново, целиком "
+                "и одной строкой, и вставьте в переменную окружения.\n\n"
+                f"{dsn_hint()}"
+            ) from exc
+        except asyncpg.InvalidCatalogNameError as exc:
+            raise StorageError(
+                "Базы с таким именем на сервере нет — проверьте последнюю часть "
+                f"адреса в DATABASE_URL.\n\n{dsn_hint()}"
+            ) from exc
+        except asyncpg.InvalidAuthorizationSpecificationError as exc:
+            raise StorageError(
+                f"Пользователю базы отказано в доступе.\n\n{dsn_hint()}"
+            ) from exc
+        except (OSError, asyncio.TimeoutError) as exc:
+            last = exc
+            log.warning("База не отвечает (попытка %s из 3): %s", attempt + 1, exc)
+            await asyncio.sleep(2 * (attempt + 1))
+
+    raise StorageError(
+        "Сервер базы не отвечает. Проверьте адрес и порт в DATABASE_URL, "
+        f"а также доступна ли база с хостинга.\n\n{dsn_hint()}\n\n"
+        f"Последняя ошибка: {last}"
+    )
+
+
 # ------------------------------------------------------------------ соединение
 async def connect() -> Any:
     global _sqlite_conn, _pg_pool
     if IS_PG:
         if _pg_pool is None:
-            import asyncpg
-
-            settings = {"search_path": cfg.db_schema} if cfg.db_schema else None
-            _pg_pool = await asyncpg.create_pool(
-                cfg.database_url, min_size=1, max_size=5, command_timeout=30,
-                max_inactive_connection_lifetime=180, server_settings=settings,
-            )
+            _pg_pool = await _open_pool()
         return _pg_pool
 
     if _sqlite_conn is None:
