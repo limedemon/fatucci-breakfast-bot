@@ -1357,9 +1357,19 @@ async def _stats_route(ev: Event, ch: Channel, args: list[str]) -> None:
         f"Заказов: <b>{totals['cnt']}</b>",
         f"Сетов: <b>{totals['sets']}</b>",
         f"Выручка (оплачено): <b>{fmt_money(totals['revenue'])}</b>",
-        "",
-        "<b>По объектам:</b>",
     ]
+
+    # заказы считаются по дате доставки, поэтому оформленные «на потом» в период
+    # не попадают. Показываем их отдельной строкой, чтобы не выглядело как ноль.
+    ahead = await repo.stats_totals(fmt_date_iso(date_to + timedelta(days=1)),
+                                    fmt_date_iso(date_to + timedelta(days=365)))
+    if ahead["cnt"]:
+        lines.append(
+            f"🔜 Ещё <b>{ahead['cnt']}</b> "
+            f"{plural(ahead['cnt'], 'заказ', 'заказа', 'заказов')} на более поздние даты"
+        )
+
+    lines += ["", "<b>По объектам:</b>"]
     visits = await repo.qr_visits(iso_from, iso_to)
     codes = {obj["id"]: obj["code"] for obj in await repo.list_objects()}
     shown_codes = set()

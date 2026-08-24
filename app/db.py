@@ -137,12 +137,6 @@ CREATE TABLE IF NOT EXISTS orders (
     created_at     TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at     TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE INDEX IF NOT EXISTS idx_orders_date   ON orders (delivery_date);
-CREATE INDEX IF NOT EXISTS idx_orders_status ON orders (status);
-CREATE INDEX IF NOT EXISTS idx_orders_object ON orders (object_id);
-CREATE INDEX IF NOT EXISTS idx_orders_user   ON orders (channel, ext_id);
-CREATE INDEX IF NOT EXISTS idx_orders_group  ON orders (group_key);
-
 CREATE TABLE IF NOT EXISTS order_events (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     order_id INTEGER NOT NULL,
@@ -151,8 +145,6 @@ CREATE TABLE IF NOT EXISTS order_events (
     note     TEXT NOT NULL DEFAULT '',
     at       TEXT NOT NULL DEFAULT (datetime('now'))
 );
-CREATE INDEX IF NOT EXISTS idx_events_order ON order_events (order_id);
-
 CREATE TABLE IF NOT EXISTS sessions (
     channel     TEXT NOT NULL,
     ext_id      TEXT NOT NULL,
@@ -223,6 +215,18 @@ CREATE TABLE IF NOT EXISTS admin_state (
     data     TEXT NOT NULL DEFAULT '{}'
 );
 """
+
+#: Индексы создаются ОТДЕЛЬНО и уже после миграций.
+#: Иначе при обновлении бота на существующей базе индекс по новой колонке
+#: пытался бы создаться раньше, чем сама колонка появится, и запуск падал бы.
+INDEXES = [
+    "CREATE INDEX IF NOT EXISTS idx_orders_date   ON orders (delivery_date)",
+    "CREATE INDEX IF NOT EXISTS idx_orders_status ON orders (status)",
+    "CREATE INDEX IF NOT EXISTS idx_orders_object ON orders (object_id)",
+    "CREATE INDEX IF NOT EXISTS idx_orders_user   ON orders (channel, ext_id)",
+    "CREATE INDEX IF NOT EXISTS idx_orders_group  ON orders (group_key)",
+    "CREATE INDEX IF NOT EXISTS idx_events_order  ON order_events (order_id)",
+]
 
 #: серверное «сейчас» в том же текстовом виде, что и у SQLite
 PG_NOW = "to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS')"
@@ -449,19 +453,52 @@ async def _migrate() -> None:
             continue
         log.info("Миграция: добавляю %s.%s", table, column)
         await execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+    await _backfill()
 
 
-async def init_db() -> None:
-    schema = _pg_schema(SCHEMA) if IS_PG else SCHEMA
+async def _backfill() -> None:
+    """Привести старые записи к нынешним правилам.
+
+    Заказы, оформленные до появления многодневных заказов, остались без номера
+    группы. Считаем каждый такой заказ группой из одного дня — тогда карточки,
+    статусы и отмена работают с ними так же, как с новыми.
+    """
+    count = int(await fetchval("SELECT COUNT(*) FROM orders WHERE group_key = ''", (), 0))
+    if not count:
+        return
+    await execute("UPDATE orders SET group_key = number WHERE group_key = ''")
+    log.info("Миграция: проставлен номер группы у %s старых заказов", count)
+
+
+async def apply_ddl(ddl: str) -> None:
+    """Выполнить набор DDL-команд одним куском (нужен и тестам миграций)."""
     conn = await connect()
     if IS_PG:
         async with conn.acquire() as pg:
-            await pg.execute(schema)
+            await pg.execute(_pg_schema(ddl))
     else:
         async with _lock:
-            await conn.executescript(schema)
+            await conn.executescript(ddl)
             await conn.commit()
+
+
+async def _create_indexes() -> None:
+    """Индексы — после миграций, чтобы новые колонки уже существовали.
+
+    Индекс ускоряет работу, но не влияет на правильность: если конкретный
+    создать не вышло, пишем предупреждение и работаем дальше, а не роняем бота.
+    """
+    for statement in INDEXES:
+        try:
+            await execute(statement)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Не удалось создать индекс (%s): %s", statement.split()[5], exc)
+
+
+async def init_db() -> None:
+    await apply_ddl(SCHEMA)
     await _migrate()
+    await _create_indexes()
     await _seed()
     log.info("База данных готова: %s", where())
 

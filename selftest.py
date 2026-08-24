@@ -34,6 +34,7 @@ os.environ["PAYMENT_PROVIDER_TOKEN"] = ""
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+import re  # noqa: E402
 from datetime import timedelta  # noqa: E402
 
 from app import courier, db, guide, payments, pricing, repo, statuses  # noqa: E402
@@ -193,10 +194,61 @@ async def place_order(ch: FakeChannel, dates: int = 1, qty: int = 2, who: str = 
     return await repo.group_orders(key)
 
 
+async def simulate_old_database() -> None:
+    """Создать базу такой, какой она была до последних правок.
+
+    Так проверяется не установка «с нуля», а обновление бота на базе, где уже
+    лежат заказы: новые колонки должны доехать миграциями, а индексы по ним —
+    создаться только после этого.
+    """
+    old = db.SCHEMA
+    for _table, column, _ddl in db.MIGRATIONS:
+        old = re.sub(rf"^ *{column} .*\n", "", old, flags=re.M)
+    old = re.sub(r",(\s*\);)", r"\1", old)        # запятая перед закрывающей скобкой
+    await db.apply_ddl(old)
+
+
+async def index_names() -> set[str]:
+    if db.IS_PG:
+        rows = await db.fetchall(
+            "SELECT indexname AS name FROM pg_indexes WHERE schemaname = current_schema()")
+    else:
+        rows = await db.fetchall("SELECT name FROM sqlite_master WHERE type = 'index'")
+    return {row["name"] for row in rows}
+
+
 async def main() -> None:
     ch = FakeChannel()
     base.REGISTRY["tg"] = ch
+
+    print("— Обновление на уже работающей базе —")
+    await simulate_old_database()
+    missing_before = {c for _t, c, _d in db.MIGRATIONS} - await db._columns("orders")
+    check(bool(missing_before), "старая база действительно без новых колонок")
+    # заказ, оформленный ещё старой версией бота
+    legacy_id = await db.insert(
+        "INSERT INTO orders (number, channel, ext_id, delivery_date, qty, apartment, "
+        "status, price_kop, total_kop) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        ("F-00777", "tg", GUEST, fmt_date_iso(today()), 1, "7", "paid", 90000, 90000))
+
     await db.init_db()
+
+    legacy = await repo.get_order(legacy_id)
+    check(legacy is not None, "старый заказ пережил обновление")
+    check(legacy["group_key"] == "F-00777", "старому заказу проставлен номер группы")
+    check(legacy["allergies"] == "" and legacy["discount_pct"] == 0,
+          "новые поля у старого заказа заполнены значениями по умолчанию")
+    check(await repo.group_of(legacy) == [legacy],
+          "старый заказ читается как заказ на один день")
+    await db.execute("DELETE FROM orders WHERE id = ?", (legacy_id,))
+    order_cols = await db._columns("orders")
+    for column in ("group_key", "allergies", "address_ok", "discount_pct",
+                   "base_price_kop", "customer_name"):
+        check(column in order_cols, f"миграция добавила orders.{column}")
+    check("delivery_time" in await db._columns("objects"),
+          "миграция добавила objects.delivery_time")
+    check("idx_orders_group" in await index_names(),
+          "индекс по новой колонке создался после миграции")
     await repo.set_setting("pm_token", TEST_TOKEN)     # касса «подключена»
 
     print("\n— Заказ на один день —")
@@ -440,10 +492,18 @@ async def main() -> None:
     await route(guest_event("start", payload="demo1"), ch)
     after = (await repo.qr_visits(fmt_date_iso(today()), fmt_date_iso(today()))).get("demo1", 0)
     check(after == before + 1, "переход по QR посчитан")
+    # заказы в тестах оформляются на будущие даты, а статистика считает по дате
+    # доставки — поэтому одну доставку переносим на сегодня осознанно
+    group = await place_order(ch, dates=1, qty=2)
+    await repo.update_order(group[0]["id"], delivery_date=fmt_date_iso(today()))
     ch.clear()
     await route(admin_event("callback", payload="a:st:d30", callback_id="s1"), ch)
-    check("переход" in ch.texts(), "в статистике видны переходы по QR")
-    check("Выручка" in ch.texts(), "в статистике есть выручка по объекту")
+    stats = ch.texts()
+    check("переход" in stats, "в статистике видны переходы по QR")
+    check("Альфа" in stats, "объект показан отдельной строкой")
+    check("Выручка" in stats, "в статистике есть выручка по объекту")
+    check("на более поздние даты" in stats,
+          "заказы на будущие даты не теряются, а показаны отдельно")
 
     print("\n— Ежедневное напоминание —")
     from app import scheduler
