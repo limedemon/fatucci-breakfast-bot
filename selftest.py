@@ -39,7 +39,7 @@ from datetime import timedelta  # noqa: E402
 from app import courier, db, guide, payments, pricing, repo, statuses  # noqa: E402
 from app.channels import base  # noqa: E402
 from app.channels.base import Channel, Event, Out  # noqa: E402
-from app.channels.telegram import ADMIN_BUTTON  # noqa: E402
+from app.channels.telegram import ADMIN_BUTTON, SUPPORT_BUTTON  # noqa: E402
 from app.router import route  # noqa: E402
 from app.utils import fmt_date_iso, today, utc_stamp  # noqa: E402
 
@@ -66,6 +66,7 @@ class FakeChannel(Channel):
         self.sent: list[tuple[str, Out]] = []
         self.invoices: list[dict] = []
         self.admin_button_shown = False
+        self.support_button_shown = False
         self.description = ""
         self._id = 0
 
@@ -101,6 +102,11 @@ class FakeChannel(Channel):
 
     async def show_admin_button(self, chat_id: str, text: str) -> bool:
         self.admin_button_shown = True
+        self.sent.append((str(chat_id), Out(text=text)))
+        return True
+
+    async def show_support_button(self, chat_id: str, text: str) -> bool:
+        self.support_button_shown = True
         self.sent.append((str(chat_id), Out(text=text)))
         return True
 
@@ -146,6 +152,7 @@ class FakeChannel(Channel):
         self.sent.clear()
         self.invoices.clear()
         self.admin_button_shown = False
+        self.support_button_shown = False
 
 
 def guest_event(kind: str, who: str = GUEST, **kwargs) -> Event:
@@ -460,6 +467,42 @@ async def main() -> None:
     ch.clear()
     await scheduler.reminder_tick()
     check(bool(ch.find_button("g:resume")), "напоминание о брошенном заказе отправлено")
+
+    print("\n— Кнопка «Поддержка» —")
+    ch.clear()
+    await route(guest_event("start", payload="demo1"), ch)
+    check(ch.support_button_shown, "гостю закреплена кнопка «Поддержка»")
+    check("Поддержка" in ch.texts(), "гостю объяснили, что это за кнопка")
+
+    ch.clear()
+    await route(guest_event("text", text=SUPPORT_BUTTON), ch)
+    support = await repo.get_setting("support_contact")
+    check(support in ch.texts(), f"по кнопке пришёл контакт поддержки ({support})")
+    check(any(b.url.startswith("https://t.me/") for row in ch.last().kb or [] for b in row),
+          "есть кнопка-ссылка на переписку с поддержкой")
+
+    ch.clear()
+    await route(guest_event("callback", payload="g:order", callback_id="sp1"), ch)
+    first_date = ch.find_button("g:date:")
+    await route(guest_event("callback", payload=first_date, callback_id="sp2"), ch)
+    ch.clear()
+    await route(guest_event("text", text=SUPPORT_BUTTON), ch)
+    check(support in ch.texts(), "поддержка отвечает и посреди оформления заказа")
+    session = await repo.get_session("tg", GUEST)
+    check(session is not None and session["state"] == "date",
+          "черновик заказа при этом не сбился")
+
+    ch.clear()
+    await route(admin_event("text", text="/start"), ch)
+    check(not ch.support_button_shown, "у админа остаётся кнопка админ-панели")
+
+    await repo.set_setting("support_contact", "+7 900 000-00-00")
+    ch.clear()
+    await route(guest_event("text", text=SUPPORT_BUTTON), ch)
+    check("+7 900 000-00-00" in ch.texts(), "контакт поддержки берётся из настроек")
+    check(not any(b.url for row in ch.last().kb or [] for b in row),
+          "для телефона ссылка-кнопка не выдумывается")
+    await repo.set_setting("support_contact", "@marina_fatucci")
 
     print("\n— Админка —")
     ch.clear()

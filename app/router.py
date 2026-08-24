@@ -5,7 +5,7 @@ import logging
 
 from . import admin, admins, flow
 from .channels.base import TG, Btn, Channel, Event, Out
-from .channels.telegram import ADMIN_BUTTON
+from .channels.telegram import ADMIN_BUTTON, SUPPORT_BUTTON
 
 log = logging.getLogger(__name__)
 
@@ -22,6 +22,11 @@ async def _route(ev: Event, ch: Channel) -> None:
     if text == ADMIN_BUTTON:
         # нажали постоянную кнопку под полем ввода — это то же самое, что /admin
         ev.text = text = "/admin"
+
+    # кнопка «Поддержка» работает в любой момент и не сбивает оформление заказа
+    if text == SUPPORT_BUTTON or text == "/support":
+        await flow.show_support(ev, ch)
+        return
 
     # служебная команда: узнать ID чата (нужно, чтобы задать рабочий чат заказов)
     if text.startswith("/id"):

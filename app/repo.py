@@ -63,6 +63,7 @@ async def render_text(key: str, **kwargs: Any) -> str:
     common = {
         "manager_contact": await get_setting("manager_contact"),
         "manager_phone": await get_setting("manager_phone"),
+        "support_contact": await get_setting("support_contact"),
         "cutoff": kwargs.pop("cutoff", await default_cutoff()),
         "cancel_deadline": await get_setting("cancel_deadline", "18:30"),
         "delivery_time": kwargs.pop("delivery_time", await default_delivery_time()),

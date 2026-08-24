@@ -34,6 +34,9 @@ TEXT_LIMIT = 4096
 #: подпись постоянной кнопки админа под полем ввода
 ADMIN_BUTTON = "🛠 Админ-панель"
 
+#: подпись постоянной кнопки гостя под полем ввода
+SUPPORT_BUTTON = "🆘 Поддержка"
+
 Router = Callable[[Event, Channel], Awaitable[None]]
 
 
@@ -50,6 +53,8 @@ class TelegramChannel(Channel):
         self.dp = Dispatcher()
         #: чаты, где кнопка админ-панели уже закреплена (сбрасывается при рестарте)
         self._admin_kb_chats: set[str] = set()
+        #: чаты, где гостю уже закреплена кнопка «Поддержка»
+        self._support_kb_chats: set[str] = set()
 
     # ------------------------------------------------------------- отправка
     async def send(self, chat_id: str, out: Out) -> str:
@@ -123,6 +128,14 @@ class TelegramChannel(Channel):
             is_persistent=True,
         )
 
+    def _support_markup(self) -> ReplyKeyboardMarkup:
+        """Постоянная кнопка под полем ввода — для гостей."""
+        return ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(text=SUPPORT_BUTTON)]],
+            resize_keyboard=True,
+            is_persistent=True,
+        )
+
     async def set_description(self, text: str) -> bool:
         """Текст, который гость видит до нажатия Start."""
         if not text.strip():
@@ -146,22 +159,40 @@ class TelegramChannel(Channel):
             log.debug("Не удалось закрепить кнопку админки: %s", exc)
             return False
 
+    async def show_support_button(self, chat_id: str, text: str) -> bool:
+        """Закрепить кнопку «Поддержка». Возвращает False, если она уже стоит."""
+        if chat_id in self._support_kb_chats:
+            return False
+        try:
+            await self.bot.send_message(chat_id, text, reply_markup=self._support_markup())
+            self._support_kb_chats.add(chat_id)
+            return True
+        except TelegramAPIError as exc:
+            log.debug("Не удалось закрепить кнопку поддержки: %s", exc)
+            return False
+
     async def _drop_reply_keyboard(self, chat_id: str) -> None:
         """Снять reply-клавиатуру: служебное сообщение, которое сразу удаляем.
 
-        У администратора вместо снятия возвращаем кнопку админ-панели —
-        иначе она пропадала бы после каждого запроса телефона.
+        Совсем пустой клавиатуру не оставляем: администратору возвращаем кнопку
+        админ-панели, гостю — «Поддержка». Иначе постоянная кнопка пропадала бы
+        после каждого запроса телефона.
         """
         from .. import admins
 
-        is_admin = await admins.is_admin(chat_id)
-        markup = self._admin_markup() if is_admin else ReplyKeyboardRemove()
+        if await admins.is_admin(chat_id):
+            markup = self._admin_markup()
+        elif chat_id in self._support_kb_chats:
+            markup = self._support_markup()
+        else:
+            markup = ReplyKeyboardRemove()
         try:
             msg = await self.bot.send_message(chat_id, "⌛", reply_markup=markup)
             await self.bot.delete_message(chat_id, msg.message_id)
         except TelegramAPIError:
-            # не получилось — пусть следующий вход в админку поставит кнопку заново
+            # не получилось — пусть следующий вход поставит кнопку заново
             self._admin_kb_chats.discard(chat_id)
+            self._support_kb_chats.discard(chat_id)
 
     async def edit(self, chat_id: str, message_id: str, out: Out) -> bool:
         try:
