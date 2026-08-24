@@ -29,6 +29,7 @@ from .utils import (
     fmt_phone,
     parse_date,
     parse_money,
+    plural,
     slug_code,
     today,
 )
@@ -87,7 +88,10 @@ SETTING_SECTIONS: dict[str, tuple[str, list[FieldSpec]]] = {
         ("manager_contact", "Контакт менеджера", "text"),
         ("manager_phone", "Телефон менеджера", "text"),
         ("order_prefix", "Префикс номера заказа", "text"),
-        ("comment_enabled", "Спрашивать комментарий", "bool"),
+        ("comment_enabled", "Спрашивать пожелания", "bool"),
+        ("allergies_enabled", "Спрашивать про аллергии", "bool"),
+        ("multiday_enabled", "Разрешить заказ на несколько дней", "bool"),
+        ("cancel_deadline", "Отмена возможна до (накануне)", "time"),
         ("orders_paused", "Пауза приёма заказов", "bool"),
     ]),
     "ch": ("📱 Каналы", [
@@ -99,6 +103,9 @@ SETTING_SECTIONS: dict[str, tuple[str, list[FieldSpec]]] = {
         ("reminder_enabled", "Напоминать о брошенном заказе", "bool"),
         ("reminder_after_min", "Через сколько минут", "int"),
         ("reminder_max_hours", "Не старше скольких часов", "int"),
+        ("daily_remind_enabled", "Ежедневное «успейте заказать»", "bool"),
+        ("daily_remind_time", "Во сколько напоминать", "time"),
+        ("daily_remind_audience", "Кому: all или buyers", "text"),
     ]),
     "price": ("💰 Скидки за количество", [
         ("discount_tiers", "Пороги скидок", "text"),
@@ -120,13 +127,13 @@ SETTING_SECTIONS: dict[str, tuple[str, list[FieldSpec]]] = {
         ("courier_empty", "Если заказов нет", "text"),
     ]),
     "pay": ("💳 Оплата", [
-        ("pay_enabled", "Онлайн-оплата включена", "bool"),
-        ("pm_token", "Токен PayMaster от @BotFather", "secret"),
-        ("pm_provider_data", "Доп. данные провайдера (JSON)", "text"),
+        ("pay_enabled", "Приём оплаты включён", "bool"),
+        ("pm_token", "Токен кассы от @BotFather", "secret"),
     ]),
 }
 
 TEXT_TITLES: dict[str, str] = {
+    "bot_description": "Приветствие до кнопки Start",
     "welcome": "Приветствие (без объекта)",
     "welcome_object": "Приветствие (объект известен)",
     "menu_intro": "Заголовок раздела «Сеты»",
@@ -134,7 +141,7 @@ TEXT_TITLES: dict[str, str] = {
     "how_to_order": "Как заказать",
     "faq": "Частые вопросы",
     "payment_info": "Об оплате",
-    "payment_unavailable": "Оплата недоступна",
+    "payment_unavailable": "Если счёт выставить не удалось",
     "order_accepted": "Заявка принята",
     "status_accepted": "Статус: принят в работу",
     "status_paid": "Статус: оплачен",
@@ -147,7 +154,13 @@ TEXT_TITLES: dict[str, str] = {
     "blocked": "Гость в чёрном списке",
     "orders_paused": "Приём заказов на паузе",
     "no_dates": "Нет доступных дат",
-    "choose_object": "Выбор объекта",
+    "rules": "Условия заказа (правила)",
+    "pay_by_invoice": "Сообщение перед счётом",
+    "daily_reminder": "Ежедневное «успейте заказать»",
+    "too_late": "Приём заказов на завтра закрыт",
+    "ask_address": "Запрос адреса (общий QR)",
+    "address_unknown": "Адрес не найден среди объектов",
+    "ask_allergies": "Запрос про аллергии",
     "ask_apartment": "Запрос номера апартаментов",
     "ask_phone": "Запрос телефона",
     "ask_comment": "Запрос комментария",
@@ -332,8 +345,8 @@ async def _home(ev: Event, ch: Channel, new_message: bool = False) -> None:
     warnings = []
     if await repo.get_bool("orders_paused"):
         warnings.append("⏸ Приём заказов на паузе")
-    if not await payments.is_configured():
-        warnings.append("💳 Оплата не подключена")
+    if not await payments.invoice_available():
+        warnings.append("💳 Касса не подключена — гости не могут оформить заказ")
     if not (await repo.get_setting("orders_chat_id") or cfg.orders_chat_id):
         warnings.append("💬 Не задан рабочий чат для заказов")
     if warnings:
@@ -1344,15 +1357,34 @@ async def _stats_route(ev: Event, ch: Channel, args: list[str]) -> None:
         "",
         "<b>По объектам:</b>",
     ]
+    visits = await repo.qr_visits(iso_from, iso_to)
+    codes = {obj["id"]: obj["code"] for obj in await repo.list_objects()}
+    shown_codes = set()
+
     for row in rows:
-        lines.append(
-            f"• {esc(row['title'] or '—')} — {row['orders_count']} зак., "
-            f"{row['sets_count']} сет., {fmt_money(row['revenue_kop'] or 0)}"
-        )
+        code = codes.get(row["object_id"], "")
+        shown_codes.add(code)
+        scans = visits.get(code, 0)
+        lines += [
+            "",
+            f"<b>{esc(row['title'] or '—')}</b>",
+            f"  {scans} {plural(scans, 'переход', 'перехода', 'переходов')} по QR",
+            f"  {row['orders_count']} "
+            f"{plural(row['orders_count'], 'заказ', 'заказа', 'заказов')}",
+            f"  {row['sets_count']} "
+            f"{plural(row['sets_count'], 'завтрак', 'завтрака', 'завтраков')}",
+            f"  Выручка {fmt_money(row['revenue_kop'] or 0)}",
+        ]
     if not rows:
-        lines.append("— нет данных")
+        lines.append("— заказов пока нет")
+
+    idle = {code: count for code, count in visits.items() if code not in shown_codes}
+    if idle:
+        lines += ["", "<b>Сканировали QR, но не заказали:</b>"]
+        for code, count in sorted(idle.items(), key=lambda kv: -kv[1]):
+            lines.append(f"• <code>{esc(code)}</code> — {count}")
     if sources:
-        lines += ["", "<b>По QR-кодам:</b>"]
+        lines += ["", "<b>Заказы по меткам QR:</b>"]
         for row in sources:
             lines.append(f"• <code>{esc(row['source_code'] or '—')}</code> — "
                          f"{row['orders_count']} зак.")

@@ -1,37 +1,53 @@
-"""Жизненный цикл заказа: смена статусов и все связанные с ней действия."""
+"""Жизненный цикл заказа: смена статусов и все связанные с ней действия.
+
+Заказ может охватывать несколько дат — в базе это отдельные строки с общим
+номером (group_key). Менеджер работает с заказом целиком: подтвердил, отметил
+оплату — это применяется ко всем дням сразу. Доставка и отмена возможны
+и по одному дню: ежедневная выгрузка курьерам смотрит на каждую строку
+отдельно.
+"""
 from __future__ import annotations
 
-from typing import Any
-
 import logging
+from typing import Any, Optional
 
 from . import notify, payments, repo, statuses
-from .channels.base import TG, Btn, Out, get_channel
-from .utils import fmt_money, now
+from .channels.base import Btn, get_channel
+from .utils import fmt_date, now, parse_date, parse_time, utc_stamp
 
 log = logging.getLogger(__name__)
 Row = Any
+
+#: статусы, которые менеджер меняет сразу для всего заказа
+GROUP_STATUSES = (statuses.ACCEPTED, statuses.PAID, statuses.REJECTED, statuses.CANCELLED)
 
 
 async def change_status(
     order_id: int, new_status: str, actor: str = "", note: str = ""
 ) -> tuple[bool, str]:
-    """Сменить статус заказа и выполнить всё, что к этому привязано."""
+    """Сменить статус заказа. Подтверждение, оплата и отказ — на весь заказ."""
     order = await repo.get_order(order_id)
     if order is None:
         return False, "Заказ не найден"
-    if order["status"] == new_status:
+
+    group = await repo.group_of(order)
+    targets = group if new_status in GROUP_STATUSES else [order]
+    changed = [row for row in targets
+               if row["status"] != new_status and row["status"] != statuses.CANCELLED]
+    if not changed:
         return False, f"Заказ уже в статусе «{statuses.label(new_status)}»"
 
-    await repo.set_status(order_id, new_status, actor=actor, note=note)
-    if new_status == statuses.PAID and not order["paid_at"]:
-        await repo.update_order(order_id, paid_at=now().strftime("%Y-%m-%d %H:%M:%S"))
+    stamp = utc_stamp()
+    for row in changed:
+        await repo.set_status(row["id"], new_status, actor=actor, note=note)
+        if new_status == statuses.PAID and not row["paid_at"]:
+            await repo.update_order(row["id"], paid_at=stamp)
 
     order = await repo.get_order(order_id)
-    assert order is not None
+    group = await repo.group_of(order)
 
     try:
-        await _notify_guest(order, note)
+        await _notify_guest(group, order, new_status, note)
     except Exception:  # noqa: BLE001
         log.exception("Не удалось уведомить гостя по заказу %s", order["number"])
     try:
@@ -39,123 +55,155 @@ async def change_status(
     except Exception:  # noqa: BLE001
         log.exception("Не удалось обновить карточки заказа %s", order["number"])
 
-    return True, f"Статус заказа №{order['number']}: {statuses.label(new_status)}"
+    number = order["group_key"] or order["number"]
+    return True, f"Заказ №{number}: {statuses.label(new_status)}"
 
 
-async def _notify_guest(order: Row, note: str = "") -> None:
-    status = order["status"]
+async def _notify_guest(group: list[Row], order: Row, status: str, note: str = "") -> None:
+    active = [row for row in group if row["status"] != statuses.CANCELLED] or group
 
     if status == statuses.ACCEPTED:
-        await _send_payment_request(order)
+        await _send_payment_request(active)
         return
 
     if status == statuses.PAID:
-        text = await notify.guest_status_text(order, "status_paid")
-        await notify.notify_guest(order, text)
+        text = await notify.group_status_text(active, "status_paid")
+        await notify.notify_guest(order, text, [[Btn(text="📦 Мои заказы", data="g:my")]])
         return
 
     if status == statuses.DELIVERED:
-        text = await notify.guest_status_text(order, "status_delivered")
+        text = await notify.group_status_text([order], "status_delivered")
         kb = [[Btn(text="✅ Я получил заказ", data=f"g:got:{order['id']}", intent="positive")]]
         await notify.notify_guest(order, text, kb)
         return
 
     if status == statuses.RECEIVED:
-        text = await notify.guest_status_text(order, "status_received")
-        await notify.notify_guest(order, text, [[Btn(text="🥐 Заказать ещё", data="g:menu")]])
+        text = await notify.group_status_text([order], "status_received")
+        await notify.notify_guest(order, text, [[Btn(text="🥐 Заказать ещё", data="g:order")]])
         return
 
     if status == statuses.REJECTED:
         reason = f"Причина: {note}" if note else ""
-        text = await notify.guest_status_text(order, "status_rejected", reason=reason)
+        text = await notify.group_status_text(group, "status_rejected", reason=reason)
         await notify.notify_guest(order, text)
         return
 
     if status == statuses.CANCELLED:
-        text = await notify.guest_status_text(order, "status_cancelled")
+        text = await notify.group_status_text([order], "status_cancelled")
         await notify.notify_guest(order, text)
 
 
-async def _send_payment_request(order: Row) -> None:
-    """Заказ принят в работу — просим гостя оплатить."""
-    text = await notify.guest_status_text(order, "status_accepted")
-    ok, error = await send_invoice(order, text)
-    if ok:
-        return
+# ------------------------------------------------------------------- оплата
+async def _send_payment_request(group: list[Row]) -> None:
+    """Заказ подтверждён — выставляем счёт.
 
-    fallback = await repo.render_text("payment_unavailable", number=order["number"])
-    await notify.notify_guest(order, fallback)
-    if error:
-        await notify.send_to_admins(
-            f"⚠️ Заказ <b>№{order['number']}</b>: счёт на оплату не выставлен.\n"
-            f"{error}\n\nГостю отправлено сообщение, что с оплатой поможет менеджер."
-        )
+    Оплата принимается только через подключённую кассу: гость получает
+    встроенный счёт Telegram, и оплату подтверждает сам Telegram. Если счёт
+    выставить не удалось, зовём менеджера — гостя без ответа не оставляем.
+    """
+    head = group[0]
+    total = notify.group_total(group)
+    number = head["group_key"] or head["number"]
+
+    if await payments.invoice_available():
+        text = await notify.group_status_text(
+            group, "status_accepted", pay_details=await repo.render_text("pay_by_invoice"))
+        await notify.notify_guest(head, text)
+        if await _send_invoice(group, total):
+            return
+        log.warning("Счёт по заказу %s не выставлен", number)
+
+    # касса не подключена или счёт не ушёл — гостя не бросаем, зовём менеджера
+    await notify.notify_guest(head, await repo.render_text(
+        "payment_unavailable", number=number))
+    await notify.send_to_admins(
+        f"⚠️ Заказ <b>№{number}</b>: счёт на оплату выставить не удалось.\n"
+        "Проверьте /admin → 💳 Оплата и свяжитесь с гостем."
+    )
 
 
-async def send_invoice(order: Row, intro: str = "") -> tuple[bool, str]:
-    """Выставить гостю счёт. Возвращает (получилось, причина отказа)."""
-    channel = get_channel(order["channel"])
-    if channel is None:
-        return False, "Канал недоступен"
-
-    if not await payments.is_enabled():
-        return False, "Онлайн-оплата выключена или токен не задан (/admin → 💳 Оплата)"
-
-    if order["channel"] != TG:
-        # в MAX встроенных платежей нет — счёт выставить физически нечем
-        return False, ""
-
-    if order["total_kop"] < payments.MIN_AMOUNT_KOP:
-        return False, (f"Сумма {fmt_money(order['total_kop'])} меньше минимальной "
-                       f"для оплаты ({fmt_money(payments.MIN_AMOUNT_KOP)})")
-
-    target = order["chat_id"] or order["ext_id"]
-    if intro:
-        await channel.send(target, Out(text=intro))
-
+async def _send_invoice(group: list[Row], total: int) -> bool:
+    """Встроенный счёт Telegram на весь заказ."""
+    head = group[0]
+    channel = get_channel(head["channel"])
+    if channel is None or total < payments.MIN_AMOUNT_KOP:
+        return False
     ok, error = await channel.send_invoice(
-        chat_id=target,
-        title=payments.invoice_title(order),
-        description=payments.invoice_description(order),
-        payload=payments.invoice_payload(order["id"]),
-        amount_kop=order["total_kop"],
+        chat_id=head["chat_id"] or head["ext_id"],
+        title=payments.invoice_title(head),
+        description=payments.invoice_description(group),
+        payload=payments.invoice_payload(head["id"]),
+        amount_kop=total,
         provider_token=await payments.provider_token(),
-        label=f"{order['set_title']} × {order['qty']}"[:32] or "Завтрак",
+        label=f"Завтраки × {sum(o['qty'] for o in group)}"[:32],
         provider_data=await payments.provider_data(),
     )
     if ok:
-        await repo.add_event(order["id"], order["status"], "бот", "Выставлен счёт на оплату")
-    return ok, error
+        await repo.add_event(head["id"], head["status"], "бот", "Выставлен счёт на оплату")
+    elif error:
+        log.warning("send_invoice: %s", error)
+    return ok
 
 
-async def apply_payment_success(order: Row, charge_id: str = "") -> None:
-    """Платёж подтверждён Telegram/PayMaster."""
-    if order["status"] in (statuses.PAID, statuses.DELIVERED, statuses.RECEIVED):
-        return
-    if charge_id:
-        await repo.update_order(order["id"], payment_id=charge_id)
-    await change_status(order["id"], statuses.PAID, actor="PayMaster",
-                        note="Оплата подтверждена Telegram")
+# -------------------------------------------------------- отмена и получение
+async def cancel_deadline_for(day: str | Any) -> Optional[Any]:
+    """Момент, до которого гость может отменить доставку на эту дату."""
+    from datetime import datetime, timedelta
+
+    from .config import cfg
+
+    parsed = parse_date(day) if isinstance(day, str) else day
+    if parsed is None:
+        return None
+    limit = parse_time(await repo.get_setting("cancel_deadline", "18:30"), "18:30")
+    return datetime.combine(parsed - timedelta(days=1), limit, tzinfo=cfg.tz)
 
 
-async def guest_cancel(order_id: int, ext_id: str, channel: str) -> tuple[bool, str]:
-    """Отмена заказа самим гостем."""
+async def refund_allowed(order: Row) -> bool:
+    """Возвращаются ли деньги при отмене прямо сейчас."""
+    deadline = await cancel_deadline_for(order["delivery_date"])
+    return deadline is None or now() <= deadline
+
+
+async def guest_cancel(order_id: int, ext_id: str, channel: str,
+                       whole_order: bool = False) -> tuple[bool, str]:
+    """Отмена заказа гостем: одной даты или всего заказа."""
     order = await repo.get_order(order_id)
     if order is None:
         return False, "Заказ не найден"
     if order["ext_id"] != str(ext_id) or order["channel"] != channel:
         return False, "Это не ваш заказ"
-    if order["status"] not in statuses.GUEST_CANCELLABLE:
+
+    group = await repo.group_of(order)
+    targets = group if whole_order else [order]
+    targets = [row for row in targets if row["status"] in statuses.GUEST_CANCELLABLE]
+    if not targets:
         return False, f"Заказ в статусе «{statuses.label(order['status'])}» отменить нельзя"
-    await repo.set_status(order_id, statuses.CANCELLED, actor="гость", note="Отменён гостем")
+
+    no_refund = [row for row in targets if not await refund_allowed(row)]
+    for row in targets:
+        await repo.set_status(row["id"], statuses.CANCELLED, actor="гость",
+                              note="Отменён гостем")
+
     order = await repo.get_order(order_id)
-    assert order is not None
     await notify.refresh_order_cards(order)
+    number = order["group_key"] or order["number"]
+    dates = ", ".join(fmt_date(row["delivery_date"], False) for row in targets)
+    warn = ""
+    if no_refund:
+        late = ", ".join(fmt_date(row["delivery_date"], False) for row in no_refund)
+        warn = f"\n⚠️ Отмена после срока — {late}: оплата за эти дни не возвращается."
     await notify.send_to_admins(
-        f"❌ Гость отменил заказ <b>№{order['number']}</b> "
-        f"({order['object_title']}, апарт. {order['apartment']})."
+        f"❌ Гость отменил заказ <b>№{number}</b> ({dates}).\n"
+        f"{order['object_title']}, апарт. {order['apartment']}.{warn}"
     )
-    return True, "Заказ отменён"
+
+    message = f"Отменено: {dates}."
+    if no_refund:
+        deadline = await repo.get_setting("cancel_deadline", "18:30")
+        message += (f"\n\n⚠️ Отмена после {deadline} накануне — за ближайшую доставку "
+                    "оплата не возвращается. По остальным дням вернём полностью.")
+    return True, message
 
 
 async def guest_confirm_received(order_id: int, ext_id: str, channel: str) -> tuple[bool, str]:
@@ -166,5 +214,15 @@ async def guest_confirm_received(order_id: int, ext_id: str, channel: str) -> tu
         return False, "Это не ваш заказ"
     if order["status"] == statuses.RECEIVED:
         return False, "Заказ уже отмечен как полученный"
-    ok, message = await change_status(order_id, statuses.RECEIVED, actor="гость")
-    return ok, message
+    return await change_status(order_id, statuses.RECEIVED, actor="гость")
+
+
+# ------------------------------------------------------ совместимость с кодом
+async def apply_payment_success(order: Row, charge_id: str = "") -> None:
+    """Telegram подтвердил оплату счёта — отмечаем весь заказ оплаченным."""
+    if order["status"] in (statuses.PAID, statuses.DELIVERED, statuses.RECEIVED):
+        return
+    if charge_id:
+        await repo.update_order(order["id"], payment_id=charge_id)
+    await change_status(order["id"], statuses.PAID, actor="Telegram",
+                        note="Оплата подтверждена платёжной системой")

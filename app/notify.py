@@ -9,7 +9,7 @@ from typing import Any, Iterable, Optional
 from . import admins, repo, statuses
 from .channels.base import MAX, TG, Btn, Out, channel_title, get_channel
 from .config import cfg
-from .utils import esc, fmt_date, fmt_dt, fmt_money, fmt_phone
+from .utils import esc, fmt_date, fmt_dt, fmt_money, fmt_phone, plural
 
 log = logging.getLogger(__name__)
 Row = Any
@@ -25,15 +25,65 @@ def _field(row: Row, name: str, default: Any = "") -> Any:
     return default if value is None else value
 
 
-async def order_card(order: Row, for_admin: bool = True) -> str:
+def schedule_lines(orders: list[Row]) -> str:
+    """Разбивка заказа по датам — то, что просила заказчица:
+
+        25 августа — Сет 1 — 2 шт.
+        26 августа — Сет 2 — 2 шт.
+    """
+    active = [o for o in orders if o["status"] != statuses.CANCELLED] or orders
+    rows = [
+        f"{fmt_date(o['delivery_date'], with_weekday=False)} — "
+        f"{esc(o['set_title'] or 'сет дня')} — {o['qty']} шт."
+        for o in sorted(active, key=lambda r: r["delivery_date"])
+    ]
+    total_sets = sum(o["qty"] for o in active)
+    total_sum = sum(o["total_kop"] for o in active)
+    if len(rows) > 1:
+        rows.append("")
+        rows.append(f"Итого: {total_sets} "
+                    f"{plural(total_sets, 'завтрак', 'завтрака', 'завтраков')} — "
+                    f"<b>{fmt_money(total_sum)}</b>")
+    return "\n".join(rows)
+
+
+def group_total(orders: list[Row]) -> int:
+    return sum(o["total_kop"] for o in orders if o["status"] != statuses.CANCELLED)
+
+
+async def group_status_text(orders: list[Row], key: str, **extra: Any) -> str:
+    """Текст статуса для заказа целиком — с разбивкой по датам."""
+    head = orders[0]
+    return await repo.render_text(
+        key,
+        number=head["group_key"] or head["number"],
+        schedule=schedule_lines(orders),
+        date_h=fmt_date(head["delivery_date"]),
+        set_title=head["set_title"],
+        qty=sum(o["qty"] for o in orders),
+        total=fmt_money(group_total(orders)),
+        price=fmt_money(head["price_kop"]),
+        address=head["object_address"] or head["object_title"],
+        apartment=head["apartment"],
+        object_title=head["object_title"],
+        **extra,
+    )
+
+
+async def order_card(order: Row, for_admin: bool = True, group: list[Row] | None = None) -> str:
     """Карточка заказа: сверху главное, ниже детали, в конце — служебное."""
+    group = group or [order]
+    multi = len(group) > 1
     lines = [
-        f"<b>Заказ №{esc(order['number'])}</b>",
+        f"<b>Заказ №{esc(order['group_key'] or order['number'])}</b>",
         statuses.label(order["status"]),
         "",
-        f"📅 {fmt_date(order['delivery_date'])}",
-        f"🥐 {esc(order['set_title'])} × {order['qty']}",
     ]
+    if multi:
+        lines.append(schedule_lines(group))
+    else:
+        lines.append(f"📅 {fmt_date(order['delivery_date'])}")
+        lines.append(f"🥐 {esc(order['set_title'])} × {order['qty']}")
     if order["object_address"]:
         lines.append(f"📍 {esc(order['object_address'])}")
     else:
@@ -43,19 +93,26 @@ async def order_card(order: Row, for_admin: bool = True) -> str:
         contact = esc(fmt_phone(order["phone"]))
         name = _field(order, "customer_name")
         lines.append(f"📞 {contact}" + (f", {esc(name)}" if name else ""))
+    allergies = _field(order, "allergies")
+    if allergies:
+        lines.append(f"⚠️ <b>Аллергии: {esc(allergies)}</b>")
     if order["comment"]:
         lines.append(f"💬 {esc(order['comment'])}")
+    if for_admin and not int(_field(order, "address_ok", 1) or 0):
+        lines.append("❗️ <b>Адрес введён гостем вручную и не найден среди объектов</b>")
     lines.append("")
     discount = int(_field(order, "discount_pct") or 0)
     if discount:
         base = int(_field(order, "base_price_kop") or order["price_kop"])
         lines.append(f"💰 {fmt_money(base)} × {order['qty']} = {fmt_money(base * order['qty'])}")
         lines.append(f"🎁 Скидка −{discount}% → <b>{fmt_money(order['total_kop'])}</b>")
-    else:
+    elif not multi:
         lines.append(
             f"💰 {fmt_money(order['price_kop'])} × {order['qty']} = "
             f"<b>{fmt_money(order['total_kop'])}</b>"
         )
+    if multi:
+        lines.append(f"💰 К оплате за весь заказ: <b>{fmt_money(group_total(group))}</b>")
     if for_admin:
         lines += ["", f"🏢 {esc(order['object_title'])}",
                   f"🕗 {fmt_dt(order['created_at'])} · {channel_title(order['channel'])}"]
@@ -133,22 +190,29 @@ async def send_to_admins(text: str, kb: Optional[list[list[Btn]]] = None) -> lis
     return sent
 
 
-async def notify_new_order(order: Row) -> None:
-    """Новый заказ -> в рабочий чат с кнопками действий."""
-    text = "🆕 <b>НОВЫЙ ЗАКАЗ</b>\n\n" + await order_card(order)
-    kb = order_admin_kb(order, await guest_username(order))
+async def notify_new_order(orders: list[Row] | Row) -> None:
+    """Новый заказ -> одна карточка в рабочий чат, даже если дней несколько."""
+    group = orders if isinstance(orders, list) else [orders]
+    head = group[0]
+    text = "🆕 <b>НОВЫЙ ЗАКАЗ</b>\n\n" + await order_card(head, group=group)
+    kb = order_admin_kb(head, await guest_username(head))
     sent = await send_to_admins(text, kb)
-    await repo.update_order(order["id"], admin_msgs=json.dumps(sent, ensure_ascii=False))
+    await repo.update_order(head["id"], admin_msgs=json.dumps(sent, ensure_ascii=False))
 
 
 async def refresh_order_cards(order: Row) -> None:
-    """Обновить все карточки заказа у менеджеров после смены статуса."""
+    """Обновить карточку заказа у менеджеров после смены статуса."""
     channel = get_channel(TG)
     if channel is None:
         return
-    targets = repo.json_loads(order["admin_msgs"], [])
-    text = await order_card(order)
-    kb = order_admin_kb(order, await guest_username(order))
+    group = await repo.group_of(order)
+    head = group[0]
+    targets = repo.json_loads(head["admin_msgs"], [])
+    if not targets:                 # карточку отправляли по конкретной строке заказа
+        targets = repo.json_loads(order["admin_msgs"], [])
+        head, group = order, group
+    text = await order_card(head, group=group)
+    kb = order_admin_kb(head, await guest_username(head))
     for target in targets:
         try:
             await channel.edit(str(target["chat_id"]), str(target["message_id"]),

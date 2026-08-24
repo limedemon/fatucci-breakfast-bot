@@ -1,17 +1,16 @@
-"""Оплата через PayMaster — нативными платежами Telegram.
+"""Оплата заказа — встроенным счётом Telegram.
 
-Как это работает:
+Токен платёжного провайдера выдаёт @BotFather: /mybots → бот → Payments →
+подключённая касса. Токен вписывается в админке (⚙️ Настройки → 💳 Оплата)
+и выглядит так: 123456789:TEST:abcdef… — номер, слово TEST или LIVE и хеш.
 
-1. Токен провайдера выдаёт @BotFather: /mybots → бот → Payments → PayMaster.
-   Формат токена — ``<id>:TEST:<hash>`` или ``<id>:LIVE:<hash>``.
-2. Когда менеджер принимает заказ в работу, бот отправляет гостю **инвойс** —
-   сообщение со встроенной кнопкой оплаты.
-3. Телеграм спрашивает бота, всё ли в порядке (pre_checkout_query) — отвечаем «да».
-4. После оплаты приходит successful_payment, и заказ автоматически становится
-   «оплачен». Опрашивать ничего не нужно, вебхуки и белый IP тоже не нужны.
+Пока токен не задан, бот не даёт оформить заказ: гость видит сообщение, что
+приём заказов временно недоступен. Так не появляется заказов, за которые
+нечем заплатить.
 
-Важно: нативные платежи есть только в Telegram. В MAX их нет — там гость
-получает сообщение, что с оплатой поможет менеджер (см. orders_service).
+Когда токен есть, всё происходит само: менеджер подтверждает заказ — гостю
+приходит счёт, он платит картой, Telegram сообщает боту об оплате, и заказ
+переходит в статус «Оплачен» без участия менеджера.
 """
 from __future__ import annotations
 
@@ -25,22 +24,15 @@ from .utils import fmt_date
 log = logging.getLogger(__name__)
 Row = Any
 
-#: минимальная сумма платежа в копейках — Telegram не пропускает совсем мелкие
+#: Telegram не пропускает совсем мелкие суммы
 MIN_AMOUNT_KOP = 6000
 
 
+# --------------------------------------------------------- токен провайдера
 async def provider_token() -> str:
-    """Токен провайдера: сначала админ-панель, потом переменная окружения."""
+    """Токен из админки, иначе из переменной окружения."""
     token = (await repo.get_setting("pm_token")) or cfg.provider_token
     return token.strip()
-
-
-async def is_configured() -> bool:
-    return bool(await provider_token())
-
-
-async def is_enabled() -> bool:
-    return await repo.get_bool("pay_enabled", True) and await is_configured()
 
 
 def is_test(token: str) -> bool:
@@ -48,17 +40,23 @@ def is_test(token: str) -> bool:
 
 
 def token_looks_valid(token: str) -> bool:
+    """Грубая проверка формы токена — чтобы отловить опечатку сразу."""
     parts = token.split(":")
     return len(parts) == 3 and parts[0].isdigit() and parts[1].upper() in ("TEST", "LIVE")
 
 
-async def mode_label() -> str:
-    token = await provider_token()
-    if not token:
-        return "не настроена"
-    return "тестовый режим" if is_test(token) else "боевой режим"
+async def is_enabled() -> bool:
+    return await repo.get_bool("pay_enabled", True)
 
 
+async def invoice_available() -> bool:
+    """Можно ли принять оплату — от этого зависит, откроется ли оформление."""
+    if not await is_enabled():
+        return False
+    return token_looks_valid(await provider_token())
+
+
+# ------------------------------------------------------------------- счёт
 def invoice_payload(order_id: int) -> str:
     return f"order:{order_id}"
 
@@ -71,59 +69,72 @@ def parse_payload(payload: str) -> Optional[int]:
 
 
 def invoice_title(order: Row) -> str:
-    """Заголовок инвойса — Telegram разрешает до 32 символов."""
-    return f"Заказ №{order['number']}"[:32]
+    """Заголовок счёта — Telegram разрешает до 32 символов."""
+    return f"Заказ №{order['group_key'] or order['number']}"[:32]
 
 
-def invoice_description(order: Row) -> str:
-    """Описание — до 255 символов."""
+def invoice_description(orders: list[Row]) -> str:
+    """Описание счёта — до 255 символов, с разбивкой по датам."""
     parts = [
-        f"{order['set_title']} × {order['qty']}",
-        fmt_date(order["delivery_date"], with_weekday=False),
+        f"{fmt_date(o['delivery_date'], with_weekday=False)}: "
+        f"{o['set_title'] or 'сет дня'} × {o['qty']}"
+        for o in orders
     ]
-    if order["object_address"]:
-        parts.append(f"{order['object_address']}, апарт. {order['apartment']}")
-    else:
-        parts.append(f"апарт. {order['apartment']}")
-    return " · ".join(parts)[:255]
+    head = orders[0]
+    tail = f" · апарт. {head['apartment']}"
+    return (" · ".join(parts) + tail)[:255]
 
 
 async def provider_data() -> str:
-    """Необязательный JSON для провайдера (например, чек по 54-ФЗ).
-
-    Формат задаёт PayMaster, поэтому строку не собираем сами, а отдаём как есть —
-    её можно вписать в админ-панели, если этого требует ваша схема.
-    """
+    """Доп. данные для кассы (например, чек по 54-ФЗ) — обычно не нужны."""
     return (await repo.get_setting("pm_provider_data")).strip()
 
 
+# -------------------------------------------------------------- диагностика
 async def check_setup() -> tuple[bool, str]:
-    """Диагностика для кнопки «Проверить оплату» в админ-панели."""
+    """Что показывает кнопка «Проверить оплату» в админ-панели."""
+    if not await is_enabled():
+        return False, (
+            "⛔️ <b>Приём оплаты выключен</b>\n\n"
+            "Пока переключатель выше выключен, гости не могут оформить заказ.\n"
+            "Включите его, когда будете готовы принимать оплату."
+        )
+
     token = await provider_token()
     if not token:
         return False, (
-            "Токен не задан.\n\n"
-            "Получить: @BotFather → /mybots → ваш бот → Payments → PayMaster.\n"
-            "Затем вставьте выданный токен в это поле."
+            "⚠️ <b>Касса не подключена — заказы не принимаются</b>\n\n"
+            "Гость видит сообщение, что заказ пока оформить нельзя.\n\n"
+            "Где взять токен:\n"
+            "1. Откройте @BotFather\n"
+            "2. /mybots → выберите бота → Payments\n"
+            "3. Выберите кассу и подключите её\n"
+            "4. Скопируйте выданный токен и впишите его в поле выше\n\n"
+            "Для проверки подойдёт токен в режиме TEST — деньги не списываются."
         )
+
     if not token_looks_valid(token):
         return False, (
-            "Это не похоже на токен провайдера.\n\n"
-            "Он выглядит так: <code>123456789:TEST:abcdef…</code> — "
-            "число, слово TEST или LIVE и хеш через двоеточия.\n"
-            "Выдаёт его @BotFather в разделе Payments, а не личный кабинет PayMaster."
+            "⚠️ <b>Токен не похож на настоящий</b>\n\n"
+            "Правильный вид: <code>123456789:TEST:abcdef…</code> — номер, "
+            "слово TEST или LIVE и хеш через двоеточия.\n\n"
+            "Скопируйте токен заново: @BotFather → /mybots → бот → Payments."
         )
+
     if is_test(token):
         return True, (
-            "✅ Токен принят — <b>тестовый режим</b>.\n\n"
-            "Деньги не списываются, платить нужно тестовой картой "
+            "✅ <b>Касса подключена — тестовый режим</b>\n\n"
+            "Гости могут оформлять заказы: после вашего подтверждения счёт "
+            "приходит гостю сам.\n\n"
+            "Деньги не списываются. Тестовая карта:\n"
             "<code>4111 1111 1111 1111</code>, срок — любой будущий, CVC любой.\n\n"
-            "⚠️ В тестовом режиме Telegram присылает счёт только тем, кто есть "
-            "во взаимных контактах у владельца бота. Для проверки добавьте "
-            "тестировщика в контакты.\n\n"
-            "Для приёма настоящих денег получите у @BotFather токен LIVE."
+            "⚠️ В тестовом режиме Telegram показывает счёт не всем — проверяйте "
+            "на своём аккаунте.\n\n"
+            "Для настоящих платежей получите у @BotFather токен LIVE."
         )
+
     return True, (
-        "✅ Токен принят — <b>боевой режим</b>.\n\n"
-        "Деньги будут списываться по-настоящему. Проверьте на маленькой сумме."
+        "✅ <b>Касса подключена — боевой режим</b>\n\n"
+        "Деньги списываются по-настоящему, оплата подтверждается автоматически.\n"
+        "Проверьте на небольшой сумме — например, оформите заказ на себя."
     )

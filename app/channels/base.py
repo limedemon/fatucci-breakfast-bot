@@ -103,6 +103,10 @@ class Channel(ABC):
         """Скачать присланный файл в память."""
         return b''
 
+    async def set_description(self, text: str) -> bool:
+        """Описание бота до первого запуска (есть только в Telegram)."""
+        return False
+
     async def show_admin_button(self, chat_id: str, text: str) -> bool:
         """Закрепить кнопку админ-панели под полем ввода (есть только в Telegram)."""
         return False

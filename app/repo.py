@@ -64,9 +64,19 @@ async def render_text(key: str, **kwargs: Any) -> str:
         "manager_contact": await get_setting("manager_contact"),
         "manager_phone": await get_setting("manager_phone"),
         "cutoff": kwargs.pop("cutoff", await default_cutoff()),
+        "cancel_deadline": await get_setting("cancel_deadline", "18:30"),
+        "delivery_time": kwargs.pop("delivery_time", await default_delivery_time()),
     }
     common.update(kwargs)
     return safe_format(template, **common)
+
+
+async def default_delivery_time() -> str:
+    """Время доставки первого активного объекта — для общих текстов."""
+    value = await db.fetchval(
+        "SELECT delivery_time FROM objects WHERE is_active = 1 AND is_general = 0 ORDER BY id LIMIT 1"
+    )
+    return str(value or "09:00")
 
 
 async def default_cutoff() -> str:
@@ -74,14 +84,14 @@ async def default_cutoff() -> str:
     value = await db.fetchval(
         "SELECT cutoff_time FROM objects WHERE is_active = 1 ORDER BY id LIMIT 1"
     )
-    return str(value or "20:00")
+    return str(value or "16:00")
 
 
 # ==================================================================== объекты
 OBJECT_FIELDS = (
     "code", "title", "group_title", "address", "price_kop", "delivery_days",
     "cutoff_time", "lead_days", "max_days_ahead", "min_qty", "max_qty",
-    "is_active", "is_general", "note",
+    "is_active", "is_general", "delivery_time", "note",
 )
 
 
@@ -106,6 +116,45 @@ async def get_object(object_id: int | None) -> Optional[Row]:
 
 async def get_object_by_code(code: str) -> Optional[Row]:
     return await db.fetchone("SELECT * FROM objects WHERE LOWER(code) = LOWER(?)", (code.strip(),))
+
+
+def address_key(value: str) -> str:
+    """Адрес в сравнимом виде: только буквы и цифры, без «ул.», «дом», регистра.
+
+    «г. Сочи, ул. Северная, д. 12» и «Северная 12» дают одинаковый ключ,
+    поэтому гость может написать адрес как ему привычно.
+    """
+    import re as _re
+
+    text = (value or "").lower().replace("ё", "е")
+    for noise in ("город", "улица", "переулок", "проспект", "бульвар", "шоссе",
+                  "квартал", "микрорайон", "дом", "корпус", "строение", "литера",
+                  "г.", "ул.", "пер.", "просп.", "пр-т", "пр.", "б-р", "ш.",
+                  "мкр", "кв-л", "д.", "к.", "стр.", "лит."):
+        text = text.replace(noise, " ")
+    return " ".join(_re.sub(r"[^0-9a-zа-я]+", " ", text).split())
+
+
+async def find_object_by_address(address: str) -> Optional[Row]:
+    """Подобрать объект по адресу, который гость ввёл руками (общий QR)."""
+    key = address_key(address)
+    if len(key) < 4:
+        return None
+    best: Optional[Row] = None
+    best_score = 0
+    for obj in await db.fetchall("SELECT * FROM objects WHERE is_active = 1 AND is_general = 0"):
+        for candidate in (obj["address"], obj["title"]):
+            other = address_key(candidate)
+            if not other:
+                continue
+            if other == key:
+                return obj
+            # совпадение по вхождению: «северная 12» внутри «сочи северная 12»
+            if other in key or key in other:
+                score = min(len(other), len(key))
+                if score > best_score:
+                    best, best_score = obj, score
+    return best
 
 
 async def code_taken(code: str, exclude_id: int = 0) -> bool:
@@ -385,14 +434,66 @@ async def stale_sessions(older_than_min: int, max_hours: int) -> list[Row]:
 ORDER_FIELDS = (
     "user_pk", "channel", "ext_id", "chat_id", "object_id", "object_title", "object_address",
     "set_id", "set_title", "delivery_date", "qty", "apartment", "phone", "comment",
-    "customer_name", "discount_pct", "base_price_kop",
+    "customer_name", "allergies", "group_key", "address_ok",
+    "discount_pct", "base_price_kop",
     "price_kop", "total_kop", "status", "source_code", "payment_id", "payment_url",
     "paid_at", "admin_msgs",
 )
 
 
+async def next_group_key() -> str:
+    """Номер заказа, общий для всех его дат."""
+    prefix = await get_setting("order_prefix", "F")
+    last = int(await db.fetchval("SELECT COALESCE(MAX(id), 0) FROM orders", (), 0))
+    return f"{prefix}-{last + 1:05d}"
+
+
+async def create_order_group(days: list[dict[str, Any]], **common: Any) -> list[Row]:
+    """Создать заказ на одну или несколько дат — одним номером.
+
+    В базе каждая дата остаётся отдельной строкой: так ежедневная выгрузка
+    курьерам и статистика работают без изменений, а гость и менеджер видят
+    один заказ.
+    """
+    group_key = await next_group_key()
+    created: list[Row] = []
+    for index, day in enumerate(days, start=1):
+        number = group_key if index == 1 else f"{group_key}-{index}"
+        row = await create_order(number=number, group_key=group_key, **common, **day)
+        created.append(row)
+    return created
+
+
+async def group_orders(group_key: str) -> list[Row]:
+    """Все даты одного заказа, по возрастанию даты доставки."""
+    if not group_key:
+        return []
+    return await db.fetchall(
+        "SELECT * FROM orders WHERE group_key = ? ORDER BY delivery_date, id", (group_key,)
+    )
+
+
+async def group_of(order: Row) -> list[Row]:
+    key = order["group_key"] if order["group_key"] else ""
+    return await group_orders(key) or [order]
+
+
+async def list_order_groups(limit: int = 8, **filters: Any) -> list[list[Row]]:
+    """Заказы, сгруппированные по номеру — для списка «Мои заказы»."""
+    rows = await list_orders(limit=limit * 8, **filters)
+    groups: dict[str, list[Row]] = {}
+    for row in rows:
+        groups.setdefault(row["group_key"] or row["number"], []).append(row)
+    ordered = list(groups.values())[:limit]
+    for group in ordered:
+        group.sort(key=lambda r: r["delivery_date"])
+    return ordered
+
+
 async def create_order(**fields: Any) -> Row:
-    """Создать заказ. Номер присваивается по id строки — без гонок при одновременных заказах."""
+    """Создать заказ. Без явного номера он присваивается по id строки —
+    так не бывает гонок при одновременных заказах."""
+    wanted = str(fields.pop("number", "") or "")
     data = {k: v for k, v in fields.items() if k in ORDER_FIELDS}
     data["number"] = f"tmp-{uuid.uuid4().hex[:16]}"
     cols = ", ".join(data)
@@ -400,9 +501,11 @@ async def create_order(**fields: Any) -> Row:
     order_id = await db.insert(
         f"INSERT INTO orders ({cols}) VALUES ({marks})", list(data.values())
     )
-    prefix = await get_setting("order_prefix", "F")
-    await db.execute("UPDATE orders SET number = ? WHERE id = ?",
-                     (f"{prefix}-{order_id:05d}", order_id))
+    if not wanted:
+        prefix = await get_setting("order_prefix", "F")
+        wanted = f"{prefix}-{order_id:05d}"
+    await db.execute("UPDATE orders SET number = ?, group_key = ? WHERE id = ?",
+                     (wanted, data.get("group_key") or wanted, order_id))
     await add_event(order_id, data.get("status", statuses.NEW), "гость", "Заказ создан")
     row = await get_order(order_id)
     assert row is not None
@@ -566,6 +669,27 @@ async def stats_by_object(date_from: str, date_to: str) -> list[Row]:
            ORDER BY revenue_kop DESC""",
         (date_from, date_to),
     )
+
+
+# ============================================================ переходы по QR
+async def add_qr_visit(code: str, channel: str, day: str) -> None:
+    """Отметить переход по QR-коду — для отчёта «сколько сканов, сколько заказов»."""
+    if not code:
+        return
+    await db.execute(
+        "INSERT INTO qr_visits (code, d, channel, visits) VALUES (?, ?, ?, 1) "
+        "ON CONFLICT(code, d, channel) DO UPDATE SET visits = qr_visits.visits + 1",
+        (code, day, channel),
+    )
+
+
+async def qr_visits(date_from: str, date_to: str) -> dict[str, int]:
+    rows = await db.fetchall(
+        "SELECT code, SUM(visits) AS total FROM qr_visits "
+        "WHERE d BETWEEN ? AND ? GROUP BY code",
+        (date_from, date_to),
+    )
+    return {row["code"]: int(row["total"] or 0) for row in rows}
 
 
 async def stats_by_source(date_from: str, date_to: str) -> list[Row]:

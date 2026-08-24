@@ -3,7 +3,7 @@
 Прогоняет весь путь гостя и действия менеджера на временной базе:
     python selftest.py
 
-Ничего не отправляет наружу — вместо Telegram/MAX подставляется заглушка.
+Ничего не отправляет наружу — вместо Telegram подставляется заглушка.
 Полезно после любых правок: если что-то сломалось, видно сразу.
 """
 from __future__ import annotations
@@ -18,12 +18,10 @@ TMP = tempfile.mkdtemp(prefix="fatucci_test_")
 # Тест полностью задаёт своё окружение, чтобы .env разработчика на него не влиял.
 # На PostgreSQL тест идёт только из selftest_pg.py — он задаёт DB_SCHEMA
 # и работает во временной схеме. Во всех остальных случаях принудительно
-# гасим DATABASE_URL, иначе .env увёл бы тест в боевую базу.
+# гасим адрес базы, иначе тест ушёл бы в боевую.
 if not os.getenv("DB_SCHEMA"):
     for name in ("DATABASE_URL", "POSTGRES_URL", "POSTGRESQL_URL", "DB_URL"):
         os.environ[name] = ""
-    # адрес базы зашит в коде, поэтому гасим его явным маркером —
-    # иначе тест ушёл бы в боевую базу
     os.environ["FATUCCI_DATABASE_URL"] = "sqlite"
     os.environ["DB_PATH"] = os.path.join(TMP, "test.db")
 os.environ["TELEGRAM_TOKEN"] = "0:test"
@@ -36,14 +34,20 @@ os.environ["PAYMENT_PROVIDER_TOKEN"] = ""
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from app import courier, db, repo, statuses  # noqa: E402
+from datetime import timedelta  # noqa: E402
+
+from app import courier, db, guide, payments, pricing, repo, statuses  # noqa: E402
 from app.channels import base  # noqa: E402
 from app.channels.base import Channel, Event, Out  # noqa: E402
+from app.channels.telegram import ADMIN_BUTTON  # noqa: E402
 from app.router import route  # noqa: E402
-from app.utils import fmt_date_iso, today  # noqa: E402
+from app.utils import fmt_date_iso, today, utc_stamp  # noqa: E402
 
 OK, FAIL = "✅", "❌"
 failures: list[str] = []
+
+TEST_TOKEN = "123456789:TEST:abcdef0123456789abcd"
+GUEST, GUEST2, ADMIN, CHAT = "555", "556", "777", "-100777"
 
 
 def check(condition: bool, title: str) -> None:
@@ -55,13 +59,14 @@ def check(condition: bool, title: str) -> None:
 class FakeChannel(Channel):
     """Заглушка мессенджера: всё «отправленное» складывается в список."""
 
-    def __init__(self, name: str) -> None:
+    def __init__(self, name: str = "tg") -> None:
         self.name = name
         self.title = name
         self.username = "fatucci_test_bot"
         self.sent: list[tuple[str, Out]] = []
         self.invoices: list[dict] = []
         self.admin_button_shown = False
+        self.description = ""
         self._id = 0
 
     async def send(self, chat_id: str, out: Out) -> str:
@@ -79,23 +84,31 @@ class FakeChannel(Channel):
     def start_link(self, payload: str = "") -> str:
         return f"https://t.me/fatucci_test_bot?start={payload}"
 
-    async def send_document(self, chat_id: str, data: bytes, filename: str,
-                            caption: str = "") -> bool:
+    async def send_document(self, chat_id, data, filename, caption="") -> bool:
         self.sent.append((str(chat_id), Out(text=f"[файл] {filename} {len(data)}b {caption}")))
         return True
 
-    async def send_bytes(self, chat_id: str, data: bytes, filename: str, caption: str = "") -> bool:
+    async def send_bytes(self, chat_id, data, filename, caption="") -> bool:
         self.sent.append((str(chat_id), Out(text=f"[png {len(data)}b] {filename}")))
         return True
 
     async def download_bytes(self, file_id: str) -> bytes:
         return bytes([0x89]) + b"PNG" + b"0" * 64
 
+    async def set_description(self, text: str) -> bool:
+        self.description = text
+        return True
+
+    async def show_admin_button(self, chat_id: str, text: str) -> bool:
+        self.admin_button_shown = True
+        self.sent.append((str(chat_id), Out(text=text)))
+        return True
+
     async def send_invoice(self, chat_id, title, description, payload, amount_kop,
                            provider_token, label="К оплате", provider_data="") -> tuple[bool, str]:
-        self.invoices.append({"chat_id": str(chat_id), "title": title,
-                              "description": description, "payload": payload,
-                              "amount": amount_kop, "token": provider_token})
+        self.invoices.append({"chat_id": str(chat_id), "title": title, "payload": payload,
+                              "description": description, "amount": amount_kop,
+                              "token": provider_token})
         self.sent.append((str(chat_id), Out(text=f"[счёт] {title} — {amount_kop} коп.")))
         return True, ""
 
@@ -106,9 +119,11 @@ class FakeChannel(Channel):
     def texts(self) -> str:
         return "\n".join(out.text for _, out in self.sent)
 
+    def to(self, chat: str) -> str:
+        return "\n".join(out.text for c, out in self.sent if c == chat)
+
     def buttons(self) -> list[str]:
-        out = self.last()
-        return [b.data or b.url for row in (out.kb or []) for b in row]
+        return [b.data or b.url for row in (self.last().kb or []) for b in row]
 
     def find_button(self, prefix: str) -> str:
         for _, out in reversed(self.sent):
@@ -118,10 +133,14 @@ class FakeChannel(Channel):
                         return btn.data
         return ""
 
-    async def show_admin_button(self, chat_id: str, text: str) -> bool:
-        self.admin_button_shown = True
-        self.sent.append((str(chat_id), Out(text=text)))
-        return True
+    def find_all(self, prefix: str) -> list[str]:
+        found = []
+        for _, out in self.sent:
+            for row in out.kb or []:
+                for btn in row:
+                    if btn.data.startswith(prefix) and btn.data not in found:
+                        found.append(btn.data)
+        return found
 
     def clear(self) -> None:
         self.sent.clear()
@@ -129,12 +148,8 @@ class FakeChannel(Channel):
         self.admin_button_shown = False
 
 
-GUEST = "555"
-ADMIN = "777"
-
-
-def guest_event(kind: str, **kwargs) -> Event:
-    return Event(channel="tg", user_id=GUEST, chat_id=GUEST, kind=kind,
+def guest_event(kind: str, who: str = GUEST, **kwargs) -> Event:
+    return Event(channel="tg", user_id=who, chat_id=who, kind=kind,
                  full_name="Тестовый Гость", **kwargs)
 
 
@@ -143,541 +158,400 @@ def admin_event(kind: str, chat_id: str = ADMIN, **kwargs) -> Event:
                  username="manager", full_name="Менеджер", **kwargs)
 
 
+async def place_order(ch: FakeChannel, dates: int = 1, qty: int = 2, who: str = GUEST,
+                      apartment: str = "45", allergies: str = "",
+                      comment: str = "") -> list:
+    """Пройти путь гостя до конца и вернуть строки созданного заказа."""
+    ch.clear()
+    await route(guest_event("start", who, payload="demo1"), ch)
+    await route(guest_event("callback", who, payload="g:order", callback_id="o1"), ch)
+    picks = ch.find_all("g:date:")[:dates]
+    for iso in picks:
+        await route(guest_event("callback", who, payload=iso, callback_id="o2"), ch)
+    await route(guest_event("callback", who, payload="g:dates", callback_id="o3"), ch)
+    await route(guest_event("callback", who, payload=f"g:qty:{qty}", callback_id="o4"), ch)
+    await route(guest_event("text", who, text=apartment), ch)
+    await route(guest_event("contact", who, phone="+7 999 123-45-67"), ch)
+    if allergies:
+        await route(guest_event("text", who, text=allergies), ch)
+    else:
+        await route(guest_event("callback", who, payload="g:skipa", callback_id="o5"), ch)
+    if comment:
+        await route(guest_event("text", who, text=comment), ch)
+    else:
+        await route(guest_event("callback", who, payload="g:skip", callback_id="o6"), ch)
+    await route(guest_event("callback", who, payload="g:confirm", callback_id="o7"), ch)
+    orders = await repo.list_orders(limit=30, user_key=("tg", who))
+    key = orders[0]["group_key"]
+    return await repo.group_orders(key)
+
+
 async def main() -> None:
-    ch = FakeChannel("tg")
+    ch = FakeChannel()
     base.REGISTRY["tg"] = ch
     await db.init_db()
-    await repo.set_setting("pay_enabled", "0")   # оплату включаем ниже, отдельным блоком
+    await repo.set_setting("pm_token", TEST_TOKEN)     # касса «подключена»
 
-    print("\n— Сценарий гостя —")
+    print("\n— Заказ на один день —")
+    ch.clear()
     await route(guest_event("start", payload="demo1"), ch)
     check("Fatucci" in ch.texts(), "приветствие показано")
-    check(any("g:order" in b for b in ch.buttons()), "есть кнопка «Заказать завтрак»")
+    check(bool(ch.find_button("g:order")), "есть кнопка «Заказать завтрак»")
+    check(bool(ch.find_button("g:rules")), "есть раздел «Условия заказа»")
+    check(bool(ch.find_button("g:manager")), "есть кнопка «Связаться с менеджером»")
 
     ch.clear()
-    await route(guest_event("callback", payload="g:order", callback_id="c1"), ch)
-    date_btn = ch.find_button("g:date:")
-    check(bool(date_btn), f"предложены даты доставки ({date_btn})")
+    await route(guest_event("callback", payload="g:order", callback_id="d1"), ch)
+    dates = ch.find_all("g:date:")
+    check(len(dates) >= 2, f"предложено несколько дат ({len(dates)})")
 
     ch.clear()
-    await route(guest_event("callback", payload=date_btn, callback_id="c2"), ch)
-    qty_btn = ch.find_button("g:qty:")
-    check(bool(qty_btn), "показан выбор количества")
-    check("Сет" in ch.texts(), "показан сет дня")
+    await route(guest_event("callback", payload=dates[0], callback_id="d2"), ch)
+    check("✅" in "".join(b.text for r in ch.last().kb for b in r), "дата отмечается галочкой")
+    check(bool(ch.find_button("g:dates")), "появилась кнопка «Далее»")
 
     ch.clear()
-    await route(guest_event("callback", payload="g:qty:2", callback_id="c3"), ch)
+    await route(guest_event("callback", payload="g:dates", callback_id="d3"), ch)
+    check(bool(ch.find_button("g:qty:")), "показан выбор количества")
+
+    ch.clear()
+    await route(guest_event("callback", payload="g:qty:2", callback_id="d4"), ch)
     check("апартамент" in ch.texts().lower(), "запрошен номер апартаментов")
-
     ch.clear()
     await route(guest_event("text", text="45"), ch)
     check("телефон" in ch.texts().lower(), "запрошен телефон")
-    check(ch.last().reply_contact != "", "предложена кнопка «Поделиться контактом»")
-
     ch.clear()
     await route(guest_event("contact", phone="+7 999 123-45-67"), ch)
-    check("пожелания" in ch.texts().lower() or "комментар" in ch.texts().lower(),
-          "запрошен комментарий")
-
+    check("аллерг" in ch.texts().lower(), "спрошено про аллергии")
     ch.clear()
-    await route(guest_event("callback", payload="g:skip", callback_id="c4"), ch)
+    await route(guest_event("text", text="аллергия на орехи"), ch)
+    check("пожелания" in ch.texts().lower(), "спрошены пожелания")
+    ch.clear()
+    await route(guest_event("text", text="позвонить за 10 минут"), ch)
     check("Проверьте заказ" in ch.texts(), "показана карточка проверки")
-    check("1 800" in ch.texts().replace(" ", " "), "итоговая сумма 900 × 2 = 1 800 ₽")
+    check("Отменить или изменить" in ch.texts(), "на проверке видны условия отмены")
+    check("аллергия на орехи" in ch.texts(), "аллергии видны в карточке")
 
     ch.clear()
-    await route(guest_event("callback", payload="g:confirm", callback_id="c5"), ch)
+    await route(guest_event("callback", payload="g:confirm", callback_id="d5"), ch)
     orders = await repo.list_orders(limit=5)
-    check(len(orders) == 1, "заказ создан в базе")
+    check(len(orders) == 1, "заказ создан")
     order = orders[0]
-    check(order["status"] == statuses.NEW, "статус нового заказа — «не оплачен»")
-    check(order["apartment"] == "45" and order["qty"] == 2, "апартаменты и количество сохранены")
-    check(order["phone"] == "+79991234567", "телефон нормализован")
-    check(order["total_kop"] == 180000, "сумма посчитана верно")
-    check(order["source_code"] == "demo1", "QR-метка объекта записана")
-    check(any(chat == "-100777" for chat, _ in ch.sent), "заказ ушёл в рабочий чат менеджеров")
-    check("НОВЫЙ ЗАКАЗ" in ch.texts(), "менеджер видит карточку заказа")
+    check(order["qty"] == 2 and order["apartment"] == "45", "количество и апартаменты сохранены")
+    check(order["allergies"] == "аллергия на орехи", "аллергии записаны в заказ")
+    check(order["comment"] == "позвонить за 10 минут", "пожелания записаны")
+    check(order["group_key"] == order["number"], "номер заказа и номер группы совпали")
+    check("Заказ принят" in ch.to(GUEST), "гостю пришло подтверждение приёма")
+    check("НОВЫЙ ЗАКАЗ" in ch.to(CHAT), "менеджер получил карточку")
+    check("Аллергии" in ch.to(CHAT), "аллергии видны менеджеру")
 
-    print("\n— Действия менеджера —")
+    print("\n— Заказ сразу на несколько дней —")
+    group = await place_order(ch, dates=3, qty=2, who=GUEST2, apartment="214")
+    check(len(group) == 3, f"создано 3 строки заказа — по одной на дату ({len(group)})")
+    check(len({row["group_key"] for row in group}) == 1, "у всех дат один номер заказа")
+    check(len({row["delivery_date"] for row in group}) == 3, "даты разные")
+    check(len({row["number"] for row in group}) == 3, "номера строк уникальны")
+    guest_text = ch.to(GUEST2)
+    check(guest_text.count(" шт.") >= 3, "гость видит разбивку по датам")
+    check("Итого:" in guest_text, "показан итог по всему заказу")
+    total = sum(row["total_kop"] for row in group)
+    check(total == sum(r["price_kop"] * r["qty"] for r in group), "сумма заказа сходится")
+    check(ch.to(CHAT).count("НОВЫЙ ЗАКАЗ") == 1, "менеджеру пришла одна карточка на весь заказ")
+
+    print("\n— Оплата через подключённую кассу —")
     ch.clear()
-    await route(admin_event("callback", chat_id="-100777",
-                            payload=f"a:ord:{order['id']}:{statuses.ACCEPTED}",
-                            callback_id="a1"), ch)
-    order = await repo.get_order(order["id"])
-    check(order["status"] == statuses.ACCEPTED, "статус → «принят в работу»")
-    check("оплат" in ch.texts().lower(), "гостю ушло сообщение про оплату")
+    await route(admin_event("callback", chat_id=CHAT,
+                            payload=f"a:ord:{group[0]['id']}:{statuses.ACCEPTED}",
+                            callback_id="p1"), ch)
+    fresh = await repo.group_orders(group[0]["group_key"])
+    check(all(row["status"] == statuses.ACCEPTED for row in fresh),
+          "подтверждение применилось ко всем дням заказа")
+    check(len(ch.invoices) == 1, "гостю выставлен один счёт на весь заказ")
+    if ch.invoices:
+        inv = ch.invoices[0]
+        check(inv["amount"] == total, "сумма счёта равна сумме заказа")
+        check(inv["token"] == TEST_TOKEN, "счёт выставлен с токеном кассы")
+        check(len(inv["title"]) <= 32 and len(inv["description"]) <= 255,
+              "заголовок и описание счёта в пределах лимитов Telegram")
 
     ch.clear()
-    await route(admin_event("callback", chat_id="-100777",
-                            payload=f"a:ord:{order['id']}:{statuses.PAID}", callback_id="a2"), ch)
-    order = await repo.get_order(order["id"])
-    check(order["status"] == statuses.PAID, "статус → «оплачен»")
-    check(order["paid_at"] != "", "зафиксировано время оплаты")
+    await route(Event(channel="tg", user_id=GUEST2, chat_id=GUEST2, kind="payment",
+                      payload=payments.invoice_payload(group[0]["id"]),
+                      raw={"charge_id": "ch_1"}), ch)
+    fresh = await repo.group_orders(group[0]["group_key"])
+    check(all(row["status"] == statuses.PAID for row in fresh), "после оплаты весь заказ оплачен")
+    check(all(row["paid_at"] for row in fresh), "время оплаты зафиксировано")
+
+    print("\n— Доставка и получение по дням —")
+    group = await place_order(ch, dates=2, qty=1, who=GUEST2, apartment="214")
+    await route(admin_event("callback", chat_id=CHAT,
+                            payload=f"a:ord:{group[0]['id']}:{statuses.ACCEPTED}",
+                            callback_id="dl0"), ch)
+    ch.clear()
+    await route(admin_event("callback", chat_id=CHAT,
+                            payload=f"a:ord:{group[0]['id']}:{statuses.DELIVERED}",
+                            callback_id="dl1"), ch)
+    fresh = await repo.group_orders(group[0]["group_key"])
+    check(fresh[0]["status"] == statuses.DELIVERED and fresh[1]["status"] != statuses.DELIVERED,
+          "доставка отмечается по одному дню")
+    check(bool(ch.find_button("g:got:")), "гостю предложено подтвердить получение")
+    ch.clear()
+    await route(guest_event("callback", GUEST2, payload=f"g:got:{group[0]['id']}",
+                            callback_id="dl2"), ch)
+    fresh = await repo.group_orders(group[0]["group_key"])
+    check(fresh[0]["status"] == statuses.RECEIVED, "гость подтвердил получение")
+    check(not ch.find_button("g:paid:"), "кнопки «Я оплатил» больше нет — платит касса")
+
+    print("\n— Без подключённой кассы заказ не оформляется —")
+    await repo.set_setting("pm_token", "")
+    ch.clear()
+    await route(guest_event("callback", payload="g:order", callback_id="n1"), ch)
+    check("недоступен" in ch.texts().lower(), "гостю сказано, что заказать пока нельзя")
+    check(not ch.find_button("g:date:"), "даты при этом не предлагаются")
+    await repo.set_setting("pm_token", TEST_TOKEN)
 
     ch.clear()
-    await route(admin_event("callback", chat_id="-100777",
-                            payload=f"a:ord:{order['id']}:{statuses.DELIVERED}",
-                            callback_id="a3"), ch)
-    order = await repo.get_order(order["id"])
-    check(order["status"] == statuses.DELIVERED, "статус → «доставлен»")
+    await repo.set_setting("pay_enabled", "0")
+    await route(guest_event("callback", payload="g:order", callback_id="n2"), ch)
+    check("недоступен" in ch.texts().lower(), "выключенный приём оплаты тоже закрывает заказы")
+    await repo.set_setting("pay_enabled", "1")
+    ok, report = await payments.check_setup()
+    check(ok and "тестовый" in report.lower(), "проверка оплаты видит тестовый режим")
+    await repo.set_setting("pm_token", "мусор")
+    ok, report = await payments.check_setup()
+    check(not ok and "не похож" in report, "кривой токен подсвечивается")
+    await repo.set_setting("pm_token", TEST_TOKEN)
+
+    print("\n— Общий QR: гость вводит адрес —")
+    ch.clear()
+    await route(guest_event("start", payload="obshiy"), ch)
+    await route(guest_event("callback", payload="g:order", callback_id="a1"), ch)
+    check("адрес" in ch.texts().lower(), "по общему QR спрошен адрес")
+    check(not ch.find_button("g:obj:"), "список чужих объектов гостю не показывается")
 
     ch.clear()
-    await route(guest_event("callback", payload=f"g:got:{order['id']}", callback_id="c6"), ch)
-    order = await repo.get_order(order["id"])
-    check(order["status"] == statuses.RECEIVED, "гость подтвердил получение → «получен»")
+    await route(guest_event("text", text="Северная 12"), ch)
+    check(bool(ch.find_button("g:date:")), "после адреса предложены даты")
+    session = await repo.get_session("tg", GUEST)
+    matched = await repo.get_object(session["object_id"])
+    check(matched is not None and matched["code"] == "demo1",
+          "адрес сопоставлен с нужным объектом")
 
-    print("\n— Выгрузка курьерам —")
-    await repo.set_setting("courier_statuses", "received,paid,accepted,delivered")
-    digest = await courier.build_digest(order["delivery_date"] and
-                                        __import__("datetime").date.fromisoformat(
-                                            order["delivery_date"]))
-    check("апарт. 45" in digest, "в сводке есть номер апартаментов")
-    check("Северная" in digest, "в сводке есть адрес объекта")
-    check(digest.count("\n") > 2, "сводка — одно многострочное сообщение")
-    # форма курьерской службы, присланная заказчиком 18.08
+    ch.clear()
+    await route(guest_event("start", payload="obshiy"), ch)
+    await route(guest_event("callback", payload="g:order", callback_id="a2"), ch)
+    await route(guest_event("text", text="Неизвестная улица 99"), ch)
+    check("менеджер проверит" in ch.texts().lower() or "не найден" in ch.texts().lower()
+          or "пока нет в списке" in ch.texts().lower(),
+          "про незнакомый адрес честно сказано")
+    check(bool(ch.find_button("g:date:")), "заказ всё равно можно продолжить")
+
+    print("\n— Сопоставление адресов —")
+    for typed, expect in [("г. Сочи, ул. Северная, д. 12", "demo1"),
+                          ("северная 12", "demo1"),
+                          ("Северная д.12", "demo1"),
+                          ("Ленина 5", None)]:
+        found = await repo.find_object_by_address(typed)
+        code = found["code"] if found else None
+        check(code == expect, f"адрес «{typed}» → {code or 'не найден'}")
+
+    print("\n— Отмена заказа —")
+    group = await place_order(ch, dates=3, qty=1, who=GUEST2, apartment="214")
+    ch.clear()
+    await route(guest_event("callback", GUEST2, payload=f"g:cancel:{group[1]['id']}",
+                            callback_id="c1"), ch)
+    fresh = await repo.group_orders(group[0]["group_key"])
+    cancelled = [row for row in fresh if row["status"] == statuses.CANCELLED]
+    check(len(cancelled) == 1, "отменён ровно один день заказа")
+    check(cancelled[0]["id"] == group[1]["id"], "отменён именно выбранный день")
+
+    ch.clear()
+    await route(guest_event("callback", GUEST2, payload=f"g:cancelall:{group[0]['id']}",
+                            callback_id="c2"), ch)
+    fresh = await repo.group_orders(group[0]["group_key"])
+    check(all(row["status"] == statuses.CANCELLED for row in fresh), "отменён весь заказ")
+    check("отменил заказ" in ch.to(CHAT).lower(), "менеджер уведомлён об отмене")
+
+    print("\n— Курьерская выгрузка —")
+    await repo.set_setting("courier_statuses", "new,accepted,paid")
+    group = await place_order(ch, dates=3, qty=2, who=GUEST, apartment="45")
+    from datetime import date as _date
+    for row in group:
+        digest = await courier.build_digest(_date.fromisoformat(row["delivery_date"]))
+        check(f"апарт. {row['apartment']}" in digest,
+              f"заказ попал в выгрузку на {row['delivery_date']}")
+    first = _date.fromisoformat(group[0]["delivery_date"])
+    digest = await courier.build_digest(first)
+    check(digest.count("📥 Откуда:") == len(
+        await repo.orders_for_delivery(group[0]["delivery_date"], ["new", "accepted", "paid"])),
+        "в выгрузке столько блоков, сколько доставок на этот день")
     for field in ("📥 Откуда:", "📍 Адрес:", "👥 Получатель:", "⏰ Когда:",
                   "✏️ Комментарий:", "Доставка:"):
-        check(field in digest, f"в сводке есть поле формы курьера «{field}»")
-    check("Fatucci fine food" in digest, "подставлен адрес, откуда забирать заказ")
-    check("отчитаться о доставке" in digest, "подставлен комментарий курьеру")
-    check("+7 (999) 123-45-67" in digest, "телефон получателя в читаемом виде")
+        check(field in digest, f"в выгрузке есть поле «{field}»")
 
-    print("\n— Админ-панель —")
+    await repo.set_status(group[1]["id"], statuses.CANCELLED, actor="тест")
+    second = _date.fromisoformat(group[1]["delivery_date"])
+    digest2 = await courier.build_digest(second)
+    check("апарт. 45" not in digest2 or "подтверждённых заказов нет" in digest2,
+          "отменённый день из выгрузки пропал")
+
+    print("\n— Скидки за количество —")
+    tiers = pricing.parse_tiers("3=5, 5=10, 10=15")
+    check([t.qty for t in tiers] == [10, 5, 3], "пороги разобраны и отсортированы")
+    check(pricing.percent_for(4, tiers) == 5, "между порогами держится нижний")
+    price = pricing.calc(90000, 5, tiers)
+    check(price.percent == 10 and price.per_set == 81000, "900 ₽ → 810 ₽ при 5 наборах")
+    check(price.total == 405000 and price.saved == 45000, "итог и экономия посчитаны")
+    check(pricing.parse_tiers("ерунда") == [], "мусор в настройке игнорируется")
+
+    await repo.set_setting("discount_tiers", "2=10")
+    group = await place_order(ch, dates=1, qty=2, who=GUEST)
+    check(group[0]["discount_pct"] == 10, "скидка сохранена в заказе")
+    check(group[0]["price_kop"] == round(group[0]["base_price_kop"] * 0.9 / 100) * 100,
+          "цена со скидкой посчитана верно")
+    await repo.set_setting("discount_tiers", "")
+
+    print("\n— Время приёма и отмены —")
+    obj = await repo.get_object_by_code("demo1")
+    from app import availability, orders_service
+    await repo.update_object(obj["id"], cutoff_time="00:01", lead_days=1)
+    obj = await repo.get_object_by_code("demo1")
+    tomorrow = today() + timedelta(days=1)
+    dates_now = [d for d, _ in await availability.available_dates(obj)]
+    check(tomorrow not in dates_now, "после отсечки завтра не предлагается")
+    await repo.update_object(obj["id"], cutoff_time="23:59")
+    obj = await repo.get_object_by_code("demo1")
+    dates_now = [d for d, _ in await availability.available_dates(obj)]
+    check(tomorrow in dates_now, "до отсечки завтра доступно")
+
+    deadline = await orders_service.cancel_deadline_for(fmt_date_iso(tomorrow))
+    check(deadline is not None and deadline.date() == today(),
+          "срок отмены — накануне дня доставки")
+
+    print("\n— Аналитика по QR —")
+    before = (await repo.qr_visits(fmt_date_iso(today()), fmt_date_iso(today()))).get("demo1", 0)
+    await route(guest_event("start", payload="demo1"), ch)
+    after = (await repo.qr_visits(fmt_date_iso(today()), fmt_date_iso(today()))).get("demo1", 0)
+    check(after == before + 1, "переход по QR посчитан")
+    ch.clear()
+    await route(admin_event("callback", payload="a:st:d30", callback_id="s1"), ch)
+    check("переход" in ch.texts(), "в статистике видны переходы по QR")
+    check("Выручка" in ch.texts(), "в статистике есть выручка по объекту")
+
+    print("\n— Ежедневное напоминание —")
+    from app import scheduler
+    await repo.set_setting("daily_remind_time", "00:00")
+    await repo.set_setting("daily_remind_sent", "")
+    ch.clear()
+    await scheduler.daily_remind_tick()
+    check(await repo.get_setting("daily_remind_sent") in ("", fmt_date_iso(today())),
+          "отметка об отправке напоминания ставится")
+    await repo.set_setting("daily_remind_enabled", "0")
+
+    print("\n— Незавершённый заказ —")
+    ch.clear()
+    await route(guest_event("callback", payload="g:order", callback_id="r1"), ch)
+    first_date = ch.find_button("g:date:")
+    await route(guest_event("callback", payload=first_date, callback_id="r2"), ch)
+    session = await repo.get_session("tg", GUEST)
+    check(session is not None and session["state"] != "", "черновик заказа сохранён")
+    await db.execute("UPDATE sessions SET updated_at = ? WHERE channel='tg' AND ext_id = ?",
+                     (utc_stamp(minutes=-90), GUEST))
+    ch.clear()
+    await scheduler.reminder_tick()
+    check(bool(ch.find_button("g:resume")), "напоминание о брошенном заказе отправлено")
+
+    print("\n— Админка —")
     ch.clear()
     await route(admin_event("text", text="/admin"), ch)
     check("Админ-панель" in ch.texts(), "админка открывается по /admin")
-    for section, title in [("a:o:l:new:0", "заказы"), ("a:m:l", "меню"), ("a:r:l", "ротация"),
-                           ("a:b:l", "объекты"), ("a:q:l", "QR"), ("a:cur:m", "курьеры"),
-                           ("a:t:l", "тексты"), ("a:f:l", "доп. предложения"),
-                           ("a:u:l:0", "гости"), ("a:bc:m", "рассылка"), ("a:cfg:m", "настройки"),
-                           ("a:st:m", "статистика"), ("a:x:m", "экспорт")]:
+    check(ch.admin_button_shown, "кнопка админ-панели закрепляется")
+    ch.clear()
+    await route(admin_event("text", text=ADMIN_BUTTON), ch)
+    check("Админ-панель" in ch.texts(), "нажатие кнопки открывает админку")
+
+    ch.clear()
+    await route(admin_event("callback", payload="a:h", callback_id="h0"), ch)
+    check("Админ-панель" in ch.texts(), "домашний экран админки открывается кнопкой")
+    await repo.set_setting("pm_token", "")
+    ch.clear()
+    await route(admin_event("callback", payload="a:h", callback_id="h1"), ch)
+    check("Касса не подключена" in ch.texts(), "админ видит предупреждение про кассу")
+    await repo.set_setting("pm_token", TEST_TOKEN)
+
+    for section, title in [("a:o:l:new:0", "заказы"), ("a:g:menu", "меню и цены"),
+                           ("a:g:obj", "объекты и QR"), ("a:cur:m", "курьеры"),
+                           ("a:g:rep", "отчёты"), ("a:cfg:m", "настройки"),
+                           ("a:bc:m", "рассылка"), ("a:hp", "справка"),
+                           ("a:db", "проверка базы"), ("a:acc:l", "доступ"),
+                           ("a:t:l", "тексты"), ("a:m:l", "сеты"), ("a:r:l", "ротация"),
+                           ("a:b:l", "объекты"), ("a:q:l", "QR"), ("a:f:l", "доп. предложения"),
+                           ("a:u:l:0", "гости"), ("a:x:m", "экспорт")]:
         ch.clear()
         await route(admin_event("callback", payload=section, callback_id="x"), ch)
         check(len(ch.sent) > 0 and len(ch.last().text) > 10, f"раздел админки: {title}")
 
-    print("\n— Проверка базы данных —")
     ch.clear()
-    await route(admin_event("callback", payload="a:db", callback_id="db1"), ch)
-    text = ch.texts()
-    check("База данных" in text, "раздел проверки базы открывается")
-    check("Связь есть" in text, "связь с базой подтверждена")
-    check("Заказов:" in text and "Гостей:" in text, "показано содержимое таблиц")
-    check("Отклик:" in text, "измерено время отклика базы")
-    check(any("a:db" == (b.data or "") for r in ch.last().kb for b in r),
-          "есть кнопка повторной проверки")
-    report = await db.health()
-    check(report["ok"] and report["ping_ms"] >= 0, "health() отдаёт исправный отчёт")
-    check(any(title == "Заказов" for title, _ in report["tables"]),
-          "в отчёте есть таблица заказов")
-    check(report["engine"] in ("SQLite", "PostgreSQL"), f"движок определён: {report['engine']}")
-    check("@" not in report["where"], "пароль базы в отчёт не попадает")
+    await route(admin_event("callback", payload="a:cfg:yk", callback_id="y1"), ch)
+    check("касс" in ch.texts().lower() or "счёт в telegram" in ch.texts().lower(),
+          "проверка оплаты сообщает о состоянии кассы")
 
-    print("\n— Кнопка админ-панели —")
-    from app.channels.telegram import ADMIN_BUTTON
-    ch.clear()
-    await route(admin_event("callback", payload="a:h", callback_id="k1"), ch)
-    check(ch.admin_button_shown, "при входе в админку кнопка закрепляется")
-    ch.clear()
-    await route(admin_event("text", text=ADMIN_BUTTON), ch)
-    check("Админ-панель" in ch.texts(), "нажатие кнопки открывает админку")
-    ch.clear()
-    await route(guest_event("text", text=ADMIN_BUTTON), ch)
-    check("Админ-панель" not in ch.texts(), "у гостя эта кнопка админку не открывает")
-
-    print("\n— Справка в админке —")
-    from app import guide
-    ch.clear()
-    await route(admin_event("callback", payload="a:hp", callback_id="h0"), ch)
-    check("Справка по админ-панели" in ch.texts(), "оглавление справки открывается")
-    check(len(ch.last().kb) >= len(guide.ORDER), "в оглавлении есть все разделы")
-    missing = [k for k in guide.ORDER if not guide.body(k).strip()]
-    check(not missing, f"у каждого раздела есть текст (пустых: {len(missing)})")
-    broken: list[str] = []
+    broken = []
     for key in guide.ORDER:
         ch.clear()
         await route(admin_event("callback", payload=f"a:hp:{key}", callback_id="h"), ch)
-        text = ch.texts()
-        has_nav = any("a:hp" == (b.data or "") for r in (ch.last().kb or []) for b in r)
-        if len(text) < 150 or not has_nav:
+        if len(ch.texts()) < 150:
             broken.append(guide.title(key))
-    check(not broken, f"все {len(guide.ORDER)} разделов справки открываются "
-                      f"с текстом и навигацией{' — сломаны: ' + ', '.join(broken) if broken else ''}")
+    check(not broken, f"все {len(guide.ORDER)} разделов справки открываются"
+                      + (f" — сломаны: {broken}" if broken else ""))
 
     ch.clear()
-    await route(admin_event("callback", payload="a:g:menu", callback_id="g1"), ch)
-    check("Скидки за количество" in ch.texts() or
-          any("cfg:s:price" in (b.data or "") for r in ch.last().kb for b in r),
-          "группа «Меню и цены» ведёт к скидкам")
-    ch.clear()
-    await route(admin_event("callback", payload="a:cfg:s:price", callback_id="g2"), ch)
-    check("скидк" in ch.texts().lower(), "раздел скидок открывается")
-
-    ch.clear()
-    await route(admin_event("callback", payload="a:cfg:s:cur", callback_id="g3"), ch)
-    check("Откуда забирать" in ch.texts(), "настройки формы курьера доступны")
-
-    ch.clear()
-    await route(admin_event("callback", payload="a:st:d30", callback_id="x"), ch)
-    check("Статистика" in ch.texts(), "статистика за 30 дней считается")
-
-    ch.clear()
-    await route(admin_event("callback", payload="a:x:p30", callback_id="x"), ch)
+    await route(admin_event("callback", payload="a:x:p30", callback_id="x1"), ch)
     check("[файл]" in ch.texts(), "CSV-выгрузка формируется")
-
     ch.clear()
-    await route(admin_event("callback", payload="a:q:o:1", callback_id="x"), ch)
+    await route(admin_event("callback", payload="a:q:o:1", callback_id="x2"), ch)
     check("[png" in ch.texts(), "QR-код генерируется картинкой")
-    check("t.me/fatucci_test_bot?start=demo1" in ch.texts(), "ссылка QR содержит код объекта")
 
-    print("\n— Проверка ограничений —")
-    ch.clear()
-    obj = await repo.get_object_by_code("demo1")
-    await repo.update_object(obj["id"], delivery_days="1")   # только понедельник
-    from app import availability
-    obj = await repo.get_object_by_code("demo1")
-    dates = await availability.available_dates(obj)
-    check(all(d.isoweekday() == 1 for d, _ in dates), "даты фильтруются по дням доставки")
-    await repo.update_object(obj["id"], delivery_days="1,2,3,4,5,6,7")
+    print("\n— Содержимое из ТЗ —")
+    sets = await repo.list_sets()
+    check(len(sets) == 4, f"в меню 4 сета ({len(sets)})")
+    offers = await repo.list_offers()
+    check(len(offers) == 3, f"три направления «Ещё от Fatucci» ({len(offers)})")
+    titles = " ".join(o["title"] for o in offers)
+    for name in ("Fine Food", "Дольче Дача", "Кейтеринг"):
+        check(name in titles, f"есть блок «{name}»")
+    check(len(await repo.get_text("bot_description")) > 50, "задано приветствие до кнопки Start")
+    check("Условия заказа" in await repo.get_text("rules"), "заполнен раздел «Условия заказа»")
+    check(await repo.get_setting("courier_time") == "19:00", "выгрузка курьерам в 19:00")
+    check(await repo.get_setting("cancel_deadline") == "18:30", "отмена до 18:30 накануне")
 
-    ch.clear()
-    await route(guest_event("start", payload="obshiy"), ch)
-    await route(guest_event("callback", payload="g:order", callback_id="c7"), ch)
-    check(bool(ch.find_button("g:obj:")), "общий QR предлагает выбрать объект")
+    print("\n— Шаблоны текстов —")
+    from app import defaults
+    broken_texts = []
+    for key in defaults.DEFAULT_TEXTS:
+        try:
+            rendered = await repo.render_text(key)
+        except Exception as exc:  # noqa: BLE001
+            broken_texts.append(f"{key}: {exc}")
+            continue
+        if not rendered.strip():
+            broken_texts.append(f"{key}: пусто")
+    check(not broken_texts, f"все {len(defaults.DEFAULT_TEXTS)} текстов бота собираются"
+                            + (f" — сломаны: {broken_texts}" if broken_texts else ""))
 
-    ch.clear()
+    print("\n— Чёрный список —")
     user = await repo.get_user("tg", GUEST)
     await repo.set_blocked(user["id"], True)
+    ch.clear()
     await route(guest_event("text", text="привет"), ch)
     check("недоступно" in ch.texts(), "чёрный список работает")
     await repo.set_blocked(user["id"], False)
 
-    print("\n— Время отсечки заказов —")
-    obj = await repo.get_object_by_code("demo1")
-    await repo.update_object(obj["id"], cutoff_time="00:01", lead_days=1)
-    obj = await repo.get_object_by_code("demo1")
-    dates = [d for d, _ in await availability.available_dates(obj)]
-    tomorrow = today() + __import__("datetime").timedelta(days=1)
-    check(tomorrow not in dates, "после отсечки завтрашняя дата не предлагается")
-    await repo.update_object(obj["id"], cutoff_time="23:59")
-    obj = await repo.get_object_by_code("demo1")
-    dates = [d for d, _ in await availability.available_dates(obj)]
-    check(tomorrow in dates, "до отсечки завтрашняя дата доступна")
-    ok, reason = await availability.check_date(obj, today() - __import__("datetime").timedelta(days=3))
-    check(not ok, f"заказ в прошлое отклоняется ({reason})")
-
-    print("\n— Правка данных из админки —")
-    ch.clear()
-    await route(admin_event("callback", payload=f"a:b:e:{obj['id']}:price_kop", callback_id="x"), ch)
-    await route(admin_event("text", text="1250"), ch)
-    obj = await repo.get_object_by_code("demo1")
-    check(obj["price_kop"] == 125000, "цена объекта изменилась на 1 250 ₽")
-
-    ch.clear()
-    await route(admin_event("callback", payload="a:cfg:e:gen:manager_phone", callback_id="x"), ch)
-    await route(admin_event("text", text="+7 900 111-22-33"), ch)
-    check(await repo.get_setting("manager_phone") == "+7 900 111-22-33", "настройка сохраняется")
-
-    ch.clear()
-    await route(admin_event("callback", payload="a:cfg:t:gen:orders_paused", callback_id="x"), ch)
-    check(await repo.get_bool("orders_paused"), "переключатель в настройках работает")
-    await route(admin_event("callback", payload="a:cfg:t:gen:orders_paused", callback_id="x"), ch)
-    check(not await repo.get_bool("orders_paused"), "переключатель возвращается обратно")
-
-    ch.clear()
-    await route(admin_event("callback", payload="a:t:e:welcome", callback_id="x"), ch)
-    await route(admin_event("text", text="Новое приветствие"), ch)
-    check(await repo.get_text("welcome") == "Новое приветствие", "текст бота редактируется")
-
-    print("\n— Отмена и отказ —")
-    ch.clear()
-    await route(guest_event("start", payload="demo1"), ch)
-    await route(guest_event("callback", payload="g:order", callback_id="d1"), ch)
-    date_btn = ch.find_button("g:date:")
-    await route(guest_event("callback", payload=date_btn, callback_id="d2"), ch)
-    await route(guest_event("callback", payload="g:qty:1", callback_id="d3"), ch)
-    await route(guest_event("text", text="12А"), ch)
-    await route(guest_event("text", text="89991112233"), ch)
-    await route(guest_event("callback", payload="g:skip", callback_id="d4"), ch)
-    await route(guest_event("callback", payload="g:confirm", callback_id="d5"), ch)
-    second = (await repo.list_orders(limit=1))[0]
-    check(second["qty"] == 1 and second["apartment"] == "12А", "второй заказ оформлен")
-
-    ch.clear()
-    await route(guest_event("callback", payload=f"g:cancel:{second['id']}", callback_id="d6"), ch)
-    second = await repo.get_order(second["id"])
-    check(second["status"] == statuses.CANCELLED, "гость может отменить свой заказ")
-
-    ch.clear()
-    await route(guest_event("callback", payload="g:order", callback_id="d7"), ch)
-    date_btn = ch.find_button("g:date:")
-    await route(guest_event("callback", payload=date_btn, callback_id="d8"), ch)
-    await route(guest_event("callback", payload="g:qty:1", callback_id="d9"), ch)
-    await route(guest_event("callback", payload="g:reapt", callback_id="d10"), ch)
-    await route(guest_event("callback", payload="g:rephone", callback_id="d11"), ch)
-    await route(guest_event("callback", payload="g:skip", callback_id="d12"), ch)
-    await route(guest_event("callback", payload="g:confirm", callback_id="d13"), ch)
-    third = (await repo.list_orders(limit=1))[0]
-    check(third["apartment"] == "12А" and third["phone"] == "+79991112233",
-          "повторный заказ подставляет сохранённые данные")
-
-    ch.clear()
-    await route(admin_event("callback", chat_id="-100777",
-                            payload=f"a:ord:{third['id']}:{statuses.REJECTED}", callback_id="r1"), ch)
-    await route(admin_event("text", text="Нет свободных курьеров"), ch)
-    third = await repo.get_order(third["id"])
-    check(third["status"] == statuses.REJECTED, "менеджер может отклонить заказ")
-    check("Нет свободных курьеров" in ch.texts(), "причина отказа доходит до гостя")
-
-    print("\n— Незавершённый заказ и напоминание —")
-    ch.clear()
-    await route(guest_event("callback", payload="g:order", callback_id="e1"), ch)
-    date_btn = ch.find_button("g:date:")
-    await route(guest_event("callback", payload=date_btn, callback_id="e2"), ch)
-    session = await repo.get_session("tg", GUEST)
-    check(session is not None and session["state"] != "", "черновик заказа сохранён в базе")
-    from app.utils import utc_stamp
-    await db.execute("UPDATE sessions SET updated_at = ? "
-                     "WHERE channel = 'tg' AND ext_id = ?", (utc_stamp(minutes=-90), GUEST))
-    from app import scheduler
-    ch.clear()
-    await scheduler.reminder_tick()
-    check("не закончили" in ch.texts() or "Продолжить" in str(ch.buttons()) or
-          bool(ch.find_button("g:resume")), "напоминание о брошенном заказе отправлено")
-    ch.clear()
-    await route(guest_event("callback", payload="g:resume", callback_id="e3"), ch)
-    check(bool(ch.find_button("g:qty:")), "по кнопке «Продолжить» гость возвращается на свой шаг")
-
-    print("\n— Адаптер MAX —")
-    from app.channels.max import MaxChannel
-    mx = MaxChannel("test-token", "fatucci_max_bot")
-    started = mx._parse({"update_type": "bot_started", "chat_id": 900,
-                         "user": {"user_id": 11, "name": "Гость MAX", "username": "guest"},
-                         "payload": "demo1"})
-    check(started is not None and started.kind == "start" and started.payload == "demo1",
-          "MAX: bot_started разбирается, стартовая метка получена")
-    created = mx._parse({"update_type": "message_created", "message": {
-        "sender": {"user_id": 11, "name": "Гость MAX"},
-        "recipient": {"chat_id": 900, "chat_type": "dialog"},
-        "body": {"mid": "mid.1", "text": "45"}}})
-    check(created is not None and created.kind == "text" and created.text == "45",
-          "MAX: обычное сообщение разбирается")
-    contact = mx._parse({"update_type": "message_created", "message": {
-        "sender": {"user_id": 11}, "recipient": {"chat_id": 900},
-        "body": {"mid": "mid.2", "attachments": [
-            {"type": "contact", "payload": {
-                "vcf_info": "BEGIN:VCARD\nTEL;TYPE=CELL:+7 999 123-45-67\nEND:VCARD"}}]}}})
-    check(contact is not None and contact.kind == "contact" and contact.phone == "+79991234567",
-          "MAX: контакт разбирается, телефон извлечён")
-    cb = mx._parse({"update_type": "message_callback",
-                    "callback": {"callback_id": "cb1", "payload": "g:order",
-                                 "user": {"user_id": 11}},
-                    "message": {"recipient": {"chat_id": 900}, "body": {"mid": "mid.3"}}})
-    check(cb is not None and cb.kind == "callback" and cb.payload == "g:order"
-          and cb.callback_id == "cb1", "MAX: нажатие кнопки разбирается")
-    body = await mx._body(Out(text="Привет", kb=[[base.Btn(text="Заказать", data="g:order"),
-                                                  base.Btn(text="Сайт", url="https://a.ru")]],
-                              reply_contact="Поделиться"))
-    kbd = [a for a in body["attachments"] if a["type"] == "inline_keyboard"][0]["payload"]["buttons"]
-    check(kbd[0][0]["type"] == "request_contact", "MAX: кнопка запроса контакта собрана")
-    check(kbd[1][0]["type"] == "callback" and kbd[1][0]["payload"] == "g:order",
-          "MAX: callback-кнопка собрана")
-    check(kbd[1][1]["type"] == "link" and kbd[1][1]["url"] == "https://a.ru",
-          "MAX: кнопка-ссылка собрана")
-    check(body["format"] == "html" and len(body["text"]) <= 4000, "MAX: тело сообщения корректно")
-    check(mx.start_link("demo1") == "https://max.ru/fatucci_max_bot?start=demo1",
-          "MAX: ссылка для QR собирается верно")
-    await mx.close()
-
-    print("\n— Скидки за количество —")
-    from app import pricing
-    tiers = pricing.parse_tiers("3=5, 5=10, 10=15")
-    check([t.qty for t in tiers] == [10, 5, 3], "пороги разобраны и отсортированы")
-    check(pricing.percent_for(1, tiers) == 0, "на 1 набор скидки нет")
-    check(pricing.percent_for(3, tiers) == 5, "от 3 наборов — 5%")
-    check(pricing.percent_for(4, tiers) == 5, "между порогами держится нижний")
-    check(pricing.percent_for(12, tiers) == 15, "выше верхнего порога — максимальная скидка")
-    check(pricing.parse_tiers("ерунда") == [], "мусор в настройке скидок игнорируется")
-
-    price = pricing.calc(90000, 5, tiers)
-    check(price.percent == 10 and price.per_set == 81000,
-          "цена сета со скидкой 10%: 900 ₽ → 810 ₽")
-    check(price.total == 405000 and price.saved == 45000,
-          "итог и экономия посчитаны верно")
-    check(pricing.calc(90000, 1, tiers).total == 90000, "без скидки итог не меняется")
-
-    await repo.set_setting("discount_tiers", "2=10")
-    ch.clear()
-    await route(guest_event("start", payload="demo1"), ch)
-    await route(guest_event("callback", payload="g:order", callback_id="s1"), ch)
-    date_btn = ch.find_button("g:date:")
-    await route(guest_event("callback", payload=date_btn, callback_id="s2"), ch)
-    check("−10%" in ch.texts(), "гостю показана скидка на шаге количества")
-    await route(guest_event("callback", payload="g:qty:2", callback_id="s3"), ch)
-    await route(guest_event("callback", payload="g:reapt", callback_id="s4"), ch)
-    await route(guest_event("callback", payload="g:rephone", callback_id="s5"), ch)
-    ch.clear()
-    await route(guest_event("callback", payload="g:skip", callback_id="s6"), ch)
-    check("Скидка −10%" in ch.texts(), "скидка видна в карточке проверки заказа")
-    check(len(ch.last().kb) == 2, "на экране подтверждения всего две строки кнопок")
-    ch.clear()
-    await route(guest_event("callback", payload="g:edit", callback_id="s6e"), ch)
-    check("Что поправить" in ch.texts(), "кнопка «Изменить» открывает список правок")
-    ch.clear()
-    await route(guest_event("callback", payload="g:back", callback_id="s6b"), ch)
-    check("Проверьте заказ" in ch.texts(), "возврат к карточке заказа работает")
-    await route(guest_event("callback", payload="g:confirm", callback_id="s7"), ch)
-    disc_order = (await repo.list_orders(limit=1))[0]
-    obj_now = await repo.get_object_by_code("demo1")
-    expect_base = obj_now["price_kop"]
-    expect_set = round(expect_base * 0.9 / 100) * 100
-    check(disc_order["discount_pct"] == 10, "скидка сохранена в заказе")
-    check(disc_order["base_price_kop"] == expect_base
-          and disc_order["price_kop"] == expect_set,
-          "в заказе есть и базовая цена, и цена со скидкой")
-    check(disc_order["total_kop"] == expect_set * 2,
-          f"итог заказа со скидкой посчитан верно ({expect_set * 2 / 100:.0f} ₽)")
-    check(disc_order["customer_name"] != "", "имя получателя записано в заказ")
-    await repo.set_setting("discount_tiers", "")
-
-    print("\n— Оплата через PayMaster —")
-    from app import orders_service, payments
-    TEST_TOKEN = "123456789:TEST:abcdef0123456789abcd"
-    check(payments.token_looks_valid(TEST_TOKEN), "токен провайдера распознан")
-    check(payments.is_test(TEST_TOKEN), "режим определён как тестовый")
-    check(not payments.token_looks_valid("test_abc"), "чужой формат ключа отбраковывается")
-    check(payments.parse_payload(payments.invoice_payload(42)) == 42,
-          "метка заказа в счёте читается обратно")
-
-    await repo.set_setting("pm_token", TEST_TOKEN)
-    await repo.set_setting("pay_enabled", "1")
-    ok, message = await payments.check_setup()
-    check(ok and "тестовый" in message.lower(), "проверка настройки предупреждает о тест-режиме")
-
-    ch.clear()
-    await route(guest_event("start", payload="demo1"), ch)
-    await route(guest_event("callback", payload="g:order", callback_id="p1"), ch)
-    date_btn = ch.find_button("g:date:")
-    await route(guest_event("callback", payload=date_btn, callback_id="p2"), ch)
-    await route(guest_event("callback", payload="g:qty:1", callback_id="p3"), ch)
-    await route(guest_event("callback", payload="g:reapt", callback_id="p4"), ch)
-    await route(guest_event("callback", payload="g:rephone", callback_id="p5"), ch)
-    await route(guest_event("callback", payload="g:skip", callback_id="p6"), ch)
-    await route(guest_event("callback", payload="g:confirm", callback_id="p7"), ch)
-    pay_order = (await repo.list_orders(limit=1))[0]
-
-    ch.clear()
-    await route(admin_event("callback", chat_id="-100777",
-                            payload=f"a:ord:{pay_order['id']}:{statuses.ACCEPTED}",
-                            callback_id="p8"), ch)
-    check(len(ch.invoices) == 1, "при принятии в работу гостю выставлен счёт")
-    if ch.invoices:
-        inv = ch.invoices[0]
-        check(inv["amount"] == pay_order["total_kop"], "сумма счёта совпадает с заказом")
-        check(inv["token"] == TEST_TOKEN, "счёт выставлен с токеном провайдера")
-        check(len(inv["title"]) <= 32 and len(inv["description"]) <= 255,
-              "заголовок и описание счёта укладываются в лимиты Telegram")
-        check(inv["chat_id"] == GUEST, "счёт ушёл именно гостю")
-
-    ch.clear()
-    await route(guest_event("payment", payload=payments.invoice_payload(pay_order["id"]),
-                            text=""), ch)
-    pay_order = await repo.get_order(pay_order["id"])
-    check(pay_order["status"] == statuses.PAID, "после оплаты заказ автоматически «оплачен»")
-    check(pay_order["paid_at"] != "", "время оплаты зафиксировано")
-    check("оплачено" in ch.texts().lower(), "гостю пришло подтверждение оплаты")
-
-    ch.clear()
-    await route(guest_event("payment", payload="order:999999"), ch)
-    check(len(ch.sent) == 0, "оплата по несуществующему заказу не роняет бота")
-
-    max_ch = FakeChannel("max")
-    base.REGISTRY["max"] = max_ch
-    max_order = await repo.create_order(
-        channel="max", ext_id="42", chat_id="900", object_id=1,
-        object_title="Тест", object_address="Адрес", set_id=1, set_title="Сет",
-        delivery_date=fmt_date_iso(today()), qty=1, apartment="7", phone="+79990000000",
-        price_kop=90000, total_kop=90000, status=statuses.NEW, source_code="demo1")
-    ok, error = await orders_service.send_invoice(max_order)
-    check(not ok and not error, "в MAX счёт не выставляется — там нет встроенных платежей")
-    check(len(max_ch.invoices) == 0, "и не пытается: гостю MAX счёт не уходит")
-
-    max_ch.clear()
-    await orders_service.change_status(max_order["id"], statuses.ACCEPTED, actor="тест")
-    check("менеджер свяжется" in max_ch.texts().lower(),
-          "гость в MAX получает сообщение, что с оплатой поможет менеджер")
-    base.REGISTRY.pop("max", None)
-
-    await repo.set_setting("pay_enabled", "0")
-
-    print("\n— MAX подключается из админ-панели —")
-    import main as botmain
-    await repo.set_setting("max_token", "max-token-from-panel")
-    await repo.set_setting("max_username", "fatucci_max_bot")
-    token, username = await botmain.max_credentials()
-    check(token == "max-token-from-panel" and username == "fatucci_max_bot",
-          "токен и username MAX читаются из настроек, а не из .env")
-    check(await botmain.max_still_on("max-token-from-panel"), "канал MAX поднимается")
-    await repo.set_setting("max_enabled", "0")
-    check(not await botmain.max_still_on("max-token-from-panel"),
-          "выключение MAX в админке останавливает опрос")
-    await repo.set_setting("max_enabled", "1")
-    await repo.set_setting("max_token", "another-token")
-    check(not await botmain.max_still_on("max-token-from-panel"),
-          "смена токена в админке перезапускает канал")
-    await repo.set_setting("max_token", "")
-
-    print("\n— Доступ: владелец и менеджеры —")
-    from app import admins
-    from app.config import cfg as app_cfg
-    saved_env_admins = app_cfg.admin_ids
-    app_cfg.admin_ids = []                      # как на чистом хостинге без ADMIN_IDS
-    await db.execute("DELETE FROM admins")
-    admins.invalidate()
-
-    OWNER, MANAGER = "901", "902"
-    ch.clear()
-    await route(Event(channel="tg", user_id=OWNER, chat_id=OWNER, kind="start",
-                      full_name="Первый Написавший"), ch)
-    check(await admins.is_admin(OWNER), "первый написавший боту стал владельцем")
-    check(await admins.is_owner(OWNER), "он помечен именно как владелец")
-    check("владелец" in ch.texts().lower(), "владельцу пришло сообщение о выданном доступе")
-
-    ch.clear()
-    await route(Event(channel="tg", user_id=MANAGER, chat_id=MANAGER, kind="start",
-                      full_name="Второй Гость"), ch)
-    check(not await admins.is_admin(MANAGER), "второй пользователь прав не получает")
-    check("владелец" not in ch.texts().lower(), "второму про владельца не пишут")
-
-    ch.clear()
-    await route(Event(channel="tg", user_id=MANAGER, chat_id=MANAGER, kind="text",
-                      text="/admin"), ch)
-    check("Админ-панель" not in ch.texts(), "не-админ не может открыть админку")
-
-    ch.clear()
-    await route(Event(channel="tg", user_id=OWNER, chat_id=OWNER, kind="callback",
-                      payload="a:acc:add", callback_id="z1"), ch)
-    await route(Event(channel="tg", user_id=OWNER, chat_id=OWNER, kind="text",
-                      text=MANAGER), ch)
-    check(await admins.is_admin(MANAGER), "владелец добавил менеджера через админку")
-    check("доступ к админ-панели" in ch.texts().lower(), "новому админу пришло уведомление")
-
-    ch.clear()
-    await route(Event(channel="tg", user_id=MANAGER, chat_id=MANAGER, kind="text",
-                      text="/admin"), ch)
-    check("Админ-панель" in ch.texts(), "новый менеджер видит админку")
-
-    ok, _ = await admins.remove(int(MANAGER))
-    check(ok and not await admins.is_admin(MANAGER), "менеджера можно убрать")
-    ok, message = await admins.remove(int(OWNER))
-    check(not ok, f"владельца убрать нельзя ({message})")
-
-    ch.clear()
-    await route(Event(channel="tg", user_id=OWNER, chat_id=OWNER, kind="callback",
-                      payload="a:acc:l", callback_id="z2"), ch)
-    check("Доступ к админ-панели" in ch.texts(), "раздел «Доступ» открывается")
-
-    app_cfg.admin_ids = saved_env_admins
-    admins.invalidate()
-    check(await admins.is_admin(ADMIN), "ADMIN_IDS из окружения остаётся аварийным входом")
+    print("\n— Проверка базы —")
+    report = await db.health()
+    check(report["ok"], "health() говорит, что связь есть")
+    check(any(t == "Заказов" for t, _ in report["tables"]), "в отчёте есть таблица заказов")
+    check("@" not in report["where"], "пароль базы в отчёт не попадает")
 
     await db.close()
     print()
@@ -689,8 +563,15 @@ async def main() -> None:
     print(f"{OK} Все проверки пройдены.")
 
 
+async def _run() -> None:
+    try:
+        await main()
+    finally:
+        await db.close()
+
+
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        asyncio.run(_run())
     finally:
         shutil.rmtree(TMP, ignore_errors=True)

@@ -123,6 +123,17 @@ class TelegramChannel(Channel):
             is_persistent=True,
         )
 
+    async def set_description(self, text: str) -> bool:
+        """Текст, который гость видит до нажатия Start."""
+        if not text.strip():
+            return False
+        try:
+            await self.bot.set_my_description(description=text.strip()[:512])
+            return True
+        except TelegramAPIError as exc:
+            log.warning("Не удалось обновить описание бота: %s", exc)
+            return False
+
     async def show_admin_button(self, chat_id: str, text: str) -> bool:
         """Закрепить кнопку админ-панели. Возвращает False, если она уже стоит."""
         if chat_id in self._admin_kb_chats:

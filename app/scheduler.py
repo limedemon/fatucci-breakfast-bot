@@ -16,6 +16,7 @@ async def run_all() -> None:
     await asyncio.gather(
         _loop("courier", courier_tick, 60),
         _loop("reminders", reminder_tick, 300),
+        _loop("daily", daily_remind_tick, 60),
     )
 
 
@@ -47,6 +48,51 @@ async def courier_tick() -> int:
         return 60
     log.info("Формирую автоматическую выгрузку для курьеров на %s", day)
     await courier.send_digest(day, auto=True)
+    return 60
+
+
+# ------------------------------------ ежедневное «успейте заказать до 16:00»
+async def daily_remind_tick() -> int:
+    """Раз в день напоминаем гостям, что приём заказов на завтра скоро закроется."""
+    if not await repo.get_bool("daily_remind_enabled", True):
+        return 300
+    scheduled = parse_time(await repo.get_setting("daily_remind_time", "15:00"), "15:00")
+    current = now()
+    planned = current.replace(hour=scheduled.hour, minute=scheduled.minute,
+                              second=0, microsecond=0)
+    if not (planned <= current < planned + timedelta(minutes=10)):
+        return 60
+
+    stamp = fmt_date_iso(current.date())
+    if await repo.get_setting("daily_remind_sent") == stamp:
+        return 60
+    await repo.set_setting("daily_remind_sent", stamp)
+
+    tomorrow = fmt_date_iso(current.date() + timedelta(days=1))
+    only_buyers = (await repo.get_setting("daily_remind_audience", "all")).strip() == "buyers"
+    text = await repo.render_text("daily_reminder")
+    kb = [[Btn(text="🥐 Заказать завтрак", data="g:order", intent="positive")]]
+
+    sent = 0
+    for row in await repo.broadcast_targets():
+        if await repo.count_orders(user_key=(row["channel"], row["ext_id"]),
+                                   date_from=tomorrow, date_to=tomorrow,
+                                   status="new,accepted,paid"):
+            continue                       # на завтра заказ уже есть
+        if only_buyers and not await repo.count_orders(
+                user_key=(row["channel"], row["ext_id"])):
+            continue
+        channel = get_channel(row["channel"])
+        if channel is None:
+            continue
+        try:
+            await channel.send(row["chat_id"] or row["ext_id"], Out(text=text, kb=kb))
+            sent += 1
+        except Exception:  # noqa: BLE001
+            log.debug("Напоминание не доставлено: %s/%s", row["channel"], row["ext_id"])
+        await asyncio.sleep(0.05 if row["channel"] == "tg" else 0.4)
+
+    log.info("Ежедневное напоминание отправлено: %s гостям", sent)
     return 60
 
 

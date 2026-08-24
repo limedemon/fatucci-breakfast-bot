@@ -52,13 +52,14 @@ CREATE TABLE IF NOT EXISTS objects (
     address        TEXT NOT NULL DEFAULT '',
     price_kop      INTEGER NOT NULL DEFAULT 0,
     delivery_days  TEXT NOT NULL DEFAULT '1,2,3,4,5,6,7',
-    cutoff_time    TEXT NOT NULL DEFAULT '20:00',
+    cutoff_time    TEXT NOT NULL DEFAULT '16:00',
     lead_days      INTEGER NOT NULL DEFAULT 1,
     max_days_ahead INTEGER NOT NULL DEFAULT 7,
     min_qty        INTEGER NOT NULL DEFAULT 1,
     max_qty        INTEGER NOT NULL DEFAULT 10,
     is_active      INTEGER NOT NULL DEFAULT 1,
     is_general     INTEGER NOT NULL DEFAULT 0,
+    delivery_time  TEXT NOT NULL DEFAULT '09:00',
     note           TEXT NOT NULL DEFAULT '',
     created_at     TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -119,6 +120,9 @@ CREATE TABLE IF NOT EXISTS orders (
     apartment      TEXT NOT NULL DEFAULT '',
     phone          TEXT NOT NULL DEFAULT '',
     customer_name  TEXT NOT NULL DEFAULT '',
+    allergies      TEXT NOT NULL DEFAULT '',
+    group_key      TEXT NOT NULL DEFAULT '',
+    address_ok     INTEGER NOT NULL DEFAULT 1,
     discount_pct   INTEGER NOT NULL DEFAULT 0,
     base_price_kop INTEGER NOT NULL DEFAULT 0,
     comment        TEXT NOT NULL DEFAULT '',
@@ -137,6 +141,7 @@ CREATE INDEX IF NOT EXISTS idx_orders_date   ON orders (delivery_date);
 CREATE INDEX IF NOT EXISTS idx_orders_status ON orders (status);
 CREATE INDEX IF NOT EXISTS idx_orders_object ON orders (object_id);
 CREATE INDEX IF NOT EXISTS idx_orders_user   ON orders (channel, ext_id);
+CREATE INDEX IF NOT EXISTS idx_orders_group  ON orders (group_key);
 
 CREATE TABLE IF NOT EXISTS order_events (
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -202,6 +207,14 @@ CREATE TABLE IF NOT EXISTS admins (
     is_owner   INTEGER NOT NULL DEFAULT 0,
     added_by   TEXT NOT NULL DEFAULT '',
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS qr_visits (
+    code    TEXT NOT NULL,
+    d       TEXT NOT NULL,
+    channel TEXT NOT NULL DEFAULT '',
+    visits  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (code, d, channel)
 );
 
 CREATE TABLE IF NOT EXISTS admin_state (
@@ -412,6 +425,10 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("orders", "discount_pct", "INTEGER NOT NULL DEFAULT 0"),
     ("orders", "base_price_kop", "INTEGER NOT NULL DEFAULT 0"),
     ("users", "customer_name", "TEXT NOT NULL DEFAULT ''"),
+    ("orders", "allergies", "TEXT NOT NULL DEFAULT ''"),
+    ("orders", "group_key", "TEXT NOT NULL DEFAULT ''"),
+    ("orders", "address_ok", "INTEGER NOT NULL DEFAULT 1"),
+    ("objects", "delivery_time", "TEXT NOT NULL DEFAULT '09:00'"),
 ]
 
 
@@ -469,6 +486,7 @@ HEALTH_TABLES = [
     ("admins", "Администраторов"),
     ("media", "Картинок"),
     ("digests", "Выгрузок курьерам"),
+    ("qr_visits", "Записей переходов по QR"),
 ]
 
 

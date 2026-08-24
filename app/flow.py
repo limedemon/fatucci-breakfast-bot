@@ -4,6 +4,10 @@
   • перезапуск бота не роняет незавершённые заказы;
   • работает напоминание о брошенной корзине;
   • логика в Telegram и MAX идентична.
+
+Заказ можно оформить сразу на несколько дат: гость отмечает дни, бот сам
+подставляет сет по ротации на каждый из них, а в базе получается один заказ
+из нескольких строк — по одной на дату.
 """
 from __future__ import annotations
 
@@ -23,6 +27,7 @@ from .utils import (
     norm_phone,
     parse_date,
     plural,
+    today,
 )
 
 log = logging.getLogger(__name__)
@@ -30,17 +35,21 @@ Row = Any
 
 # состояния
 S_NONE = ""
-S_OBJECT = "object"
+S_ADDRESS = "address"
 S_DATE = "date"
 S_QTY = "qty"
 S_APARTMENT = "apartment"
 S_PHONE = "phone"
+S_ALLERGY = "allergy"
 S_COMMENT = "comment"
 S_CONFIRM = "confirm"
 
 BACK_LABEL = "⬅️ Назад"
 SKIP_LABEL = "⏭ Пропустить"
 CONTACT_LABEL = "📞 Поделиться контактом"
+
+#: сколько дат максимум можно отметить в одном заказе
+MAX_DATES = 14
 
 
 # ======================================================================= вход
@@ -75,10 +84,13 @@ async def _cmd_start(ev: Event, ch: Channel) -> None:
     code = _clean_code(ev.payload)
     obj = await repo.get_object_by_code(code) if code else None
 
+    if code:
+        await repo.add_qr_visit(code, ev.channel, fmt_date_iso(today()))
+
     if code and obj is None:
         await ch.send(ev.chat_id, Out(
             text="😕 Такой QR-код не найден или больше не действует.\n"
-                 "Выберите объект вручную или обратитесь к менеджеру."))
+                 "Оформите заказ обычной кнопкой — бот спросит адрес."))
     elif obj is not None and not obj["is_active"]:
         await ch.send(ev.chat_id, Out(
             text="⏸ Приём заказов по этому объекту временно приостановлен."))
@@ -88,7 +100,7 @@ async def _cmd_start(ev: Event, ch: Channel) -> None:
     if obj is not None:
         await repo.update_user(ev.channel, ev.user_id, source_code=obj["code"])
         if obj["is_general"]:
-            session_object = None
+            session_object = obj["id"]       # общий QR: адрес спросим при заказе
         else:
             session_object = obj["id"]
             await repo.update_user(ev.channel, ev.user_id, object_id=obj["id"])
@@ -114,13 +126,14 @@ async def _show_main_menu(ev: Event, ch: Channel, new_message: bool = False) -> 
     session = await repo.get_session(ev.channel, ev.user_id)
     obj = await repo.get_object(session["object_id"] if session else None)
 
-    if obj is not None:
+    if obj is not None and not obj["is_general"]:
         text = await repo.render_text(
             "welcome_object",
             object_title=obj["title"],
             address=obj["address"] or obj["title"],
             price=fmt_money(obj["price_kop"]),
             cutoff=obj["cutoff_time"],
+            delivery_time=obj["delivery_time"],
         )
     else:
         text = await repo.render_text("welcome")
@@ -129,14 +142,19 @@ async def _show_main_menu(ev: Event, ch: Channel, new_message: bool = False) -> 
         [Btn(text="🥐 Заказать завтрак", data="g:order", intent="positive")],
         [Btn(text="📋 Меню и цены", data="g:sets"), Btn(text="🚚 Доставка", data="g:delivery")],
         [Btn(text="❓ Как заказать", data="g:how"), Btn(text="💬 Вопросы", data="g:faq")],
+        [Btn(text="📋 Условия заказа", data="g:rules")],
     ]
     if await repo.count_orders(user_key=(ev.channel, ev.user_id)):
         kb.append([Btn(text="📦 Мои заказы", data="g:my")])
     if await repo.list_offers(active_only=True):
-        kb.append([Btn(text="🍽 Ещё от Fatucci", data="g:offers")])
+        kb.append([Btn(text="🤍 Ещё от Fatucci", data="g:offers")])
+    kb.append([_manager_btn()])
 
-    out = Out(text=text, kb=kb, remove_reply_kb=True)
-    await _respond(ev, ch, out, new_message=new_message)
+    await _respond(ev, ch, Out(text=text, kb=kb, remove_reply_kb=True), new_message=new_message)
+
+
+def _manager_btn() -> Btn:
+    return Btn(text="✉️ Связаться с менеджером", data="g:manager")
 
 
 # ==================================================================== callback
@@ -154,20 +172,25 @@ async def _on_callback(ev: Event, ch: Channel, user: Row) -> None:
         "delivery": lambda: _show_info(ev, ch, "delivery_info"),
         "how": lambda: _show_info(ev, ch, "how_to_order"),
         "faq": lambda: _show_info(ev, ch, "faq"),
+        "rules": lambda: _show_info(ev, ch, "rules"),
+        "manager": lambda: _contact_manager(ev, ch),
         "offers": lambda: _show_offers(ev, ch),
         "offer": lambda: _show_offer(ev, ch, int(arg or 0)),
         "my": lambda: _show_my_orders(ev, ch),
         "ord": lambda: _show_my_order(ev, ch, int(arg or 0)),
-        "cancel": lambda: _cancel_order(ev, ch, int(arg or 0)),
+        "cancel": lambda: _cancel_order(ev, ch, int(arg or 0), whole=False),
+        "cancelall": lambda: _cancel_order(ev, ch, int(arg or 0), whole=True),
         "got": lambda: _confirm_received(ev, ch, int(arg or 0)),
-        "pay": lambda: _pay_again(ev, ch, int(arg or 0)),
-        "obj": lambda: _pick_object(ev, ch, int(arg or 0)),
-        "date": lambda: _pick_date(ev, ch, arg),
+        "date": lambda: _toggle_date(ev, ch, arg),
+        "dates": lambda: _dates_done(ev, ch),
+        "date_back": lambda: _ask_date(ev, ch),
         "qty": lambda: (_pick_qty(ev, ch, int(arg)) if arg else _ask_qty(ev, ch)),
         "apt": lambda: _ask_apartment(ev, ch),
         "reapt": lambda: _reuse_apartment(ev, ch),
         "phone": lambda: _ask_phone(ev, ch),
         "rephone": lambda: _reuse_phone(ev, ch),
+        "allergy": lambda: _ask_allergy(ev, ch),
+        "skipa": lambda: _skip_allergy(ev, ch),
         "cmt": lambda: _ask_comment(ev, ch),
         "skip": lambda: _skip_comment(ev, ch),
         "edit": lambda: _show_edit(ev, ch),
@@ -217,12 +240,29 @@ async def _to_menu(ev: Event, ch: Channel) -> None:
 
 # ================================================================ информация
 async def _show_info(ev: Event, ch: Channel, key: str) -> None:
-    session = await repo.get_session(ev.channel, ev.user_id)
-    obj = await repo.get_object(session["object_id"] if session else None)
-    cutoff = obj["cutoff_time"] if obj is not None else await repo.default_cutoff()
-    text = await repo.render_text(key, cutoff=cutoff)
-    await _respond(ev, ch, Out(text=text, kb=[[Btn(text="🥐 Заказать", data="g:order"),
-                                               Btn(text="⬅️ В меню", data="g:menu")]]))
+    obj = (await _session_object(ev))[0]
+    text = await repo.render_text(
+        key,
+        cutoff=obj["cutoff_time"] if obj is not None else await repo.default_cutoff(),
+        delivery_time=obj["delivery_time"] if obj is not None
+        else await repo.default_delivery_time(),
+    )
+    kb = [[Btn(text="🥐 Заказать", data="g:order"), Btn(text="⬅️ В меню", data="g:menu")],
+          [_manager_btn()]]
+    await _respond(ev, ch, Out(text=text, kb=kb))
+
+
+async def _contact_manager(ev: Event, ch: Channel) -> None:
+    contact = await repo.get_setting("manager_contact")
+    phone = await repo.get_setting("manager_phone")
+    lines = ["✉️ <b>Связаться с менеджером</b>", ""]
+    if contact:
+        lines.append(f"Telegram: {esc(contact)}")
+    if phone:
+        lines.append(f"Телефон: {esc(phone)}")
+    lines += ["", "Напишите нам по любому вопросу — о заказе, доставке или оплате."]
+    await _respond(ev, ch, Out(text="\n".join(lines),
+                               kb=[[Btn(text="⬅️ В меню", data="g:menu")]]))
 
 
 async def _show_sets(ev: Event, ch: Channel) -> None:
@@ -260,8 +300,7 @@ async def _show_set(ev: Event, ch: Channel, set_id: int) -> None:
     if item is None:
         await _show_sets(ev, ch)
         return
-    session = await repo.get_session(ev.channel, ev.user_id)
-    obj = await repo.get_object(session["object_id"] if session else None)
+    obj = (await _session_object(ev))[0]
     price = availability.price_for(obj, item) if obj is not None else (item["price_kop"] or 0)
     text = f"🥐 <b>{esc(item['title'])}</b>"
     if item["description"]:
@@ -269,7 +308,7 @@ async def _show_set(ev: Event, ch: Channel, set_id: int) -> None:
     if price:
         text += f"\n\n💰 <b>{fmt_money(price)}</b> за сет"
     kb = [[Btn(text="🥐 Заказать", data="g:order")],
-          [Btn(text="⬅️ К сетам", data="g:sets"), Btn(text="🏠 В меню", data="g:menu")]]
+          [Btn(text="⬅️ К меню", data="g:sets"), Btn(text="🏠 В начало", data="g:menu")]]
     await _respond(ev, ch, Out(text=text, kb=kb, photo=item["photo_path"]),
                    new_message=bool(item["photo_path"]))
 
@@ -294,30 +333,32 @@ async def _show_offer(ev: Event, ch: Channel, offer_id: int) -> None:
     kb: list[list[Btn]] = []
     if offer["url"]:
         kb.append([Btn(text=offer["button_text"] or "Открыть", url=offer["url"])])
-    kb.append([Btn(text="⬅️ Назад", data="g:offers"), Btn(text="🏠 В меню", data="g:menu")])
+    kb.append([Btn(text="⬅️ Назад", data="g:offers"), Btn(text="🏠 В начало", data="g:menu")])
     await _respond(ev, ch, Out(text=text, kb=kb, photo=offer["photo_path"]),
                    new_message=bool(offer["photo_path"]))
 
 
 # ============================================================== мои заказы
 async def _show_my_orders(ev: Event, ch: Channel) -> None:
-    orders = await repo.list_orders(user_key=(ev.channel, ev.user_id), limit=8)
-    if not orders:
+    groups = await repo.list_order_groups(limit=8, user_key=(ev.channel, ev.user_id))
+    if not groups:
         await _respond(ev, ch, Out(text="У вас пока нет заказов.",
                                    kb=[[Btn(text="🥐 Заказать завтрак", data="g:order")],
                                        [Btn(text="⬅️ В меню", data="g:menu")]]))
         return
     lines = ["📦 <b>Ваши заказы</b>", ""]
     kb: list[list[Btn]] = []
-    for order in orders:
+    for group in groups:
+        head = group[0]
+        number = head["group_key"] or head["number"]
+        days = len([row for row in group if row["status"] != statuses.CANCELLED]) or len(group)
         lines.append(
-            f"<b>№{esc(order['number'])}</b> · {fmt_date(order['delivery_date'], False)}\n"
-            f"{statuses.label(order['status'])} · {order['qty']} × "
-            f"{esc(order['set_title'])} · {fmt_money(order['total_kop'])}"
+            f"<b>№{esc(number)}</b> · {statuses.label(head['status'])}\n"
+            f"{days} {plural(days, 'день', 'дня', 'дней')} · "
+            f"{fmt_money(notify.group_total(group))}"
         )
-        kb.append([Btn(text=f"№{order['number']} · {fmt_date(order['delivery_date'], False)}",
-                       data=f"g:ord:{order['id']}")])
-    lines.append("\n<i>Нажмите на заказ, чтобы открыть его.</i>")
+        kb.append([Btn(text=f"№{number} · {fmt_date(head['delivery_date'], False)}",
+                       data=f"g:ord:{head['id']}")])
     kb.append([Btn(text="🥐 Заказать ещё", data="g:order"),
                Btn(text="⬅️ В меню", data="g:menu")])
     await _respond(ev, ch, Out(text="\n\n".join(lines), kb=kb))
@@ -328,21 +369,31 @@ async def _show_my_order(ev: Event, ch: Channel, order_id: int) -> None:
     if order is None or order["ext_id"] != str(ev.user_id) or order["channel"] != ev.channel:
         await _show_my_orders(ev, ch)
         return
-    text = await notify.order_card(order, for_admin=False)
+    group = await repo.group_of(order)
+    text = await notify.order_card(order, for_admin=False, group=group)
+    deadline = await repo.get_setting("cancel_deadline", "18:30")
+    text += (f"\n\n<i>Отменить или изменить заказ можно до {esc(deadline)} "
+             "предыдущего дня доставки.</i>")
+
     kb: list[list[Btn]] = []
-    if order["status"] == statuses.ACCEPTED:
-        kb.append([Btn(text=f"💳 Оплатить {fmt_money(order['total_kop'])}",
-                       data=f"g:pay:{order['id']}", intent="positive")])
     if order["status"] == statuses.DELIVERED:
         kb.append([Btn(text="✅ Я получил заказ", data=f"g:got:{order['id']}", intent="positive")])
     if order["status"] in statuses.GUEST_CANCELLABLE:
-        kb.append([Btn(text="❌ Отменить заказ", data=f"g:cancel:{order['id']}", intent="negative")])
-    kb.append([Btn(text="⬅️ К заказам", data="g:my"), Btn(text="🏠 В меню", data="g:menu")])
+        label = "❌ Отменить весь заказ" if len(group) > 1 else "❌ Отменить заказ"
+        kb.append([Btn(text=label, data=f"g:cancelall:{order['id']}", intent="negative")])
+        if len(group) > 1:
+            for row in group:
+                if row["status"] in statuses.GUEST_CANCELLABLE:
+                    kb.append([Btn(text=f"❌ Отменить {fmt_date(row['delivery_date'], False)}",
+                                   data=f"g:cancel:{row['id']}")])
+    kb.append([Btn(text="📋 Условия", data="g:rules"), _manager_btn()])
+    kb.append([Btn(text="⬅️ К заказам", data="g:my"), Btn(text="🏠 В начало", data="g:menu")])
     await _respond(ev, ch, Out(text=text, kb=kb))
 
 
-async def _cancel_order(ev: Event, ch: Channel, order_id: int) -> None:
-    ok, message = await orders_service.guest_cancel(order_id, ev.user_id, ev.channel)
+async def _cancel_order(ev: Event, ch: Channel, order_id: int, whole: bool) -> None:
+    ok, message = await orders_service.guest_cancel(order_id, ev.user_id, ev.channel,
+                                                    whole_order=whole)
     await ch.send(ev.chat_id, Out(text=("✅ " if ok else "⚠️ ") + message))
     await _show_my_orders(ev, ch)
 
@@ -353,22 +404,8 @@ async def _confirm_received(ev: Event, ch: Channel, order_id: int) -> None:
         await ch.send(ev.chat_id, Out(text="⚠️ " + message))
 
 
-async def _pay_again(ev: Event, ch: Channel, order_id: int) -> None:
-    """Гость нажал «Оплатить» в своих заказах — выставляем счёт заново."""
-    order = await repo.get_order(order_id)
-    if order is None or order["ext_id"] != str(ev.user_id):
-        await _show_my_orders(ev, ch)
-        return
-    ok, error = await orders_service.send_invoice(order)
-    if not ok:
-        await ch.send(ev.chat_id, Out(
-            text=await repo.render_text("payment_unavailable", number=order["number"])))
-        if error:
-            log.warning("Счёт по заказу %s не выставлен: %s", order["number"], error)
-
-
 async def _on_payment(ev: Event, ch: Channel) -> None:
-    """Telegram сообщил об успешной оплате."""
+    """Telegram подтвердил оплату встроенного счёта."""
     order_id = payments.parse_payload(ev.payload)
     if order_id is None:
         log.warning("Оплата с неизвестной меткой: %r", ev.payload)
@@ -381,83 +418,116 @@ async def _on_payment(ev: Event, ch: Channel) -> None:
     await orders_service.apply_payment_success(order, str(ev.raw.get("charge_id", "")))
 
 
-# ================================================================ оформление
 async def _start_order(ev: Event, ch: Channel) -> None:
     if await repo.get_bool("orders_paused", False):
         await _respond(ev, ch, Out(text=await repo.render_text("orders_paused"),
-                                   kb=[[Btn(text="⬅️ В меню", data="g:menu")]]))
+                                   kb=[[_manager_btn()],
+                                       [Btn(text="⬅️ В меню", data="g:menu")]]))
         return
 
-    session = await repo.get_session(ev.channel, ev.user_id)
-    object_id = session["object_id"] if session else None
-    obj = await repo.get_object(object_id)
-    if obj is None or not obj["is_active"] or obj["is_general"]:
-        await _ask_object(ev, ch)
+    if not await payments.invoice_available():
+        # без подключённой кассы оплатить заказ будет нечем — не начинаем оформление
+        await _respond(ev, ch, Out(text=await repo.render_text("no_payment"),
+                                   kb=[[_manager_btn()],
+                                       [Btn(text="⬅️ В меню", data="g:menu")]]))
+        return
+
+    obj, data = await _session_object(ev)
+    if obj is None:
+        await _ask_address(ev, ch)
+        return
+    if obj["is_general"] and not data.get("address"):
+        await _ask_address(ev, ch)
         return
     await _ask_date(ev, ch)
 
 
-async def _ask_object(ev: Event, ch: Channel) -> None:
-    objects = await repo.list_objects(active_only=True, selectable=True)
-    if not objects:
-        await _respond(ev, ch, Out(
-            text="Пока нет доступных объектов для заказа. Свяжитесь с менеджером.",
-            kb=[[Btn(text="⬅️ В меню", data="g:menu")]]))
-        return
-    await _set_state(ev, S_OBJECT, {})
-    kb = [[Btn(text=_object_label(obj), data=f"g:obj:{obj['id']}")] for obj in objects]
+# ------------------------------------------------------------------- адрес
+async def _ask_address(ev: Event, ch: Channel) -> None:
+    _, data = await _session_object(ev)
+    await _set_state(ev, S_ADDRESS, data)
+    kb: list[list[Btn]] = []
+    user = await repo.get_user(ev.channel, ev.user_id)
+    if user and user["object_id"]:
+        known = await repo.get_object(user["object_id"])
+        if known is not None and not known["is_general"] and known["address"]:
+            kb.append([Btn(text=f"📍 {known['address']}", data="g:noop")])
     kb.append([Btn(text="⬅️ В меню", data="g:menu")])
-    await _respond(ev, ch, Out(text=await repo.render_text("choose_object"), kb=kb))
+    await _respond(ev, ch, Out(text=await repo.render_text("ask_address"), kb=kb,
+                               remove_reply_kb=True))
 
 
-def _object_label(obj: Row) -> str:
-    if obj["group_title"] and obj["group_title"] not in obj["title"]:
-        return f"{obj['group_title']} · {obj['title']}"
-    return obj["title"]
-
-
-async def _pick_object(ev: Event, ch: Channel, object_id: int) -> None:
-    obj = await repo.get_object(object_id)
-    if obj is None or not obj["is_active"]:
-        await _ask_object(ev, ch)
+async def _input_address(ev: Event, ch: Channel, text: str, data: dict[str, Any]) -> None:
+    address = text.strip()
+    if len(address) < 5:
+        await ch.send(ev.chat_id, Out(
+            text="⚠️ Напишите улицу и номер дома — например, <b>Северная 12</b>."))
         return
+
+    matched = await repo.find_object_by_address(address)
+    data["address"] = address
+    data["address_ok"] = bool(matched)
     session = await repo.get_session(ev.channel, ev.user_id)
-    data = repo.json_loads(session["data"], {}) if session else {}
+    object_id = matched["id"] if matched else (session["object_id"] if session else None)
     await repo.save_session(ev.channel, ev.user_id, S_DATE, data, chat_id=ev.chat_id,
-                            object_id=obj["id"])
-    await repo.update_user(ev.channel, ev.user_id, object_id=obj["id"])
+                            object_id=object_id)
+
+    if matched is None:
+        await ch.send(ev.chat_id, Out(
+            text=await repo.render_text("address_unknown", address=esc(address))))
     await _ask_date(ev, ch)
 
 
+# -------------------------------------------------------------------- даты
 async def _ask_date(ev: Event, ch: Channel) -> None:
     obj, data = await _session_object(ev)
     if obj is None:
-        await _ask_object(ev, ch)
+        await _ask_address(ev, ch)
         return
-    dates = await availability.available_dates(obj)
+
+    dates = await availability.available_dates(obj, limit=MAX_DATES)
     if not dates:
-        await _respond(ev, ch, Out(text=await repo.render_text("no_dates"),
-                                   kb=[[Btn(text="⬅️ В меню", data="g:menu")]]))
+        await _respond(ev, ch, Out(
+            text=await repo.render_text("too_late", cutoff=obj["cutoff_time"]),
+            kb=[[_manager_btn()], [Btn(text="⬅️ В меню", data="g:menu")]]))
         return
+
+    chosen = set(data.get("dates", []))
+    multi = await repo.get_bool("multiday_enabled", True)
     await _set_state(ev, S_DATE, data)
-    kb = [[Btn(text=f"{fmt_date_btn(day)} · {breakfast['title']}", data=f"g:date:{fmt_date_iso(day)}")]
-          for day, breakfast in dates]
+
+    kb: list[list[Btn]] = []
+    for day, breakfast in dates:
+        iso = fmt_date_iso(day)
+        mark = "✅ " if iso in chosen else ""
+        kb.append([Btn(text=f"{mark}{fmt_date_btn(day)} · {breakfast['title']}",
+                       data=f"g:date:{iso}")])
+    if chosen:
+        kb.append([Btn(text=f"➡️ Далее · выбрано {len(chosen)} "
+                            f"{plural(len(chosen), 'день', 'дня', 'дней')}",
+                       data="g:dates", intent="positive")])
     kb.append([Btn(text="⬅️ В меню", data="g:menu")])
-    text = (
-        "📅 <b>На какой день привезти завтрак?</b>\n\n"
-        f"📍 {esc(obj['address'] or obj['title'])}\n"
-        f"💰 {fmt_money(obj['price_kop'])} за сет\n\n"
-        "Рядом с датой — сет, который подадут в этот день.\n"
-        f"<i>Показаны только те дни, на которые заказ ещё принимается "
-        f"(до {esc(obj['cutoff_time'])} накануне).</i>"
-    )
-    await _respond(ev, ch, Out(text=text, kb=kb))
+
+    text = ["📅 <b>На какие дни привезти завтрак?</b>", ""]
+    if obj["address"] and not obj["is_general"]:
+        text.append(f"📍 {esc(obj['address'])}")
+    elif data.get("address"):
+        text.append(f"📍 {esc(data['address'])}")
+    text.append(f"💰 {fmt_money(obj['price_kop'])} за сет · доставка к {esc(obj['delivery_time'])}")
+    text.append("")
+    if multi:
+        text.append("Можно отметить <b>несколько дней сразу</b> — рядом с датой "
+                    "показан сет, который подадут в этот день.")
+    else:
+        text.append("Рядом с датой — сет, который подадут в этот день.")
+    text.append(f"<i>Заказы принимаем до {esc(obj['cutoff_time'])} накануне.</i>")
+    await _respond(ev, ch, Out(text="\n".join(text), kb=kb))
 
 
-async def _pick_date(ev: Event, ch: Channel, iso: str) -> None:
+async def _toggle_date(ev: Event, ch: Channel, iso: str) -> None:
     obj, data = await _session_object(ev)
     if obj is None:
-        await _ask_object(ev, ch)
+        await _ask_address(ev, ch)
         return
     day = parse_date(iso)
     if day is None:
@@ -465,59 +535,93 @@ async def _pick_date(ev: Event, ch: Channel, iso: str) -> None:
         return
     ok, reason = await availability.check_date(obj, day)
     if not ok:
-        await ch.send(ev.chat_id, Out(text=f"⚠️ {reason}"))
+        await _answer(ev, ch, reason[:180])
         await _ask_date(ev, ch)
         return
-    breakfast = await repo.set_for_date(day)
-    data["date"] = fmt_date_iso(day)
-    data["set_id"] = breakfast["id"] if breakfast else None
-    await _set_state(ev, S_QTY, data)
+
+    chosen: list[str] = list(data.get("dates", []))
+    key = fmt_date_iso(day)
+    multi = await repo.get_bool("multiday_enabled", True)
+    if key in chosen:
+        chosen.remove(key)
+    elif not multi:
+        chosen = [key]
+    elif len(chosen) >= MAX_DATES:
+        await _answer(ev, ch, f"Больше {MAX_DATES} дней за раз не получится")
+        return
+    else:
+        chosen.append(key)
+    data["dates"] = sorted(chosen)
+    await _set_state(ev, S_DATE, data)
+
+    if not multi and chosen:
+        await _ask_qty(ev, ch)
+        return
+    await _ask_date(ev, ch)
+
+
+async def _dates_done(ev: Event, ch: Channel) -> None:
+    _, data = await _session_object(ev)
+    if not data.get("dates"):
+        await _ask_date(ev, ch)
+        return
     await _ask_qty(ev, ch)
 
 
+# ------------------------------------------------------------- количество
 async def _ask_qty(ev: Event, ch: Channel) -> None:
     obj, data = await _session_object(ev)
     if obj is None:
-        await _ask_object(ev, ch)
+        await _ask_address(ev, ch)
         return
-    if not data.get("date"):
+    dates = data.get("dates") or []
+    if not dates:
         await _ask_date(ev, ch)
         return
-    breakfast = await repo.get_set(data.get("set_id"))
+
     low, high = availability.qty_limits(obj)
-    price = availability.price_for(obj, breakfast)
+    price = obj["price_kop"]
+    tiers = await pricing.tiers()
     await _set_state(ev, S_QTY, data)
 
-    text = (
-        f"📅 <b>{fmt_date(data['date'])}</b>\n\n"
-        f"🥐 <b>{esc(breakfast['title'] if breakfast else '—')}</b>"
-    )
-    if breakfast and breakfast["description"]:
-        text += "\n" + esc(breakfast["description"])
-    text += f"\n\n💰 {fmt_money(price)} за сет"
+    first = parse_date(dates[0])
+    breakfast = await repo.set_for_date(first) if first else None
 
-    tiers = await pricing.tiers()
+    lines = ["🔢 <b>Сколько наборов привозить каждый день?</b>", ""]
+    lines.append(await _dates_preview(dates))
+    lines.append("")
+    lines.append(f"💰 {fmt_money(price)} за сет")
     if tiers:
-        text += "\n\n🎁 <b>Чем больше наборов, тем дешевле каждый:</b>\n"
-        text += "\n".join(
-            f"от {t.qty} наборов — −{t.percent}%, "
-            f"{fmt_money(pricing.calc(price, t.qty, tiers).per_set)} за сет"
-            for t in sorted(tiers, key=lambda t: t.qty)
-        )
-    text += "\n\n🔢 <b>Сколько наборов привезти?</b>"
+        lines.append("")
+        lines.append("🎁 <b>Чем больше наборов в день, тем дешевле каждый:</b>")
+        lines += [f"от {t.qty} наборов — −{t.percent}%, "
+                  f"{fmt_money(pricing.calc(price, t.qty, tiers).per_set)} за сет"
+                  for t in sorted(tiers, key=lambda t: t.qty)]
 
-    numbers = [
-        Btn(text=_qty_label(n, price, tiers), data=f"g:qty:{n}")
-        for n in range(low, high + 1)
-    ]
+    numbers = [Btn(text=_qty_label(n, tiers), data=f"g:qty:{n}") for n in range(low, high + 1)]
     kb = chunk(numbers, 5)
-    kb.append([Btn(text="⬅️ Другая дата", data="g:order"), Btn(text="🏠 В меню", data="g:menu")])
-    await _respond(ev, ch, Out(text=text, kb=kb, photo=breakfast["photo_path"] if breakfast else ""),
-                   new_message=bool(breakfast and breakfast["photo_path"]))
+    kb.append([Btn(text="⬅️ Изменить даты", data="g:date_back"),
+               Btn(text="🏠 В начало", data="g:menu")])
+    photo = breakfast["photo_path"] if breakfast else ""
+    await _respond(ev, ch, Out(text="\n".join(lines), kb=kb, photo=photo),
+                   new_message=bool(photo))
 
 
-def _qty_label(qty: int, base_price: int, tiers: list) -> str:
-    """Подпись кнопки количества: со скидкой показываем её прямо на кнопке."""
+async def _dates_preview(dates: list[str], qty: int = 0) -> str:
+    """Строки «дата — сет — количество» для экранов заказа."""
+    rows = []
+    for iso in dates:
+        day = parse_date(iso)
+        if day is None:
+            continue
+        breakfast = await repo.set_for_date(day)
+        title = breakfast["title"] if breakfast else "сет дня"
+        tail = f" — {qty} шт." if qty else ""
+        rows.append(f"{fmt_date(day, with_weekday=False)} — {esc(title)}{tail}")
+    return "\n".join(rows)
+
+
+def _qty_label(qty: int, tiers: list) -> str:
     percent = pricing.percent_for(qty, tiers)
     return f"{qty} · −{percent}%" if percent else str(qty)
 
@@ -525,7 +629,7 @@ def _qty_label(qty: int, base_price: int, tiers: list) -> str:
 async def _pick_qty(ev: Event, ch: Channel, qty: int) -> None:
     obj, data = await _session_object(ev)
     if obj is None:
-        await _ask_object(ev, ch)
+        await _ask_address(ev, ch)
         return
     low, high = availability.qty_limits(obj)
     if not low <= qty <= high:
@@ -537,6 +641,7 @@ async def _pick_qty(ev: Event, ch: Channel, qty: int) -> None:
     await _ask_apartment(ev, ch)
 
 
+# ------------------------------------------------------- апартаменты и связь
 async def _ask_apartment(ev: Event, ch: Channel) -> None:
     _, data = await _session_object(ev)
     await _set_state(ev, S_APARTMENT, data)
@@ -544,9 +649,8 @@ async def _ask_apartment(ev: Event, ch: Channel) -> None:
     text = await repo.render_text("ask_apartment")
     kb: list[list[Btn]] = []
     if user and user["apartment"]:
-        text += f"\n\nВ прошлый раз вы указывали: <b>{esc(user['apartment'])}</b>"
         kb.append([Btn(text=f"🚪 Снова {user['apartment']}", data="g:reapt", intent="positive")])
-    kb.append([Btn(text=BACK_LABEL, data="g:qty"), Btn(text="🏠 В меню", data="g:menu")])
+    kb.append([Btn(text=BACK_LABEL, data="g:qty"), Btn(text="🏠 В начало", data="g:menu")])
     await _respond(ev, ch, Out(text=text, kb=kb, remove_reply_kb=True))
 
 
@@ -568,8 +672,8 @@ async def _ask_phone(ev: Event, ch: Channel) -> None:
     text = await repo.render_text("ask_phone")
     kb: list[list[Btn]] = []
     if user and user["phone"]:
-        text += f"\n\nСохранённый номер: <b>{esc(fmt_phone(user['phone']))}</b>"
-        kb.append([Btn(text=f"📱 {fmt_phone(user['phone'])}", data="g:rephone", intent="positive")])
+        kb.append([Btn(text=f"📱 {fmt_phone(user['phone'])}", data="g:rephone",
+                       intent="positive")])
     kb.append([Btn(text=BACK_LABEL, data="g:apt")])
     await _respond(ev, ch, Out(text=text, kb=kb, reply_contact=CONTACT_LABEL), new_message=True)
 
@@ -583,6 +687,28 @@ async def _reuse_phone(ev: Event, ch: Channel) -> None:
     await _input_phone(ev, ch, user["phone"], data, user["customer_name"])
 
 
+# ------------------------------------------------- аллергии и пожелания
+async def _ask_allergy(ev: Event, ch: Channel) -> None:
+    _, data = await _session_object(ev)
+    if not await repo.get_bool("allergies_enabled", True):
+        data["allergies"] = ""
+        await _set_state(ev, S_COMMENT, data)
+        await _ask_comment(ev, ch)
+        return
+    await _set_state(ev, S_ALLERGY, data)
+    kb = [[Btn(text=SKIP_LABEL, data="g:skipa")],
+          [Btn(text=BACK_LABEL, data="g:phone"), Btn(text="🏠 В начало", data="g:menu")]]
+    await _respond(ev, ch, Out(text=await repo.render_text("ask_allergies"), kb=kb,
+                               remove_reply_kb=True), new_message=True)
+
+
+async def _skip_allergy(ev: Event, ch: Channel) -> None:
+    _, data = await _session_object(ev)
+    data["allergies"] = ""
+    await _set_state(ev, S_COMMENT, data)
+    await _ask_comment(ev, ch)
+
+
 async def _ask_comment(ev: Event, ch: Channel) -> None:
     _, data = await _session_object(ev)
     if not await repo.get_bool("comment_enabled", True):
@@ -592,7 +718,7 @@ async def _ask_comment(ev: Event, ch: Channel) -> None:
         return
     await _set_state(ev, S_COMMENT, data)
     kb = [[Btn(text=SKIP_LABEL, data="g:skip")],
-          [Btn(text=BACK_LABEL, data="g:phone"), Btn(text="🏠 В меню", data="g:menu")]]
+          [Btn(text=BACK_LABEL, data="g:allergy"), Btn(text="🏠 В начало", data="g:menu")]]
     await _respond(ev, ch, Out(text=await repo.render_text("ask_comment"), kb=kb,
                                remove_reply_kb=True), new_message=True)
 
@@ -604,67 +730,91 @@ async def _skip_comment(ev: Event, ch: Channel) -> None:
     await _show_confirm(ev, ch)
 
 
+# ---------------------------------------------------------------- проверка
+async def _order_lines(obj: Row, data: dict[str, Any]) -> tuple[list[str], int, int]:
+    """Разбивка по датам, всего наборов и итоговая сумма."""
+    qty = int(data.get("qty", 1))
+    tiers = await pricing.tiers()
+    rows: list[str] = []
+    total = 0
+    sets = 0
+    for iso in data.get("dates", []):
+        day = parse_date(iso)
+        if day is None:
+            continue
+        breakfast = await repo.set_for_date(day)
+        base = availability.price_for(obj, breakfast)
+        price = pricing.calc(base, qty, tiers)
+        total += price.total
+        sets += qty
+        line = (f"{fmt_date(day, with_weekday=False)} — "
+                f"{esc(breakfast['title'] if breakfast else 'сет дня')} — {qty} шт.")
+        if price.percent:
+            line += f"  (−{price.percent}%)"
+        rows.append(line)
+    return rows, sets, total
+
+
 async def _show_confirm(ev: Event, ch: Channel) -> None:
     obj, data = await _session_object(ev)
     if obj is None:
-        await _ask_object(ev, ch)
+        await _ask_address(ev, ch)
         return
-    if not (data.get("date") and data.get("qty") and data.get("apartment") and data.get("phone")):
+    if not (data.get("dates") and data.get("qty") and data.get("apartment")
+            and data.get("phone")):
         await _resume_incomplete(ev, ch, data)
         return
-    breakfast = await repo.get_set(data.get("set_id"))
-    base_price = availability.price_for(obj, breakfast)
-    qty = int(data.get("qty", 1))
-    price = await pricing.price_for_order(base_price, qty)
     await _set_state(ev, S_CONFIRM, data)
 
-    lines = [
-        "🧾 <b>Проверьте заказ</b>",
+    rows, sets, total = await _order_lines(obj, data)
+    address = data.get("address") or obj["address"] or obj["title"]
+    deadline = await repo.get_setting("cancel_deadline", "18:30")
+
+    lines = ["🧾 <b>Проверьте заказ</b>", ""]
+    lines += rows
+    lines += [
         "",
-        f"📅 <b>{fmt_date(data['date'])}</b>",
-        f"🥐 {esc(breakfast['title'] if breakfast else '—')}",
-        f"🔢 {qty} {plural(qty, 'набор', 'набора', 'наборов')}",
-        f"📍 {esc(obj['address'] or obj['title'])}",
+        f"Итого: {sets} {plural(sets, 'завтрак', 'завтрака', 'завтраков')} — "
+        f"<b>{fmt_money(total)}</b>",
+        "",
+        f"📍 {esc(address)}",
         f"🚪 Апартаменты {esc(data.get('apartment', ''))}",
         f"📞 {esc(fmt_phone(data.get('phone', '')))}",
     ]
-    if data.get("name"):
-        lines.append(f"👤 {esc(data['name'])}")
+    if data.get("allergies"):
+        lines.append(f"⚠️ Аллергии: {esc(data['allergies'])}")
     if data.get("comment"):
         lines.append(f"💬 {esc(data['comment'])}")
-    lines.append("")
-    if price.percent:
-        lines += [
-            f"💰 {fmt_money(price.base_per_set)} × {qty} = {fmt_money(base_price * qty)}",
-            f"🎁 Скидка −{price.percent}% = <b>−{fmt_money(price.saved)}</b>",
-            f"<b>К оплате: {fmt_money(price.total)}</b>",
-        ]
-    else:
-        lines.append(f"💰 {fmt_money(price.per_set)} × {qty} = <b>{fmt_money(price.total)}</b>")
-    lines += ["", "Всё верно? Любой пункт ещё можно поменять."]
+    lines += [
+        "",
+        f"🕘 Привезём к {esc(obj['delivery_time'])}",
+        f"<i>Отменить или изменить заказ можно до {esc(deadline)} "
+        "предыдущего дня доставки. Полные условия — по кнопке ниже.</i>",
+    ]
+
     kb = [
         [Btn(text="✅ Подтвердить заказ", data="g:confirm", intent="positive")],
         [Btn(text="✏️ Изменить", data="g:edit"),
-         Btn(text="❌ Отменить", data="g:menu", intent="negative")],
+         Btn(text="📋 Условия", data="g:rules")],
+        [Btn(text="❌ Отменить", data="g:menu", intent="negative")],
     ]
     await _respond(ev, ch, Out(text="\n".join(lines), kb=kb, remove_reply_kb=True))
 
 
 async def _show_edit(ev: Event, ch: Channel) -> None:
-    """Что именно поменять в заказе — отдельным экраном, чтобы не пугать кнопками."""
     kb = [
-        [Btn(text="📅 Дату доставки", data="g:order")],
+        [Btn(text="📅 Дни доставки", data="g:date_back")],
         [Btn(text="🔢 Количество наборов", data="g:qty")],
         [Btn(text="🚪 Номер апартаментов", data="g:apt")],
         [Btn(text="📞 Телефон", data="g:phone")],
+        [Btn(text="⚠️ Аллергии", data="g:allergy")],
         [Btn(text="⬅️ Назад к заказу", data="g:back")],
     ]
     await _respond(ev, ch, Out(text="✏️ <b>Что поправить?</b>", kb=kb))
 
 
 async def _resume_incomplete(ev: Event, ch: Channel, data: dict[str, Any]) -> None:
-    """Данных не хватает — возвращаем гостя на нужный шаг."""
-    if not data.get("date"):
+    if not data.get("dates"):
         await _ask_date(ev, ch)
     elif not data.get("qty"):
         await _ask_qty(ev, ch)
@@ -677,49 +827,69 @@ async def _resume_incomplete(ev: Event, ch: Channel, data: dict[str, Any]) -> No
 async def _confirm_order(ev: Event, ch: Channel) -> None:
     obj, data = await _session_object(ev)
     if obj is None:
-        await _ask_object(ev, ch)
+        await _ask_address(ev, ch)
         return
-    required = ("date", "qty", "apartment", "phone")
-    if any(not data.get(key) for key in required):
+    if not (data.get("dates") and data.get("qty") and data.get("apartment")
+            and data.get("phone")):
         await ch.send(ev.chat_id, Out(text="⚠️ Заказ заполнен не полностью, начнём заново."))
         await _start_order(ev, ch)
         return
 
-    day = parse_date(data["date"])
-    ok, reason = await availability.check_date(obj, day) if day else (False, "Некорректная дата")
-    if not ok:
-        await ch.send(ev.chat_id, Out(text=f"⚠️ {reason}\nВыберите другую дату."))
+    qty = int(data["qty"])
+    tiers = await pricing.tiers()
+    days: list[dict[str, Any]] = []
+    skipped: list[str] = []
+    for iso in data["dates"]:
+        day = parse_date(iso)
+        if day is None:
+            continue
+        ok, reason = await availability.check_date(obj, day)
+        if not ok:
+            skipped.append(f"{fmt_date(day, False)} — {reason}")
+            continue
+        breakfast = await repo.set_for_date(day)
+        base = availability.price_for(obj, breakfast)
+        price = pricing.calc(base, qty, tiers)
+        days.append({
+            "delivery_date": fmt_date_iso(day),
+            "set_id": breakfast["id"] if breakfast else None,
+            "set_title": breakfast["title"] if breakfast else "",
+            "qty": qty,
+            "base_price_kop": price.base_per_set,
+            "discount_pct": price.percent,
+            "price_kop": price.per_set,
+            "total_kop": price.total,
+        })
+
+    if not days:
+        await ch.send(ev.chat_id, Out(
+            text="⚠️ Выбранные даты уже недоступны — выберите другие."))
         await _ask_date(ev, ch)
         return
+    if skipped:
+        await ch.send(ev.chat_id, Out(
+            text="⚠️ Не получилось принять часть дат:\n" + "\n".join(skipped)))
 
-    breakfast = await repo.set_for_date(day)
-    base_price = availability.price_for(obj, breakfast)
-    qty = int(data["qty"])
-    price = await pricing.price_for_order(base_price, qty)
     user = await repo.get_user(ev.channel, ev.user_id)
     name = str(data.get("name") or (user["customer_name"] if user else "")
                or (user["full_name"] if user else "") or ev.full_name)
+    address = data.get("address") or obj["address"]
 
-    order = await repo.create_order(
+    orders = await repo.create_order_group(
+        days,
         user_pk=user["id"] if user else None,
         channel=ev.channel,
         ext_id=str(ev.user_id),
         chat_id=str(ev.chat_id),
         object_id=obj["id"],
         object_title=obj["title"],
-        object_address=obj["address"],
-        set_id=breakfast["id"] if breakfast else None,
-        set_title=breakfast["title"] if breakfast else "",
-        delivery_date=fmt_date_iso(day),
-        qty=qty,
+        object_address=address,
         apartment=str(data["apartment"]),
         phone=str(data["phone"]),
         customer_name=name,
+        allergies=str(data.get("allergies", "")),
         comment=str(data.get("comment", "")),
-        base_price_kop=price.base_per_set,
-        discount_pct=price.percent,
-        price_kop=price.per_set,
-        total_kop=price.total,
+        address_ok=1 if data.get("address_ok", True) else 0,
         status=statuses.NEW,
         source_code=(user["source_code"] if user else "") or obj["code"],
     )
@@ -729,10 +899,12 @@ async def _confirm_order(ev: Event, ch: Channel) -> None:
                            object_id=obj["id"])
     await repo.clear_session(ev.channel, ev.user_id)
 
-    text = await notify.guest_status_text(order, "order_accepted")
-    await ch.send(ev.chat_id, Out(text=text, kb=[[Btn(text="📦 Мои заказы", data="g:my")]],
-                                  remove_reply_kb=True))
-    await notify.notify_new_order(order)
+    text = await notify.group_status_text(orders, "order_accepted")
+    await ch.send(ev.chat_id, Out(text=text, remove_reply_kb=True, kb=[
+        [Btn(text="📦 Мои заказы", data="g:my")],
+        [Btn(text="📋 Условия заказа", data="g:rules"), _manager_btn()],
+    ]))
+    await notify.notify_new_order(orders)
     await _send_upsell(ev, ch)
 
 
@@ -741,7 +913,7 @@ async def _send_upsell(ev: Event, ch: Channel) -> None:
     if not offers:
         return
     kb = [[Btn(text=offer["title"], data=f"g:offer:{offer['id']}")] for offer in offers]
-    kb.append([Btn(text="🏠 В меню", data="g:menu")])
+    kb.append([Btn(text="🏠 В начало", data="g:menu")])
     await ch.send(ev.chat_id, Out(text=await repo.render_text("upsell_intro"), kb=kb))
 
 
@@ -759,10 +931,17 @@ async def _on_text(ev: Event, ch: Channel, user: Row) -> None:
     if text == BACK_LABEL:
         await _back_from(ev, ch, state)
         return
-    if text == SKIP_LABEL and state == S_COMMENT:
-        await _skip_comment(ev, ch)
-        return
+    if text == SKIP_LABEL:
+        if state == S_ALLERGY:
+            await _skip_allergy(ev, ch)
+            return
+        if state == S_COMMENT:
+            await _skip_comment(ev, ch)
+            return
 
+    if state == S_ADDRESS:
+        await _input_address(ev, ch, text, data)
+        return
     if state == S_APARTMENT:
         await _input_apartment(ev, ch, text, data)
         return
@@ -770,19 +949,23 @@ async def _on_text(ev: Event, ch: Channel, user: Row) -> None:
         phone = ev.phone if ev.kind == "contact" else text
         await _input_phone(ev, ch, phone, data, str(ev.raw.get("contact_name", "")))
         return
+    if state == S_ALLERGY:
+        await _input_allergy(ev, ch, text, data)
+        return
     if state == S_COMMENT:
         await _input_comment(ev, ch, text, data)
         return
 
-    # вне сценария — просто показываем меню
     await _show_main_menu(ev, ch, new_message=True)
 
 
 async def _back_from(ev: Event, ch: Channel, state: str) -> None:
     if state == S_PHONE:
         await _ask_apartment(ev, ch)
-    elif state == S_COMMENT:
+    elif state == S_ALLERGY:
         await _ask_phone(ev, ch)
+    elif state == S_COMMENT:
+        await _ask_allergy(ev, ch)
     elif state == S_APARTMENT:
         await _ask_qty(ev, ch)
     else:
@@ -793,7 +976,8 @@ async def _input_apartment(ev: Event, ch: Channel, text: str, data: dict[str, An
     value = text.strip()
     if not value or len(value) > 12:
         await ch.send(ev.chat_id, Out(
-            text="⚠️ Укажите номер апартаментов — до 12 символов, например <b>45</b> или <b>12А</b>."))
+            text="⚠️ Укажите номер апартаментов — до 12 символов, "
+                 "например <b>45</b> или <b>12А</b>."))
         return
     data["apartment"] = value
     await _set_state(ev, S_PHONE, data)
@@ -810,8 +994,13 @@ async def _input_phone(ev: Event, ch: Channel, raw: str, data: dict[str, Any],
         return
     data["phone"] = phone
     if name.strip():
-        # имя из карточки контакта — его требует форма курьерской службы
         data["name"] = name.strip()
+    await _set_state(ev, S_ALLERGY, data)
+    await _ask_allergy(ev, ch)
+
+
+async def _input_allergy(ev: Event, ch: Channel, text: str, data: dict[str, Any]) -> None:
+    data["allergies"] = text[:200]
     await _set_state(ev, S_COMMENT, data)
     await _ask_comment(ev, ch)
 
@@ -827,11 +1016,12 @@ async def _resume_draft(ev: Event, ch: Channel) -> None:
     session = await repo.get_session(ev.channel, ev.user_id)
     state = session["state"] if session else S_NONE
     routes = {
-        S_OBJECT: _ask_object,
+        S_ADDRESS: _ask_address,
         S_DATE: _ask_date,
         S_QTY: _ask_qty,
         S_APARTMENT: _ask_apartment,
         S_PHONE: _ask_phone,
+        S_ALLERGY: _ask_allergy,
         S_COMMENT: _ask_comment,
         S_CONFIRM: _show_confirm,
     }

@@ -16,6 +16,7 @@ from app.channels.max import MaxChannel
 from app.channels.telegram import TelegramChannel
 from app.config import cfg
 from app.router import route
+from app.utils import strip_html
 
 log = logging.getLogger("fatucci")
 
@@ -151,6 +152,13 @@ async def main() -> None:
     tasks.append(asyncio.create_task(telegram_supervisor(telegram), name="telegram"))
     tasks.append(asyncio.create_task(max_supervisor(), name="max"))
     tasks.append(asyncio.create_task(scheduler.run_all(), name="scheduler"))
+
+    try:
+        description = await repo.get_text("bot_description")
+        if description and await telegram.set_description(strip_html(description)):
+            log.info("Описание бота (экран до Start) обновлено")
+    except Exception as exc:  # noqa: BLE001
+        log.debug("Описание бота не обновлено: %s", exc)
 
     log.info("Бот запущен. Админ-панель: команда /admin в Telegram.")
     try:
