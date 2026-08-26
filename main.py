@@ -72,24 +72,27 @@ async def max_supervisor() -> None:
     поднимаем канал, поменяли или выключили — гасим и пересоздаём.
     """
     channel: Optional[MaxChannel] = None
-    signature: Optional[tuple[str, str]] = None
+    signature: Optional[str] = None
     announced = False
 
     while True:
         token, username = await max_credentials()
         enabled = await repo.get_bool("max_enabled", True)
 
-        if (token, username) != signature:
+        if token != signature:
             if channel is not None:
                 await channel.close()
                 channel = None
-            signature = (token, username)
+            signature = token
             announced = False
-            if token or username:
+            if token:
                 channel = MaxChannel(token, username)
                 base.REGISTRY[base.MAX] = channel
             else:
                 base.REGISTRY.pop(base.MAX, None)
+        elif channel is not None and username and channel.username != username:
+            # username подтянулся из /me или его поправили руками — перезапуск не нужен
+            channel.username = username
 
         if channel is not None and token and enabled:
             try:

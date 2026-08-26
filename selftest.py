@@ -581,6 +581,57 @@ async def main() -> None:
           "для телефона ссылка-кнопка не выдумывается")
     await repo.set_setting("support_contact", "@marina_fatucci")
 
+    print("\n— Подключение MAX по одному токену —")
+    from app import admin as admin_mod
+    from app.channels import max as max_mod
+
+    async def fake_me(method, path, **kwargs):
+        return {"username": "@fatucci_max_bot", "name": "Fatucci"} if path == "/me" else {}
+
+    async def already_off():
+        return False
+
+    await repo.set_setting("max_username", "")
+    max_channel = max_mod.MaxChannel("test-token")
+    max_channel._request = fake_me
+    base.REGISTRY["max"] = max_channel
+    await max_channel.run(route, enabled=already_off)
+    check(max_channel.username == "fatucci_max_bot", "канал MAX узнал своё имя из /me")
+    check(await repo.get_setting("max_username") == "fatucci_max_bot",
+          "имя сохранено в настройки — вводить его не нужно")
+    check(max_channel.start_link("demo1") == "https://max.ru/fatucci_max_bot?start=demo1",
+          "ссылка для QR собирается сразу")
+
+    await repo.set_setting("max_username", "")
+    calls: list[str] = []
+
+    async def fake_fetch(token, api_base=max_mod.API_BASE):
+        calls.append(token)
+        return {"username": "fatucci_max_bot", "name": "Fatucci"}
+
+    real_fetch = max_mod.fetch_bot_info
+    max_mod.fetch_bot_info = fake_fetch
+    await repo.set_setting("max_token", "max-token-123")
+    report = await admin_mod._check_max()
+    check(calls == ["max-token-123"], "проверка идёт по сохранённому токену")
+    check("@fatucci_max_bot" in report, "администратору показано, какой бот подключён")
+    check(await repo.get_setting("max_username") == "fatucci_max_bot",
+          "после ввода токена имя проставилось само")
+
+    async def refuse(token, api_base=max_mod.API_BASE):
+        raise max_mod.MaxApiError(401, "unauthorized")
+
+    max_mod.fetch_bot_info = refuse
+    report = await admin_mod._check_max()
+    check("не принял токен" in report, "неверный токен объяснён по-человечески")
+
+    await repo.set_setting("max_token", "")
+    _, _, report = await max_mod.check_token("")
+    check("не задан" in report, "пустой токен — понятная подсказка")
+    max_mod.fetch_bot_info = real_fetch
+    base.REGISTRY.pop("max", None)
+    await repo.set_setting("max_username", "")
+
     print("\n— Админка —")
     ch.clear()
     await route(admin_event("text", text="/admin"), ch)

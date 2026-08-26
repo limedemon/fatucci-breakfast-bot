@@ -14,7 +14,7 @@ from typing import Any, Callable, Optional
 
 from . import (admins, courier, db, guide, media, notify, orders_service, payments,
                pricing, qrgen, repo, statuses)
-from .channels.base import MAX, TG, Btn, Channel, Event, Out
+from .channels.base import MAX, TG, Btn, Channel, Event, Out, get_channel
 from .config import cfg
 from .utils import (
     WEEKDAYS_FULL,
@@ -98,7 +98,7 @@ SETTING_SECTIONS: dict[str, tuple[str, list[FieldSpec]]] = {
     "ch": ("📱 Каналы", [
         ("max_enabled", "Бот в MAX включён", "bool"),
         ("max_token", "Токен бота MAX", "secret"),
-        ("max_username", "Username бота MAX (без @)", "text"),
+        ("max_username", "Username бота MAX (определится сам)", "text"),
     ]),
     "rem": ("🔔 Напоминания", [
         ("reminder_enabled", "Напоминать о брошенном заказе", "bool"),
@@ -1215,6 +1215,10 @@ async def _settings_route(ev: Event, ch: Channel, args: list[str]) -> None:
         ok, message = await payments.check_setup()
         await ch.send(ev.chat_id, Out(text=message if ok else "⚠️ " + message,
                                       kb=[_back("a:cfg:s:pay")]))
+    elif action == "max":
+        await _answer(ev, ch, "Проверяю…")
+        message = await _check_max()
+        await ch.send(ev.chat_id, Out(text=message, kb=[_back("a:cfg:s:ch")]))
 
 
 async def _settings_section(ev: Event, ch: Channel, code: str) -> None:
@@ -1241,6 +1245,7 @@ async def _settings_section(ev: Event, ch: Channel, code: str) -> None:
     if code == "ch":
         lines += ["", _max_hint(await repo.get_setting("max_token"),
                                 await repo.get_bool("max_enabled", True))]
+        kb.append([Btn(text="🧪 Проверить подключение MAX", data="a:cfg:max")])
     if code == "price":
         lines += ["", await _discount_preview()]
     topic = SECTION_HELP.get(code)
@@ -1273,12 +1278,33 @@ async def _discount_preview() -> str:
 
 def _max_hint(token: str, enabled: bool) -> str:
     if not token:
-        return ("ℹ️ Чтобы подключить MAX: создайте бота в MasterBot внутри MAX, "
-                "вставьте сюда его токен и username. Перезапускать бота не нужно — "
-                "он поднимет MAX сам в течение минуты.")
+        return ("ℹ️ Чтобы подключить MAX, нужен только токен: создайте бота "
+                "в MasterBot внутри MAX и вставьте его сюда. Username бот определит "
+                "сам, перезапускать ничего не нужно — MAX поднимется за минуту.")
     if not enabled:
         return "⏸ Токен есть, но канал выключен переключателем выше."
-    return "✅ Токен задан. Если MAX не отвечает — проверьте логи при старте."
+    return ("✅ Токен задан. Нажмите «Проверить подключение MAX», "
+            "чтобы убедиться, что он принят.")
+
+
+async def _check_max() -> str:
+    """Проверить токен MAX и заодно запомнить username бота."""
+    from .channels.max import check_token
+
+    token = (await repo.get_setting("max_token")) or cfg.max_token
+    ok, username, message = await check_token(token)
+    if ok and username:
+        if (await repo.get_setting("max_username")) != username:
+            await repo.set_setting("max_username", username)
+        _sync_max_username(username)
+    return message
+
+
+def _sync_max_username(username: str) -> None:
+    """Подсказать уже работающему каналу его имя — чтобы ссылки в QR собрались сразу."""
+    channel = get_channel(MAX)
+    if channel is not None and username:
+        channel.username = username
 
 
 async def _settings_edit(ev: Event, ch: Channel, code: str, key: str) -> None:
@@ -1631,8 +1657,16 @@ async def _in_setting(ev: Event, ch: Channel, ctx: dict, text: str, photo: str) 
         raw = str(parsed)
     await repo.set_setting(key, raw)
     await repo.clear_admin_state(int(ev.user_id))
+
+    note = ""
+    if key == "max_token":
+        # username для ссылок в QR узнаём сами — администратору вводить нечего
+        note = "\n\n" + await _check_max()
+    elif key == "max_username":
+        _sync_max_username(raw.lstrip("@"))
+
     await ch.send(ev.chat_id, Out(
-        text="✅ Настройка сохранена.",
+        text="✅ Настройка сохранена." + note,
         kb=[[Btn(text="⬅️ Назад", data=f"a:cfg:s:{ctx.get('section', 'gen')}"),
              Btn(text="🏠 Админка", data="a:h")]]))
 

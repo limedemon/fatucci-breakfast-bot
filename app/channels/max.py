@@ -38,6 +38,69 @@ class MaxApiError(Exception):
         self.body = body
 
 
+async def fetch_bot_info(token: str, api_base: str = API_BASE) -> dict[str, Any]:
+    """Спросить у MAX, чей это токен.
+
+    Возвращает то, что отдал /me. Нужна и админке (проверить токен сразу после
+    ввода), и запуску канала — поэтому живёт отдельно от MaxChannel.
+    """
+    async with aiohttp.ClientSession(
+        headers={"Authorization": token.strip()},
+        timeout=aiohttp.ClientTimeout(total=20),
+        connector=net.connector(net.max_ssl()),
+    ) as session:
+        async with session.get(f"{api_base.rstrip('/')}/me") as resp:
+            text = await resp.text()
+            if resp.status >= 400:
+                raise MaxApiError(resp.status, text[:400])
+            try:
+                return await resp.json(content_type=None) or {}
+            except (aiohttp.ContentTypeError, ValueError):
+                return {}
+
+
+async def check_token(token: str) -> tuple[bool, str, str]:
+    """Проверить токен MAX. → (годится ли, username, что показать администратору)"""
+    token = (token or "").strip()
+    if not token:
+        return False, "", (
+            "ℹ️ <b>Токен MAX не задан</b>\n\n"
+            "Создайте бота в MasterBot внутри MAX и вставьте сюда выданный токен. "
+            "Больше ничего вводить не нужно — имя бота определится само."
+        )
+    try:
+        me = await fetch_bot_info(token)
+    except MaxApiError as exc:
+        if exc.status in (401, 403):
+            return False, "", (
+                "⚠️ <b>MAX не принял токен</b>\n\n"
+                "Проверьте, что скопирован он целиком и без лишних пробелов. "
+                "Новый токен выдаёт MasterBot внутри MAX."
+            )
+        return False, "", f"⚠️ <b>MAX ответил ошибкой {exc.status}</b>\n\nПопробуйте позже."
+    except Exception as exc:  # noqa: BLE001
+        return False, "", (
+            "⚠️ <b>Не удалось связаться с MAX</b>\n\n"
+            f"<code>{strip_html(str(exc))[:200]}</code>\n\n"
+            "Чаще всего это временный сбой сети — попробуйте ещё раз."
+        )
+
+    username = (me.get("username") or "").lstrip("@")
+    name = me.get("name") or "без имени"
+    if not username:
+        return True, "", (
+            f"✅ <b>Токен принят</b> — бот «{strip_html(name)}».\n\n"
+            "Но MAX не вернул username, поэтому ссылку для QR собрать не получится. "
+            "Задайте боту имя пользователя в MasterBot и проверьте ещё раз."
+        )
+    return True, username, (
+        f"✅ <b>MAX подключён</b>\n\n"
+        f"Бот: «{strip_html(name)}», <code>@{username}</code>\n\n"
+        "Имя определилось само — вводить его не нужно. Опрос сообщений "
+        "начнётся в течение минуты, перезапускать бота не требуется."
+    )
+
+
 class MaxChannel(Channel):
     name = MAX
     title = "MAX"
@@ -312,11 +375,16 @@ class MaxChannel(Channel):
         self._running = True
         try:
             me = await self._request("GET", "/me")
-            if not self.username:
-                self.username = me.get("username", "") or ""
+            username = (me.get("username") or "").lstrip("@")
+            if username:
+                # username нужен только для ссылок в QR — узнаём его сами
+                # и запоминаем, чтобы в админке не приходилось вводить руками
+                self.username = username
+                if (await repo.get_setting("max_username")) != username:
+                    await repo.set_setting("max_username", username)
             log.info("MAX-бот запущен: @%s (%s)", self.username, me.get("name", ""))
         except Exception as exc:  # noqa: BLE001
-            log.error("MAX: не удалось получить /me — проверьте MAX_TOKEN (%s)", exc)
+            log.error("MAX: не удалось получить /me — проверьте токен MAX (%s)", exc)
             return
 
         backoff = 1
