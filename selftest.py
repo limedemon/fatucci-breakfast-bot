@@ -535,6 +535,12 @@ async def main() -> None:
     check("Поддержка" in ch.texts(), "гостю объяснили, что это за кнопка")
 
     ch.clear()
+    await route(guest_event("callback", payload="g:menu", callback_id="sp0"), ch)
+    inline = [b.data for row in ch.last().kb or [] for b in row]
+    check(not any("support" in data for data in inline),
+          "в меню кнопки поддержки нет — она постоянная, под полем ввода")
+
+    ch.clear()
     await route(guest_event("text", text=SUPPORT_BUTTON), ch)
     support = await repo.get_setting("support_contact")
     check(support in ch.texts(), f"по кнопке пришёл контакт поддержки ({support})")
@@ -554,7 +560,18 @@ async def main() -> None:
 
     ch.clear()
     await route(admin_event("text", text="/start"), ch)
-    check(not ch.support_button_shown, "у админа остаётся кнопка админ-панели")
+    check(ch.admin_button_shown, "админу закрепляются кнопки одним рядом")
+    from app.channels.telegram import TelegramChannel
+    labels = [b.text for row in TelegramChannel._admin_markup(
+        TelegramChannel.__new__(TelegramChannel)).keyboard for b in row]
+    check(labels == [ADMIN_BUTTON, SUPPORT_BUTTON],
+          f"у админа под полем ввода обе кнопки в одном ряду: {labels}")
+
+    ch.clear()
+    await route(admin_event("text", text=SUPPORT_BUTTON), ch)
+    check(support in ch.texts(), "админ по той же кнопке получает контакты поддержки")
+    check(any(b.data == "a:h" for row in ch.last().kb or [] for b in row),
+          "админа с экрана поддержки возвращают в админку")
 
     await repo.set_setting("support_contact", "+7 900 000-00-00")
     ch.clear()

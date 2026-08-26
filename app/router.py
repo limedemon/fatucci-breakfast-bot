@@ -63,7 +63,8 @@ async def _claim_owner(ev: Event, ch: Channel) -> None:
         return
     await ch.show_admin_button(
         str(ev.chat_id),
-        "🛠 Кнопка админ-панели закреплена внизу — она всегда под рукой.",
+        "🛠 Внизу закреплены <b>Админ-панель</b> и <b>Поддержка</b> — "
+        "они всегда под рукой.",
     )
     await ch.send(ev.chat_id, Out(
         text=(

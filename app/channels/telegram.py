@@ -121,9 +121,9 @@ class TelegramChannel(Channel):
 
     # ------------------------------------------------ кнопка админ-панели
     def _admin_markup(self) -> ReplyKeyboardMarkup:
-        """Постоянная кнопка под полем ввода — только для администраторов."""
+        """Постоянные кнопки администратора: панель и поддержка — в один ряд."""
         return ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text=ADMIN_BUTTON)]],
+            keyboard=[[KeyboardButton(text=ADMIN_BUTTON), KeyboardButton(text=SUPPORT_BUTTON)]],
             resize_keyboard=True,
             is_persistent=True,
         )

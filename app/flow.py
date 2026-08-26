@@ -149,7 +149,7 @@ async def _show_main_menu(ev: Event, ch: Channel, new_message: bool = False) -> 
         kb.append([Btn(text="📦 Мои заказы", data="g:my")])
     if await repo.list_offers(active_only=True):
         kb.append([Btn(text="🤍 Ещё от Fatucci", data="g:offers")])
-    kb.append([_manager_btn(), _support_btn()])
+    kb.append([_manager_btn()])
 
     await _respond(ev, ch, Out(text=text, kb=kb, remove_reply_kb=True), new_message=new_message)
 
@@ -158,25 +158,26 @@ def _manager_btn() -> Btn:
     return Btn(text="✉️ Связаться с менеджером", data="g:manager")
 
 
-def _support_btn() -> Btn:
-    return Btn(text="🆘 Поддержка", data="g:support")
-
-
 # ==================================================================== поддержка
 async def _pin_support_button(ev: Event, ch: Channel) -> None:
-    """Закрепить кнопку «Поддержка» под полем ввода — один раз на чат.
+    """Закрепить постоянные кнопки под полем ввода — один раз на чат.
 
-    У администратора там своя кнопка «Админ-панель», её не перебиваем.
+    Поддержка есть у всех. У администратора она стоит рядом с админ-панелью,
+    поэтому ему закрепляем сразу обе кнопки одним рядом.
     """
     from . import admins
 
-    if await admins.is_admin(ev.user_id):
-        return
     try:
-        await ch.show_support_button(str(ev.chat_id),
-                                     await repo.render_text("support_pinned"))
+        if await admins.is_admin(ev.user_id):
+            await ch.show_admin_button(
+                str(ev.chat_id),
+                "🛠 Внизу закреплены <b>Админ-панель</b> и <b>Поддержка</b> — "
+                "они всегда под рукой.")
+        else:
+            await ch.show_support_button(str(ev.chat_id),
+                                         await repo.render_text("support_pinned"))
     except Exception:  # noqa: BLE001
-        log.debug("Не удалось закрепить кнопку поддержки", exc_info=True)
+        log.debug("Не удалось закрепить кнопки под полем ввода", exc_info=True)
 
 
 async def show_support(ev: Event, ch: Channel) -> None:
@@ -186,7 +187,12 @@ async def show_support(ev: Event, ch: Channel) -> None:
     link = _contact_link(contact)
     if link:
         kb.append([Btn(text="✍️ Написать в поддержку", url=link)])
-    kb.append([Btn(text="🏠 В начало", data="g:menu")])
+    from . import admins
+
+    if await admins.is_admin(ev.user_id):
+        kb.append([Btn(text="🛠 Админ-панель", data="a:h")])
+    else:
+        kb.append([Btn(text="🏠 В начало", data="g:menu")])
     await _respond(ev, ch, Out(text=await repo.render_text("support"), kb=kb),
                    new_message=ev.kind != "callback")
 
@@ -218,7 +224,6 @@ async def _on_callback(ev: Event, ch: Channel, user: Row) -> None:
         "faq": lambda: _show_info(ev, ch, "faq"),
         "rules": lambda: _show_info(ev, ch, "rules"),
         "manager": lambda: _contact_manager(ev, ch),
-        "support": lambda: show_support(ev, ch),
         "offers": lambda: _show_offers(ev, ch),
         "offer": lambda: _show_offer(ev, ch, int(arg or 0)),
         "my": lambda: _show_my_orders(ev, ch),
