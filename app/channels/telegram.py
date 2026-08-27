@@ -20,7 +20,6 @@ from aiogram.types import (
     Message,
     PreCheckoutQuery,
     ReplyKeyboardMarkup,
-    ReplyKeyboardRemove,
 )
 
 from .. import media, repo
@@ -59,14 +58,12 @@ class TelegramChannel(Channel):
     # ------------------------------------------------------------- отправка
     async def send(self, chat_id: str, out: Out) -> str:
         try:
-            if out.remove_reply_kb and (out.kb or out.photo):
-                await self._drop_reply_keyboard(chat_id)
             if out.photo:
                 return await self._send_photo(chat_id, out)
             msg = await self.bot.send_message(
                 chat_id=chat_id,
                 text=_cut(out.text or "…", TEXT_LIMIT),
-                reply_markup=self._markup(out),
+                reply_markup=await self._markup(chat_id, out),
                 disable_notification=False,
             )
             return str(msg.message_id)
@@ -81,15 +78,14 @@ class TelegramChannel(Channel):
         cached = await repo.get_media_ref(key, TG)
         data = None if cached else await media.load(key)
         if not cached and data is None:          # картинки нет — отправим просто текст
-            plain = Out(text=out.text, kb=out.kb, reply_contact=out.reply_contact,
-                        remove_reply_kb=out.remove_reply_kb)
+            plain = Out(text=out.text, kb=out.kb, reply_contact=out.reply_contact)
             plain.photo = ""
             return await self.send(chat_id, plain)
 
         photo: object = cached or BufferedInputFile(data or b"", _filename(key))
         long_text = len(out.text) > CAPTION_LIMIT
         caption = "" if long_text else out.text
-        markup = None if long_text else self._markup(out)
+        markup = None if long_text else await self._markup(chat_id, out)
         try:
             msg = await self.bot.send_photo(
                 chat_id=chat_id, photo=photo, caption=caption or None, reply_markup=markup
@@ -114,7 +110,8 @@ class TelegramChannel(Channel):
             await repo.set_media_ref(key, TG, msg.photo[-1].file_id)
         if long_text:
             tail = await self.bot.send_message(
-                chat_id=chat_id, text=_cut(out.text, TEXT_LIMIT), reply_markup=self._markup(out)
+                chat_id=chat_id, text=_cut(out.text, TEXT_LIMIT),
+                reply_markup=await self._markup(chat_id, out)
             )
             return str(tail.message_id)
         return str(msg.message_id)
@@ -170,29 +167,6 @@ class TelegramChannel(Channel):
         except TelegramAPIError as exc:
             log.debug("Не удалось закрепить кнопку поддержки: %s", exc)
             return False
-
-    async def _drop_reply_keyboard(self, chat_id: str) -> None:
-        """Снять reply-клавиатуру: служебное сообщение, которое сразу удаляем.
-
-        Совсем пустой клавиатуру не оставляем: администратору возвращаем кнопку
-        админ-панели, гостю — «Поддержка». Иначе постоянная кнопка пропадала бы
-        после каждого запроса телефона.
-        """
-        from .. import admins
-
-        if await admins.is_admin(chat_id):
-            markup = self._admin_markup()
-        elif chat_id in self._support_kb_chats:
-            markup = self._support_markup()
-        else:
-            markup = ReplyKeyboardRemove()
-        try:
-            msg = await self.bot.send_message(chat_id, "⌛", reply_markup=markup)
-            await self.bot.delete_message(chat_id, msg.message_id)
-        except TelegramAPIError:
-            # не получилось — пусть следующий вход поставит кнопку заново
-            self._admin_kb_chats.discard(chat_id)
-            self._support_kb_chats.discard(chat_id)
 
     async def edit(self, chat_id: str, message_id: str, out: Out) -> bool:
         try:
@@ -281,21 +255,42 @@ class TelegramChannel(Channel):
         return f"{base}?start={payload}" if payload else base
 
     # ------------------------------------------------------------ клавиатуры
-    def _markup(self, out: Out):
+    async def _persistent_markup(self, chat_id: str) -> Optional[ReplyKeyboardMarkup]:
+        """Постоянные кнопки под полем ввода для этого чата.
+
+        В рабочем чате менеджеров их не показываем: reply-клавиатура видна всем
+        участникам группы, а нужна она только в личной переписке с ботом.
+        """
+        if str(chat_id).startswith("-"):
+            return None
+        from .. import admins
+
+        if await admins.is_admin(chat_id):
+            return self._admin_markup()
+        return self._support_markup()
+
+    async def _markup(self, chat_id: str, out: Out):
+        """Что приложить к сообщению.
+
+        Telegram не разрешает в одном сообщении и inline-кнопки, и клавиатуру
+        под полем ввода. Зато постоянная клавиатура живёт сама по себе: пока её
+        не заменили, она остаётся на месте при любых сообщениях. Поэтому мы её
+        никогда не снимаем, а только обновляем — на сообщениях без inline-кнопок.
+        """
         if out.reply_contact:
+            # к запросу телефона добавляем постоянные кнопки, чтобы они
+            # не пропадали на время этого шага
             rows = [[KeyboardButton(text=out.reply_contact, request_contact=True)]]
-            for row in out.kb or []:
-                labels = [KeyboardButton(text=b.text) for b in row if not b.url]
-                if labels:
-                    rows.append(labels)
-            return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, one_time_keyboard=True)
-        if out.remove_reply_kb and not out.kb:
-            return ReplyKeyboardRemove()
-        if out.remove_reply_kb and out.kb:
-            # inline-клавиатуру и снятие reply-клавиатуры в одном сообщении не совместить:
-            # reply-клавиатуру снимет предыдущий шаг, здесь отдаём inline.
-            return self._inline(out.kb)
-        return self._inline(out.kb)
+            persistent = await self._persistent_markup(chat_id)
+            if persistent is not None:
+                rows += list(persistent.keyboard)
+            # one_time: после отправки контакта клавиатура сворачивается сама,
+            # а следующее сообщение без inline-кнопок вернёт постоянные кнопки
+            return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True,
+                                       one_time_keyboard=True)
+        if out.kb:
+            return self._inline(out.kb)          # reply-клавиатуру не трогаем
+        return await self._persistent_markup(chat_id)
 
     @staticmethod
     def _inline(kb: Optional[list[list[Btn]]]) -> Optional[InlineKeyboardMarkup]:

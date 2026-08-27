@@ -151,7 +151,7 @@ async def _show_main_menu(ev: Event, ch: Channel, new_message: bool = False) -> 
         kb.append([Btn(text="🤍 Ещё от Fatucci", data="g:offers")])
     kb.append([_manager_btn()])
 
-    await _respond(ev, ch, Out(text=text, kb=kb, remove_reply_kb=True), new_message=new_message)
+    await _respond(ev, ch, Out(text=text, kb=kb), new_message=new_message)
 
 
 def _manager_btn() -> Btn:
@@ -503,8 +503,7 @@ async def _ask_address(ev: Event, ch: Channel) -> None:
         if known is not None and not known["is_general"] and known["address"]:
             kb.append([Btn(text=f"📍 {known['address']}", data="g:noop")])
     kb.append([Btn(text="⬅️ В меню", data="g:menu")])
-    await _respond(ev, ch, Out(text=await repo.render_text("ask_address"), kb=kb,
-                               remove_reply_kb=True))
+    await _respond(ev, ch, Out(text=await repo.render_text("ask_address"), kb=kb,))
 
 
 async def _input_address(ev: Event, ch: Channel, text: str, data: dict[str, Any]) -> None:
@@ -701,7 +700,7 @@ async def _ask_apartment(ev: Event, ch: Channel) -> None:
     if user and user["apartment"]:
         kb.append([Btn(text=f"🚪 Снова {user['apartment']}", data="g:reapt", intent="positive")])
     kb.append([Btn(text=BACK_LABEL, data="g:qty"), Btn(text="🏠 В начало", data="g:menu")])
-    await _respond(ev, ch, Out(text=text, kb=kb, remove_reply_kb=True))
+    await _respond(ev, ch, Out(text=text, kb=kb))
 
 
 async def _reuse_apartment(ev: Event, ch: Channel) -> None:
@@ -748,8 +747,7 @@ async def _ask_allergy(ev: Event, ch: Channel) -> None:
     await _set_state(ev, S_ALLERGY, data)
     kb = [[Btn(text=SKIP_LABEL, data="g:skipa")],
           [Btn(text=BACK_LABEL, data="g:phone"), Btn(text="🏠 В начало", data="g:menu")]]
-    await _respond(ev, ch, Out(text=await repo.render_text("ask_allergies"), kb=kb,
-                               remove_reply_kb=True), new_message=True)
+    await _respond(ev, ch, Out(text=await repo.render_text("ask_allergies"), kb=kb,), new_message=True)
 
 
 async def _skip_allergy(ev: Event, ch: Channel) -> None:
@@ -769,8 +767,7 @@ async def _ask_comment(ev: Event, ch: Channel) -> None:
     await _set_state(ev, S_COMMENT, data)
     kb = [[Btn(text=SKIP_LABEL, data="g:skip")],
           [Btn(text=BACK_LABEL, data="g:allergy"), Btn(text="🏠 В начало", data="g:menu")]]
-    await _respond(ev, ch, Out(text=await repo.render_text("ask_comment"), kb=kb,
-                               remove_reply_kb=True), new_message=True)
+    await _respond(ev, ch, Out(text=await repo.render_text("ask_comment"), kb=kb,), new_message=True)
 
 
 async def _skip_comment(ev: Event, ch: Channel) -> None:
@@ -848,7 +845,7 @@ async def _show_confirm(ev: Event, ch: Channel) -> None:
          Btn(text="📋 Условия", data="g:rules")],
         [Btn(text="❌ Отменить", data="g:menu", intent="negative")],
     ]
-    await _respond(ev, ch, Out(text="\n".join(lines), kb=kb, remove_reply_kb=True))
+    await _respond(ev, ch, Out(text="\n".join(lines), kb=kb))
 
 
 async def _show_edit(ev: Event, ch: Channel) -> None:
@@ -950,7 +947,7 @@ async def _confirm_order(ev: Event, ch: Channel) -> None:
     await repo.clear_session(ev.channel, ev.user_id)
 
     text = await notify.group_status_text(orders, "order_accepted")
-    await ch.send(ev.chat_id, Out(text=text, remove_reply_kb=True, kb=[
+    await ch.send(ev.chat_id, Out(text=text, kb=[
         [Btn(text="📦 Мои заказы", data="g:my")],
         [Btn(text="📋 Условия заказа", data="g:rules"), _manager_btn()],
     ]))
@@ -1046,6 +1043,9 @@ async def _input_phone(ev: Event, ch: Channel, raw: str, data: dict[str, Any],
     if name.strip():
         data["name"] = name.strip()
     await _set_state(ev, S_ALLERGY, data)
+    # сообщение без кнопок под текстом — заодно возвращает постоянные кнопки
+    # под полем ввода вместо клавиатуры «Поделиться контактом»
+    await ch.send(ev.chat_id, Out(text=f"📱 Телефон записан: <b>{esc(fmt_phone(phone))}</b>"))
     await _ask_allergy(ev, ch)
 
 

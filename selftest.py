@@ -281,6 +281,10 @@ async def main() -> None:
     check("телефон" in ch.texts().lower(), "запрошен телефон")
     ch.clear()
     await route(guest_event("contact", phone="+7 999 123-45-67"), ch)
+    check("Телефон записан" in ch.texts(), "гость видит, какой номер записан")
+    plain_after_contact = [out for _, out in ch.sent if not out.kb]
+    check(bool(plain_after_contact),
+          "после контакта есть сообщение без inline-кнопок — оно вернёт кнопки под вводом")
     check("аллерг" in ch.texts().lower(), "спрошено про аллергии")
     ch.clear()
     await route(guest_event("text", text="аллергия на орехи"), ch)
@@ -561,11 +565,41 @@ async def main() -> None:
     ch.clear()
     await route(admin_event("text", text="/start"), ch)
     check(ch.admin_button_shown, "админу закрепляются кнопки одним рядом")
+    from aiogram.types import InlineKeyboardMarkup, ReplyKeyboardMarkup
+
+    from app.channels.base import Btn
     from app.channels.telegram import TelegramChannel
-    labels = [b.text for row in TelegramChannel._admin_markup(
-        TelegramChannel.__new__(TelegramChannel)).keyboard for b in row]
+
+    tg = TelegramChannel.__new__(TelegramChannel)
+    labels = [b.text for row in tg._admin_markup().keyboard for b in row]
     check(labels == [ADMIN_BUTTON, SUPPORT_BUTTON],
           f"у админа под полем ввода обе кнопки в одном ряду: {labels}")
+
+    # ключевое: постоянные кнопки не должны исчезать ни от меню, ни от чего ещё
+    menu_like = Out(text="меню", kb=[[Btn(text="🥐 Заказать", data="g:order")]])
+    markup = await tg._markup(GUEST, menu_like)
+    check(isinstance(markup, InlineKeyboardMarkup),
+          "сообщение с кнопками под текстом не трогает клавиатуру под вводом")
+
+    plain = await tg._markup(GUEST, Out(text="просто текст"))
+    check(isinstance(plain, ReplyKeyboardMarkup),
+          "сообщение без кнопок под текстом обновляет постоянные кнопки")
+    check([b.text for row in plain.keyboard for b in row] == [SUPPORT_BUTTON],
+          "гостю возвращается его кнопка, а не пустая клавиатура")
+
+    admin_plain = await tg._markup(ADMIN, Out(text="просто текст"))
+    check([b.text for row in admin_plain.keyboard for b in row]
+          == [ADMIN_BUTTON, SUPPORT_BUTTON], "админу возвращаются обе кнопки")
+
+    contact = await tg._markup(GUEST, Out(text="телефон?", reply_contact="📱 Отправить телефон"))
+    rows = [[b.text for b in row] for row in contact.keyboard]
+    check(rows == [["📱 Отправить телефон"], [SUPPORT_BUTTON]],
+          f"на шаге телефона поддержка остаётся рядом: {rows}")
+    check(any(b.request_contact for row in contact.keyboard for b in row),
+          "кнопка отправки телефона осталась рабочей")
+
+    check(await tg._markup(CHAT, Out(text="заказ")) is None,
+          "в рабочем чате менеджеров клавиатуру под вводом не ставим")
 
     ch.clear()
     await route(admin_event("text", text=SUPPORT_BUTTON), ch)

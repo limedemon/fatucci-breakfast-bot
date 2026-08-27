@@ -34,7 +34,6 @@ class Out:
     kb: Optional[list[list[Btn]]] = None
     photo: str = ""               # ключ картинки в базе (см. app/media.py)
     reply_contact: str = ""       # подпись кнопки «Поделиться контактом»
-    remove_reply_kb: bool = False
     disable_preview: bool = True
 
 
