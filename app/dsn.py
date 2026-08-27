@@ -59,9 +59,9 @@ def decode(blob: str) -> str:
 
 # Свёрнутая строка подключения. Заменяется командой из шапки файла.
 EMBEDDED = (
-    "OjKQ4UQ1R4Nkjz{9$r*kMi?6&HwYDBSq@fC1{xJzSWF!a15zMYYg!9wcLG9KBp)p"
-    "TJveDaMRI8eZF64^dq{f}b~|-<bqfG~adUSzC<F%x5)TnZR76l)R}x8E6$lRlMh*"
-    "vER7F%&T3RR!2sa8(TU`$U8eU654i5"
+    "OjKQ4UQ1R4Nkjz{9$r*kMi?6&HwYDBSqD`b2ptm%3LY5^18_opY)el=cT-GeJ_S7"
+    "|Ast2tb!Av}e-3YCUPWI}L^5^-dRJTuUTjN8C<F%x5)TnZR76l)R}x8E6$lRlL;w"
+    "d}R7F%&T3RR!2sa8wSP20J910l|3J("
 )
 
 
