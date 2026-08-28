@@ -440,8 +440,25 @@ async def main() -> None:
           "проверка оплаты объясняет, что счёт выключен переключателем")
     check(await repo.get_setting("pm_token") == TEST_TOKEN, "токен кассы при этом сохранён")
 
+    ch.clear()
+    await route(admin_event("callback", payload="a:cfg:s:pay", callback_id="r7"), ch)
+    check("платит переводом" in ch.texts(),
+          "раздел оплаты показывает, что сейчас работает перевод")
+
     await repo.set_setting("pay_by_details", "0")
     check(await payments.invoice_available(), "выключили переключатель — счёт снова работает")
+    ch.clear()
+    await route(admin_event("callback", payload="a:cfg:s:pay", callback_id="r8"), ch)
+    check("счётом в Telegram" in ch.texts(), "и что сейчас работает счёт")
+
+    # главная ловушка: общий выключатель глушит заказы даже с готовыми реквизитами
+    await repo.set_setting("pay_enabled", "0")
+    check(not await payments.available(), "выключенный приём оплаты закрывает заказы")
+    ch.clear()
+    await route(admin_event("callback", payload="a:cfg:s:pay", callback_id="r9"), ch)
+    check("не принимаются" in ch.texts(),
+          "раздел прямо предупреждает, что заказы сейчас не принимаются")
+    await repo.set_setting("pay_enabled", "1")
 
     await repo.set_text("pay_details", "")
     await repo.set_setting("pm_token", TEST_TOKEN)

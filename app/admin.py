@@ -128,9 +128,9 @@ SETTING_SECTIONS: dict[str, tuple[str, list[FieldSpec]]] = {
         ("courier_empty", "Если заказов нет", "text"),
     ]),
     "pay": ("💳 Оплата", [
-        ("pay_enabled", "Приём оплаты включён", "bool"),
+        ("pay_enabled", "Принимать заказы и оплату", "bool"),
         ("pm_token", "Токен кассы от @BotFather", "secret"),
-        ("pay_by_details", "Оплата по реквизитам (без счёта)", "bool"),
+        ("pay_by_details", "Платить переводом, а не счётом", "bool"),
         ("pay_link", "Ссылка на оплату (если есть)", "text"),
     ]),
 }
@@ -1266,6 +1266,8 @@ async def _settings_section(ev: Event, ch: Channel, code: str) -> None:
         lines += ["", _max_hint(await repo.get_setting("max_token"),
                                 await repo.get_bool("max_enabled", True))]
         kb.append([Btn(text="🧪 Проверить подключение MAX", data="a:cfg:max")])
+    if code == "pay":
+        lines += ["", await _pay_hint()]
     if code == "price":
         lines += ["", await _discount_preview()]
     topic = SECTION_HELP.get(code)
@@ -1294,6 +1296,28 @@ async def _discount_preview() -> str:
     obj = objects[0]
     return (f"<b>Пример для «{esc(obj['title'])}»</b>\n"
             f"{pricing.table(obj['price_kop'], tiers, int(obj['max_qty'] or 10))}")
+
+
+async def _pay_hint() -> str:
+    """Что происходит с оплатой прямо сейчас — одним абзацем."""
+    if not await payments.is_enabled():
+        return ("⛔ <b>Заказы сейчас не принимаются.</b>\n"
+                "Переключатель «Принимать заказы и оплату» выключен — гость видит "
+                "сообщение, что заказать пока нельзя. Включите его, и заработает "
+                "способ оплаты, настроенный ниже.")
+    if await payments.invoice_available():
+        return ("✅ <b>Сейчас гость платит счётом в Telegram</b> — картой, "
+                "оплата подтверждается сама.\n"
+                "Чтобы вместо этого принимать переводы по реквизитам, включите "
+                "«Платить переводом, а не счётом».")
+    if await payments.details_configured():
+        return ("✅ <b>Сейчас гость платит переводом по реквизитам</b> и нажимает "
+                "«Я оплатил» — вам придёт сообщение с кнопками «Подтвердить оплату» "
+                "и «Оплата не пришла».\n"
+                "Сами реквизиты — в ✍️ Тексты бота → «Реквизиты для оплаты».")
+    return ("⚠️ <b>Оплата не настроена — заказы не принимаются.</b>\n"
+            "Заполните «Реквизиты для оплаты» в ✍️ Тексты бота либо вставьте токен "
+            "кассы выше. Кнопка «Проверить оплату» подскажет подробнее.")
 
 
 def _max_hint(token: str, enabled: bool) -> str:
