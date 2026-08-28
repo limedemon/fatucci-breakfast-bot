@@ -231,6 +231,7 @@ async def _on_callback(ev: Event, ch: Channel, user: Row) -> None:
         "cancel": lambda: _cancel_order(ev, ch, int(arg or 0), whole=False),
         "cancelall": lambda: _cancel_order(ev, ch, int(arg or 0), whole=True),
         "got": lambda: _confirm_received(ev, ch, int(arg or 0)),
+        "paid": lambda: _mark_paid(ev, ch, int(arg or 0)),
         "date": lambda: _toggle_date(ev, ch, arg),
         "dates": lambda: _dates_done(ev, ch),
         "date_back": lambda: _ask_date(ev, ch),
@@ -426,6 +427,8 @@ async def _show_my_order(ev: Event, ch: Channel, order_id: int) -> None:
              "предыдущего дня доставки.</i>")
 
     kb: list[list[Btn]] = []
+    if order["status"] == statuses.ACCEPTED and not await payments.invoice_available():
+        kb.append([Btn(text="✅ Я оплатил", data=f"g:paid:{order['id']}", intent="positive")])
     if order["status"] == statuses.DELIVERED:
         kb.append([Btn(text="✅ Я получил заказ", data=f"g:got:{order['id']}", intent="positive")])
     if order["status"] in statuses.GUEST_CANCELLABLE:
@@ -454,6 +457,15 @@ async def _confirm_received(ev: Event, ch: Channel, order_id: int) -> None:
         await ch.send(ev.chat_id, Out(text="⚠️ " + message))
 
 
+async def _mark_paid(ev: Event, ch: Channel, order_id: int) -> None:
+    """Гость нажал «Я оплатил» — передаём менеджеру на сверку."""
+    ok, message = await orders_service.guest_marked_paid(order_id, ev.user_id, ev.channel)
+    await _answer(ev, ch, "Спасибо!" if ok else message[:180])
+    await _respond(ev, ch, Out(text=message if ok else f"⚠️ {esc(message)}",
+                               kb=[[Btn(text="📦 Мои заказы", data="g:my")],
+                                   [_manager_btn()]]))
+
+
 async def _on_payment(ev: Event, ch: Channel) -> None:
     """Telegram подтвердил оплату встроенного счёта."""
     order_id = payments.parse_payload(ev.payload)
@@ -475,8 +487,8 @@ async def _start_order(ev: Event, ch: Channel) -> None:
                                        [Btn(text="⬅️ В меню", data="g:menu")]]))
         return
 
-    if not await payments.invoice_available():
-        # без подключённой кассы оплатить заказ будет нечем — не начинаем оформление
+    if not await payments.available():
+        # ни реквизитов, ни кассы — оплатить будет нечем, не начинаем оформление
         await _respond(ev, ch, Out(text=await repo.render_text("no_payment"),
                                    kb=[[_manager_btn()],
                                        [Btn(text="⬅️ В меню", data="g:menu")]]))

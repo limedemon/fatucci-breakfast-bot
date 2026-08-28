@@ -130,6 +130,8 @@ SETTING_SECTIONS: dict[str, tuple[str, list[FieldSpec]]] = {
     "pay": ("💳 Оплата", [
         ("pay_enabled", "Приём оплаты включён", "bool"),
         ("pm_token", "Токен кассы от @BotFather", "secret"),
+        ("pay_by_details", "Оплата по реквизитам (без счёта)", "bool"),
+        ("pay_link", "Ссылка на оплату (если есть)", "text"),
     ]),
 }
 
@@ -144,7 +146,11 @@ TEXT_TITLES: dict[str, str] = {
     "payment_info": "Об оплате",
     "support": "Контакты техподдержки",
     "support_pinned": "Подсказка про кнопку «Поддержка»",
-    "payment_unavailable": "Если счёт выставить не удалось",
+    "payment_unavailable": "Если оплатить нечем",
+    "pay_details": "Реквизиты для оплаты",
+    "pay_details_default": "Реквизиты, если поле выше пустое",
+    "paid_thanks": "Ответ на «Я оплатил»",
+    "payment_not_found": "Если оплата не найдена",
     "order_accepted": "Заявка принята",
     "status_accepted": "Статус: принят в работу",
     "status_paid": "Статус: оплачен",
@@ -211,6 +217,7 @@ async def handle_callback(ev: Event, ch: Channel) -> None:
         "g": lambda: _group(ev, ch, args),
         "o": lambda: _orders_route(ev, ch, args),
         "ord": lambda: _order_action(ev, ch, args),
+        "nopay": lambda: _payment_not_received(ev, ch, args),
         "m": lambda: _sets_route(ev, ch, args),
         "r": lambda: _rotation_route(ev, ch, args),
         "b": lambda: _objects_route(ev, ch, args),
@@ -349,8 +356,8 @@ async def _home(ev: Event, ch: Channel, new_message: bool = False) -> None:
     warnings = []
     if await repo.get_bool("orders_paused"):
         warnings.append("⏸ Приём заказов на паузе")
-    if not await payments.invoice_available():
-        warnings.append("💳 Касса не подключена — гости не могут оформить заказ")
+    if not await payments.available():
+        warnings.append("💳 Оплата не настроена — гости не могут оформить заказ")
     if not (await repo.get_setting("orders_chat_id") or cfg.orders_chat_id):
         warnings.append("💬 Не задан рабочий чат для заказов")
     if warnings:
@@ -528,6 +535,19 @@ async def _order_action(ev: Event, ch: Channel, args: list[str]) -> None:
         return
     if ev.chat_id and not _is_orders_chat(ev):
         await _order_card(ev, ch, order_id)
+
+
+async def _payment_not_received(ev: Event, ch: Channel, args: list[str]) -> None:
+    """Менеджер не нашёл платёж по кнопке из уведомления «Я оплатил»."""
+    if not args:
+        return
+    ok, message = await orders_service.payment_not_received(int(args[0]), actor=_actor(ev))
+    await _answer(ev, ch, message[:180])
+    if ok:
+        await ch.send(ev.chat_id, Out(
+            text=f"❌ {esc(message)}\n\nЗаказ остаётся в работе — гость может оплатить "
+                 "ещё раз. Чтобы отказать совсем, откройте карточку и нажмите «Отклонить».",
+            kb=[[Btn(text="📦 Открыть заказ", data=f"a:o:c:{int(args[0])}")]]))
 
 
 def _actor(ev: Event) -> str:

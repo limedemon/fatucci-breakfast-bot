@@ -13,7 +13,7 @@ from typing import Any, Optional
 
 from . import notify, payments, repo, statuses
 from .channels.base import Btn, get_channel
-from .utils import fmt_date, now, parse_date, parse_time, utc_stamp
+from .utils import esc, fmt_date, fmt_money, now, parse_date, parse_time, utc_stamp
 
 log = logging.getLogger(__name__)
 Row = Any
@@ -95,11 +95,11 @@ async def _notify_guest(group: list[Row], order: Row, status: str, note: str = "
 
 # ------------------------------------------------------------------- оплата
 async def _send_payment_request(group: list[Row]) -> None:
-    """Заказ подтверждён — выставляем счёт.
+    """Заказ подтверждён — просим оплатить.
 
-    Оплата принимается только через подключённую кассу: гость получает
-    встроенный счёт Telegram, и оплату подтверждает сам Telegram. Если счёт
-    выставить не удалось, зовём менеджера — гостя без ответа не оставляем.
+    Если подключена касса, шлём встроенный счёт Telegram: оплату подтвердит
+    сам мессенджер. Иначе отправляем реквизиты и кнопку «Я оплатил» — по ней
+    менеджер получит сообщение и сверит поступление вручную.
     """
     head = group[0]
     total = notify.group_total(group)
@@ -113,12 +113,21 @@ async def _send_payment_request(group: list[Row]) -> None:
             return
         log.warning("Счёт по заказу %s не выставлен", number)
 
-    # касса не подключена или счёт не ушёл — гостя не бросаем, зовём менеджера
+    if await payments.details_configured():
+        text = await notify.group_status_text(
+            group, "status_accepted", pay_details=await payments.details_text())
+        await notify.notify_guest(head, text, [
+            [Btn(text="✅ Я оплатил", data=f"g:paid:{head['id']}", intent="positive")],
+            [Btn(text="📦 Мои заказы", data="g:my")],
+        ])
+        return
+
+    # оплатить нечем — гостя не бросаем, зовём менеджера
     await notify.notify_guest(head, await repo.render_text(
         "payment_unavailable", number=number))
     await notify.send_to_admins(
-        f"⚠️ Заказ <b>№{number}</b>: счёт на оплату выставить не удалось.\n"
-        "Проверьте /admin → 💳 Оплата и свяжитесь с гостем."
+        f"⚠️ Заказ <b>№{number}</b>: гостю нечем оплатить — не задано ни реквизитов, "
+        "ни токена кассы.\nОткройте /admin → ⚙️ Настройки → 💳 Оплата и свяжитесь с гостем."
     )
 
 
@@ -143,6 +152,53 @@ async def _send_invoice(group: list[Row], total: int) -> bool:
     elif error:
         log.warning("send_invoice: %s", error)
     return ok
+
+
+async def guest_marked_paid(order_id: int, ext_id: str, channel: str) -> tuple[bool, str]:
+    """Гость нажал «Я оплатил» — зовём менеджера сверить поступление."""
+    order = await repo.get_order(order_id)
+    if order is None or order["ext_id"] != str(ext_id) or order["channel"] != channel:
+        return False, "Это не ваш заказ"
+    if order["status"] not in (statuses.NEW, statuses.ACCEPTED):
+        return False, f"Заказ уже в статусе «{statuses.label(order['status'])}»"
+
+    group = await repo.group_of(order)
+    number = order["group_key"] or order["number"]
+    await repo.add_event(order["id"], order["status"], "гость", "Отметил заказ как оплаченный")
+    await notify.send_to_admins(
+        f"💳 <b>Гость сообщил об оплате</b>\n\n"
+        f"Заказ <b>№{number}</b> — {fmt_money(notify.group_total(group))}\n"
+        f"{notify.schedule_lines(group)}\n"
+        f"{esc(order['object_title'])}, апарт. {esc(order['apartment'])}\n"
+        f"{esc(order['phone'])}\n\n"
+        "Проверьте поступление и ответьте кнопкой.",
+        [[Btn(text="✅ Подтвердить оплату", data=f"a:ord:{order['id']}:{statuses.PAID}",
+              intent="positive")],
+         [Btn(text="❌ Оплата не пришла", data=f"a:nopay:{order['id']}", intent="negative")]],
+    )
+    return True, await repo.render_text("paid_thanks")
+
+
+async def payment_not_received(order_id: int, actor: str = "") -> tuple[bool, str]:
+    """Менеджер не нашёл платёж: заказ остаётся в силе, гостю сообщаем.
+
+    Сам заказ не отменяем — гость мог ошибиться реквизитами или платёж ещё
+    идёт. Чтобы отказать совсем, у менеджера есть кнопка «Отклонить».
+    """
+    order = await repo.get_order(order_id)
+    if order is None:
+        return False, "Заказ не найден"
+    number = order["group_key"] or order["number"]
+    await repo.add_event(order["id"], order["status"], actor or "менеджер",
+                         "Оплата не найдена")
+    await notify.notify_guest(
+        order,
+        await repo.render_text("payment_not_found", number=number),
+        [[Btn(text="✅ Я оплатил", data=f"g:paid:{order['id']}", intent="positive")],
+         [Btn(text="📦 Мои заказы", data="g:my")]],
+    )
+    await notify.refresh_order_cards(order)
+    return True, f"Заказ №{number}: гостю сообщили, что оплата не найдена"
 
 
 # -------------------------------------------------------- отмена и получение

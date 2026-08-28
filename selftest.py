@@ -365,8 +365,91 @@ async def main() -> None:
     check(fresh[0]["status"] == statuses.RECEIVED, "гость подтвердил получение")
     check(not ch.find_button("g:paid:"), "кнопки «Я оплатил» больше нет — платит касса")
 
-    print("\n— Без подключённой кассы заказ не оформляется —")
+    print("\n— Оплата по реквизитам —")
+    await repo.set_setting("pm_token", "")          # кассы нет — платим переводом
+    await repo.set_text("pay_details", "Перевод по номеру +7 900 000-00-00, получатель Fatucci.")
+    check(await payments.details_configured(), "реквизиты заданы")
+    check(await payments.available() and not await payments.invoice_available(),
+          "заказ оформить можно, счёт при этом не выставляется")
+
+    group = await place_order(ch, dates=2, qty=1, who=GUEST2, apartment="214")
+    ch.clear()
+    await route(admin_event("callback", chat_id=CHAT,
+                            payload=f"a:ord:{group[0]['id']}:{statuses.ACCEPTED}",
+                            callback_id="r1"), ch)
+    guest_text = ch.to(GUEST2)
+    check("+7 900 000-00-00" in guest_text, "гость получил реквизиты")
+    check("К оплате" in guest_text, "и сумму к оплате")
+    check(not ch.invoices, "счёт не выставлялся — кассы нет")
+    check(bool(ch.find_button("g:paid:")), "у гостя есть кнопка «Я оплатил»")
+
+    ch.clear()
+    await route(guest_event("callback", GUEST2, payload=f"g:paid:{group[0]['id']}",
+                            callback_id="r2"), ch)
+    admin_text = ch.to(CHAT)
+    check("сообщил об оплате" in admin_text, "менеджеру пришло сообщение об оплате")
+    check(group[0]["group_key"] in admin_text, "в нём виден номер заказа")
+    check("апарт. 214" in admin_text, "и куда везти")
+    confirm = ch.find_button(f"a:ord:{group[0]['id']}:{statuses.PAID}")
+    refuse = ch.find_button(f"a:nopay:{group[0]['id']}")
+    check(bool(confirm), "есть кнопка «Подтвердить оплату»")
+    check(bool(refuse), "есть кнопка «Оплата не пришла»")
+    check("Спасибо" in ch.to(GUEST2), "гостю сказали, что передали менеджеру")
+
+    # менеджер платёж не нашёл — заказ остаётся в работе
+    ch.clear()
+    await route(admin_event("callback", chat_id=CHAT, payload=refuse, callback_id="r3"), ch)
+    fresh = await repo.group_orders(group[0]["group_key"])
+    check(all(row["status"] == statuses.ACCEPTED for row in fresh),
+          "после отказа заказ остаётся подтверждённым, а не отменяется")
+    check("не видим" in ch.to(GUEST2), "гостю сообщили, что оплата не найдена")
+    check(bool(ch.find_button(f"g:paid:{group[0]['id']}")),
+          "гость может нажать «Я оплатил» ещё раз")
+
+    # со второй попытки менеджер подтверждает
+    ch.clear()
+    await route(guest_event("callback", GUEST2, payload=f"g:paid:{group[0]['id']}",
+                            callback_id="r4"), ch)
+    await route(admin_event("callback", chat_id=CHAT, payload=confirm, callback_id="r5"), ch)
+    fresh = await repo.group_orders(group[0]["group_key"])
+    check(all(row["status"] == statuses.PAID for row in fresh),
+          "подтверждение оплаты применилось ко всему заказу")
+    check(all(row["paid_at"] for row in fresh), "время оплаты зафиксировано")
+
+    events = [e["note"] for e in await repo.order_events(group[0]["id"])]
+    check("Отметил заказ как оплаченный" in events and "Оплата не найдена" in events,
+          "вся история оплаты сохранена в заказе")
+
+    ok, report = await payments.check_setup()
+    check(ok and "реквизит" in report.lower(), "проверка оплаты объясняет режим реквизитов")
+
+    # касса подключена, но выбран перевод — счёт не выставляется, токен цел
+    await repo.set_setting("pm_token", TEST_TOKEN)
+    await repo.set_setting("pay_by_details", "1")
+    check(not await payments.invoice_available() and await payments.available(),
+          "переключатель «оплата по реквизитам» перебивает кассу")
+    group = await place_order(ch, dates=1, qty=1, who=GUEST2)
+    ch.clear()
+    await route(admin_event("callback", chat_id=CHAT,
+                            payload=f"a:ord:{group[0]['id']}:{statuses.ACCEPTED}",
+                            callback_id="r6"), ch)
+    check(not ch.invoices and bool(ch.find_button("g:paid:")),
+          "гость получает реквизиты, а не счёт")
+    ok, report = await payments.check_setup()
+    check(ok and "переключател" in report.lower(),
+          "проверка оплаты объясняет, что счёт выключен переключателем")
+    check(await repo.get_setting("pm_token") == TEST_TOKEN, "токен кассы при этом сохранён")
+
+    await repo.set_setting("pay_by_details", "0")
+    check(await payments.invoice_available(), "выключили переключатель — счёт снова работает")
+
+    await repo.set_text("pay_details", "")
+    await repo.set_setting("pm_token", TEST_TOKEN)
+
+    print("\n— Без настроенной оплаты заказ не оформляется —")
     await repo.set_setting("pm_token", "")
+    await repo.set_text("pay_details", "")
+    await repo.set_setting("pay_link", "")
     ch.clear()
     await route(guest_event("callback", payload="g:order", callback_id="n1"), ch)
     check("недоступен" in ch.texts().lower(), "гостю сказано, что заказать пока нельзя")
@@ -681,7 +764,8 @@ async def main() -> None:
     await repo.set_setting("pm_token", "")
     ch.clear()
     await route(admin_event("callback", payload="a:h", callback_id="h1"), ch)
-    check("Касса не подключена" in ch.texts(), "админ видит предупреждение про кассу")
+    check("Оплата не настроена" in ch.texts(),
+          "админ видит предупреждение, что оплата не настроена")
     await repo.set_setting("pm_token", TEST_TOKEN)
 
     for section, title in [("a:o:l:new:0", "заказы"), ("a:g:menu", "меню и цены"),
