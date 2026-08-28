@@ -60,6 +60,7 @@ CREATE TABLE IF NOT EXISTS objects (
     is_active      INTEGER NOT NULL DEFAULT 1,
     is_general     INTEGER NOT NULL DEFAULT 0,
     delivery_time  TEXT NOT NULL DEFAULT '09:00',
+    delivery_time_to TEXT NOT NULL DEFAULT '',
     note           TEXT NOT NULL DEFAULT '',
     created_at     TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -433,6 +434,7 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("orders", "group_key", "TEXT NOT NULL DEFAULT ''"),
     ("orders", "address_ok", "INTEGER NOT NULL DEFAULT 1"),
     ("objects", "delivery_time", "TEXT NOT NULL DEFAULT '09:00'"),
+    ("objects", "delivery_time_to", "TEXT NOT NULL DEFAULT ''"),
 ]
 
 

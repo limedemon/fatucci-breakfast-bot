@@ -67,9 +67,33 @@ async def render_text(key: str, **kwargs: Any) -> str:
         "cutoff": kwargs.pop("cutoff", await default_cutoff()),
         "cancel_deadline": await get_setting("cancel_deadline", "18:30"),
         "delivery_time": kwargs.pop("delivery_time", await default_delivery_time()),
+        "delivery_window": kwargs.pop("delivery_window", await default_delivery_window()),
     }
     common.update(kwargs)
     return safe_format(template, **common)
+
+
+def delivery_window(obj: Optional[Row]) -> str:
+    """Когда привозим — куском фразы: «с 09:00 до 10:00» или «к 09:00».
+
+    Второе время у объекта необязательное: пока оно пустое, обещаем один
+    момент, а не окно.
+    """
+    if obj is None:
+        return ""
+    start = (obj["delivery_time"] or "").strip()
+    end = (obj["delivery_time_to"] or "").strip()
+    if not start:
+        return ""
+    return f"с {start} до {end}" if end else f"к {start}"
+
+
+async def default_delivery_window() -> str:
+    """Окно доставки самого «первого» активного объекта — для общих текстов."""
+    row = await db.fetchone(
+        "SELECT delivery_time, delivery_time_to FROM objects "
+        "WHERE is_active = 1 ORDER BY id LIMIT 1")
+    return delivery_window(row) or "к 09:00"
 
 
 async def default_delivery_time() -> str:
@@ -92,7 +116,7 @@ async def default_cutoff() -> str:
 OBJECT_FIELDS = (
     "code", "title", "group_title", "address", "price_kop", "delivery_days",
     "cutoff_time", "lead_days", "max_days_ahead", "min_qty", "max_qty",
-    "is_active", "is_general", "delivery_time", "note",
+    "is_active", "is_general", "delivery_time", "delivery_time_to", "note",
 )
 
 

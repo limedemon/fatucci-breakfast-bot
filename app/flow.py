@@ -135,6 +135,7 @@ async def _show_main_menu(ev: Event, ch: Channel, new_message: bool = False) -> 
             price=fmt_money(obj["price_kop"]),
             cutoff=obj["cutoff_time"],
             delivery_time=obj["delivery_time"],
+            delivery_window=repo.delivery_window(obj),
         )
     else:
         text = await repo.render_text("welcome")
@@ -297,6 +298,8 @@ async def _show_info(ev: Event, ch: Channel, key: str) -> None:
         cutoff=obj["cutoff_time"] if obj is not None else await repo.default_cutoff(),
         delivery_time=obj["delivery_time"] if obj is not None
         else await repo.default_delivery_time(),
+        delivery_window=repo.delivery_window(obj) if obj is not None
+        else await repo.default_delivery_window(),
     )
     kb = [[Btn(text="🥐 Заказать", data="g:order"), Btn(text="⬅️ В меню", data="g:menu")],
           [_manager_btn()]]
@@ -574,7 +577,8 @@ async def _ask_date(ev: Event, ch: Channel) -> None:
         text.append(f"📍 {esc(obj['address'])}")
     elif data.get("address"):
         text.append(f"📍 {esc(data['address'])}")
-    text.append(f"💰 {fmt_money(obj['price_kop'])} за сет · доставка к {esc(obj['delivery_time'])}")
+    text.append(f"💰 {fmt_money(obj['price_kop'])} за сет · "
+                f"доставка {esc(repo.delivery_window(obj))}")
     text.append("")
     if multi:
         text.append("Можно отметить <b>несколько дней сразу</b> — рядом с датой "
@@ -846,7 +850,7 @@ async def _show_confirm(ev: Event, ch: Channel) -> None:
         lines.append(f"💬 {esc(data['comment'])}")
     lines += [
         "",
-        f"🕘 Привезём к {esc(obj['delivery_time'])}",
+        f"🕘 Привезём {esc(repo.delivery_window(obj))}",
         f"<i>Отменить или изменить заказ можно до {esc(deadline)} "
         "предыдущего дня доставки. Полные условия — по кнопке ниже.</i>",
     ]

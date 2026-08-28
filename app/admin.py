@@ -57,7 +57,8 @@ OBJECT_FIELDS: list[FieldSpec] = [
     ("price_kop", "Цена завтрака", "money"),
     ("delivery_days", "Дни доставки", "days"),
     ("cutoff_time", "Приём заказов до", "time"),
-    ("delivery_time", "Время доставки", "time"),
+    ("delivery_time", "Доставка с", "time"),
+    ("delivery_time_to", "Доставка до (— чтобы убрать)", "time_opt"),
     ("lead_days", "Минимум дней до доставки", "int"),
     ("max_days_ahead", "На сколько дней вперёд", "int"),
     ("min_qty", "Мин. наборов", "int"),
@@ -1674,7 +1675,7 @@ async def _in_field(ev: Event, ch: Channel, ctx: dict, text: str, photo: str) ->
         value: Any = media_key
     else:
         value = _parse_value(kind, text)
-        if value is None:
+        if value is None and not (kind.endswith("_opt") and text.strip() == "-"):
             await ch.send(ev.chat_id, Out(text=f"⚠️ Неверный формат ({kind}). Попробуйте ещё раз."))
             return
         if key == "code":
@@ -1862,6 +1863,8 @@ def _parse_value(kind: str, text: str) -> Optional[Any]:
         if hour > 23 or minute > 59:
             return None
         return f"{hour:02d}:{minute:02d}"
+    if kind == "time_opt":
+        return "" if raw == "-" else _parse_value("time", raw)
     if kind == "days":
         days = sorted({int(p) for p in raw.replace(" ", "").split(",")
                        if p.isdigit() and 1 <= int(p) <= 7})

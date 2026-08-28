@@ -864,6 +864,51 @@ async def main() -> None:
     await repo.update_object(obj["id"], delivery_time="09:00", cutoff_time="23:59",
                              price_kop=obj["price_kop"])
 
+    print("\n— Окно доставки —")
+    obj = await repo.get_object_by_code("demo1")
+    ch.clear()
+    await route(admin_event("callback", payload=f"a:b:e:{obj['id']}:delivery_time_to",
+                            callback_id="w1"), ch)
+    await route(admin_event("text", text="10:00"), ch)
+    fresh = await repo.get_object(obj["id"])
+    check(fresh["delivery_time_to"] == "10:00", "время окончания доставки сохранилось")
+    check(repo.delivery_window(fresh) == "с 09:00 до 10:00",
+          f"окно собирается фразой: {repo.delivery_window(fresh)!r}")
+
+    ch.clear()
+    await route(guest_event("start", payload="demo1"), ch)
+    check("с 09:00 до 10:00" in ch.texts(), "окно видно в приветствии")
+    for payload, where in [("g:delivery", "разделе «Доставка»"),
+                           ("g:rules", "условиях заказа"),
+                           ("g:faq", "частых вопросах")]:
+        ch.clear()
+        await route(guest_event("callback", payload=payload, callback_id="w2"), ch)
+        check("с 09:00 до 10:00" in ch.texts(), f"окно видно в {where}")
+
+    ch.clear()
+    await route(guest_event("callback", payload="g:order", callback_id="w3"), ch)
+    first_date = ch.find_button("g:date:")
+    await route(guest_event("callback", payload=first_date, callback_id="w4"), ch)
+    await route(guest_event("callback", payload="g:dates", callback_id="w5"), ch)
+    await route(guest_event("callback", payload="g:qty:1", callback_id="w6"), ch)
+    await route(guest_event("callback", payload="g:reapt", callback_id="w7"), ch)
+    await route(guest_event("callback", payload="g:rephone", callback_id="w8"), ch)
+    await route(guest_event("callback", payload="g:skipa", callback_id="w9"), ch)
+    ch.clear()
+    await route(guest_event("callback", payload="g:skip", callback_id="w10"), ch)
+    check("с 09:00 до 10:00" in ch.texts(), "окно видно на экране подтверждения заказа")
+    await route(guest_event("callback", payload="g:menu", callback_id="w11"), ch)
+
+    # второе время необязательное: «-» убирает его, обещание снова точечное
+    ch.clear()
+    await route(admin_event("callback", payload=f"a:b:e:{obj['id']}:delivery_time_to",
+                            callback_id="w12"), ch)
+    await route(admin_event("text", text="-"), ch)
+    fresh = await repo.get_object(obj["id"])
+    check(fresh["delivery_time_to"] == "", "второе время очищается прочерком")
+    check(repo.delivery_window(fresh) == "к 09:00", "без него обещаем одно время")
+    await repo.update_object(obj["id"], delivery_time_to="10:00")
+
     print("\n— Содержимое из ТЗ —")
     sets = await repo.list_sets()
     check(len(sets) == 4, f"в меню 4 сета ({len(sets)})")
