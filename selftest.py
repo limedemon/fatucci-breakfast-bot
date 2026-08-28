@@ -899,6 +899,36 @@ async def main() -> None:
     check("с 09:00 до 10:00" in ch.texts(), "окно видно на экране подтверждения заказа")
     await route(guest_event("callback", payload="g:menu", callback_id="w11"), ch)
 
+    # промежуток можно вписать одной строкой в поле «Доставка с»
+    from app.utils import parse_time_range
+    for typed, expect in [("с 9 до 10", ("09:00", "10:00")),
+                          ("9:00-10:00", ("09:00", "10:00")),
+                          ("9 — 10", ("09:00", "10:00")),
+                          ("с 08:30 до 09:45", ("08:30", "09:45")),
+                          ("10:00", None),
+                          ("ерунда", None)]:
+        check(parse_time_range(typed) == expect, f"«{typed}» → {parse_time_range(typed)}")
+
+    await repo.update_object(obj["id"], delivery_time="09:00", delivery_time_to="")
+    ch.clear()
+    await route(admin_event("callback", payload=f"a:b:e:{obj['id']}:delivery_time",
+                            callback_id="w13"), ch)
+    check("промежуток" in ch.texts(), "подсказка предлагает вписать промежуток")
+    await route(admin_event("text", text="с 9 до 10"), ch)
+    fresh = await repo.get_object(obj["id"])
+    check((fresh["delivery_time"], fresh["delivery_time_to"]) == ("09:00", "10:00"),
+          "промежуток из одного поля разложился по двум")
+    check("с 09:00 до 10:00" in ch.texts(), "админу показали, что получилось")
+
+    ch.clear()
+    await route(admin_event("callback", payload=f"a:b:e:{obj['id']}:delivery_time",
+                            callback_id="w14"), ch)
+    await route(admin_event("text", text="08:00"), ch)
+    fresh = await repo.get_object(obj["id"])
+    check(fresh["delivery_time"] == "08:00" and fresh["delivery_time_to"] == "10:00",
+          "одиночное время меняет только начало")
+    await repo.update_object(obj["id"], delivery_time="09:00")
+
     # второе время необязательное: «-» убирает его, обещание снова точечное
     ch.clear()
     await route(admin_event("callback", payload=f"a:b:e:{obj['id']}:delivery_time_to",

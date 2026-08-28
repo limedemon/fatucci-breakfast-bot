@@ -29,6 +29,7 @@ from .utils import (
     fmt_phone,
     parse_date,
     parse_money,
+    parse_time_range,
     plural,
     slug_code,
     today,
@@ -1660,6 +1661,19 @@ async def _in_field(ev: Event, ch: Channel, ctx: dict, text: str, photo: str) ->
         return
     kind = next((t for k, _, t in specs if k == key), "text")
 
+    # «Доставка с» принимает и диапазон целиком: «с 9 до 10» разложим сами
+    if entity == "obj" and key == "delivery_time":
+        window = parse_time_range(text)
+        if window:
+            await repo.update_object(entity_id, delivery_time=window[0],
+                                     delivery_time_to=window[1])
+            await repo.clear_admin_state(int(ev.user_id))
+            await ch.send(ev.chat_id, Out(
+                text=f"✅ Доставка: с {window[0]} до {window[1]}.",
+                kb=[[Btn(text="⬅️ Назад", data=f"a:b:c:{entity_id}"),
+                     Btn(text="🏠 Админка", data="a:h")]]))
+            return
+
     if kind == "photo":
         if not photo:
             await ch.send(ev.chat_id, Out(text="⚠️ Пришлите именно фотографию."))
@@ -1835,14 +1849,21 @@ async def _edit_field(ev: Event, ch: Channel, entity: str, entity_id: int, key: 
         "money_opt": "Сумма в рублях или <code>-</code>, чтобы брать цену объекта",
         "int": "Целое число",
         "time": "Формат <code>ЧЧ:ММ</code>, например <code>20:00</code>",
+        "time_opt": ("Формат <code>ЧЧ:ММ</code>, например <code>10:00</code>. "
+                     "Прочерк <code>-</code> — убрать второе время"),
         "days": "Дни недели цифрами через запятую: 1=Пн … 7=Вс. Например <code>1,2,3,4,5</code>",
         "code": "Только латиница, цифры, <code>_</code> и <code>-</code>",
         "photo": "Пришлите фотографию одним сообщением",
         "text": "Пришлите новый текст",
     }
+    hint = hints.get(kind, "")
+    if entity == "obj" and key == "delivery_time":
+        # можно вписать сразу окно — так привычнее, чем два поля по отдельности
+        hint += ("\n\nМожно указать сразу промежуток: <code>с 9 до 10</code> "
+                 "или <code>9:00-10:00</code> — второе время заполнится само.")
     await _ask(ev, ch, "field", {"entity": entity, "id": entity_id, "key": key},
                f"✏️ <b>{esc(label)}</b>\n\nСейчас: <code>{esc(current) or '—'}</code>\n\n"
-               f"{hints.get(kind, '')}")
+               f"{hint}")
 
 
 def _parse_value(kind: str, text: str) -> Optional[Any]:

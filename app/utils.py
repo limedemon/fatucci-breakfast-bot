@@ -43,6 +43,35 @@ def utc_stamp(minutes: int = 0, hours: int = 0) -> str:
     return moment.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def parse_clock(raw: str) -> Optional[str]:
+    """«9», «9:00», «9.00», «0900» → «09:00». Иначе None."""
+    match = re.match(r"^(\d{1,2})(?:[:.\s]?(\d{2}))?$", raw.strip())
+    if not match:
+        return None
+    hour, minute = int(match.group(1)), int(match.group(2) or 0)
+    if hour > 23 or minute > 59:
+        return None
+    return f"{hour:02d}:{minute:02d}"
+
+
+def parse_time_range(raw: str) -> Optional[tuple[str, str]]:
+    """Разобрать «с 9 до 10», «9:00-10:00», «9 — 10» в пару времён.
+
+    Чтобы менеджеру не приходилось заполнять два поля по отдельности: привычную
+    фразу целиком бот разложит сам. Одиночное время сюда не подходит — для него
+    есть обычный разбор.
+    """
+    text = raw.strip().lower().replace("—", "-").replace("–", "-")
+    text = re.sub(r"^с\s*", "", text)
+    parts = re.split(r"\s*(?:до|по|-)\s*", text, maxsplit=1)
+    if len(parts) != 2:
+        return None
+    start, end = parse_clock(parts[0]), parse_clock(parts[1])
+    if not start or not end:
+        return None
+    return start, end
+
+
 def parse_time(value: str, fallback: str = "20:00") -> time:
     raw = (value or fallback).strip()
     m = re.match(r"^(\d{1,2})[:.\s]?(\d{2})$", raw)
