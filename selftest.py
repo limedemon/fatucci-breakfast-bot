@@ -37,7 +37,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import re  # noqa: E402
 from datetime import timedelta  # noqa: E402
 
-from app import courier, db, guide, payments, pricing, repo, statuses  # noqa: E402
+from app import courier, db, guide, media, payments, pricing, repo, statuses  # noqa: E402
 from app.channels import base  # noqa: E402
 from app.channels.base import Channel, Event, Out  # noqa: E402
 from app.channels.telegram import ADMIN_BUTTON, SUPPORT_BUTTON  # noqa: E402
@@ -817,6 +817,31 @@ async def main() -> None:
     ch.clear()
     await route(admin_event("callback", payload="a:q:o:1", callback_id="x2"), ch)
     check("[png" in ch.texts(), "QR-код генерируется картинкой")
+
+    print("\n— Фотография сета —")
+    target = (await repo.list_sets())[0]
+    ch.clear()
+    await route(admin_event("callback", payload=f"a:m:e:{target['id']}:photo_path",
+                            callback_id="ph1"), ch)
+    check("фото" in ch.texts().lower(), "админку попросили прислать фотографию")
+
+    # фото приходит обычным сообщением с вложением
+    await route(Event(channel="tg", user_id=ADMIN, chat_id=ADMIN, kind="text",
+                      raw={"photo_file_id": "file-123"}), ch)
+    fresh = await repo.get_set(target["id"])
+    check(fresh["photo_path"] == f"set:{target['id']}",
+          f"сет запомнил свою картинку: {fresh['photo_path']!r}")
+    check(await media.load(fresh["photo_path"]) is not None,
+          "сама картинка лежит в базе")
+
+    ch.clear()
+    await route(guest_event("callback", payload=f"g:set:{target['id']}", callback_id="ph2"), ch)
+    check(any(out.photo and out.photo == fresh["photo_path"] for _, out in ch.sent),
+          "гость видит карточку сета вместе с фото")
+
+    ch.clear()
+    await route(admin_event("callback", payload=f"a:m:c:{target['id']}", callback_id="ph3"), ch)
+    check("загружено" in ch.texts(), "в админке видно, что фото есть")
 
     print("\n— Содержимое из ТЗ —")
     sets = await repo.list_sets()

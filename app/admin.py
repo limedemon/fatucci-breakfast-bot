@@ -65,12 +65,13 @@ OBJECT_FIELDS: list[FieldSpec] = [
     ("note", "Заметка", "text"),
 ]
 
+#: Порядок сетов в витрине не редактируется: какой сет в какой день —
+#: решает ротация, а список «Меню и цены» идёт в порядке добавления.
 SET_FIELDS: list[FieldSpec] = [
     ("title", "Название", "text"),
     ("description", "Состав / описание", "text"),
     ("price_kop", "Своя цена (пусто — цена объекта)", "money_opt"),
     ("photo_path", "Фотография", "photo"),
-    ("sort_order", "Порядок в списке", "int"),
 ]
 
 OFFER_FIELDS: list[FieldSpec] = [
@@ -1651,6 +1652,10 @@ async def _in_offer_new(ev: Event, ch: Channel, ctx: dict, text: str, photo: str
 async def _in_field(ev: Event, ch: Channel, ctx: dict, text: str, photo: str) -> None:
     entity, entity_id, key = ctx["entity"], int(ctx["id"]), ctx["key"]
     specs = {"obj": OBJECT_FIELDS, "set": SET_FIELDS, "offer": OFFER_FIELDS}[entity]
+    if key not in {name for name, _, _ in specs}:
+        log.warning("Правка неизвестного поля %s.%s — пропущено", entity, key)
+        await ch.send(ev.chat_id, Out(text="⚠️ Это поле изменить нельзя."))
+        return
     kind = next((t for k, _, t in specs if k == key), "text")
 
     if kind == "photo":
@@ -1658,11 +1663,14 @@ async def _in_field(ev: Event, ch: Channel, ctx: dict, text: str, photo: str) ->
             await ch.send(ev.chat_id, Out(text="⚠️ Пришлите именно фотографию."))
             return
         data = await ch.download_bytes(photo)
-        key = media.key_for(entity, entity_id)
-        if not data or not await media.save(key, data):
+        # ВНИМАНИЕ: имя поля (key) и ключ картинки — разные вещи. Когда-то они
+        # звались одинаково, картинка сохранялась, а поле photo_path оставалось
+        # пустым, и фото не показывалось.
+        media_key = media.key_for(entity, entity_id)
+        if not data or not await media.save(media_key, data):
             await ch.send(ev.chat_id, Out(text="⚠️ Не удалось сохранить фото."))
             return
-        value: Any = key
+        value: Any = media_key
     else:
         value = _parse_value(kind, text)
         if value is None:
