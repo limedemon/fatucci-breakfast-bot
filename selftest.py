@@ -843,6 +843,27 @@ async def main() -> None:
     await route(admin_event("callback", payload=f"a:m:c:{target['id']}", callback_id="ph3"), ch)
     check("загружено" in ch.texts(), "в админке видно, что фото есть")
 
+    print("\n— Правка объекта из админки —")
+    obj = await repo.get_object_by_code("demo1")
+    for field, value, expect, label in [
+        ("delivery_time", "08:30", "08:30", "время доставки"),
+        ("cutoff_time", "15:00", "15:00", "приём заказов до"),
+        ("price_kop", "1000", "100000", "цена завтрака"),
+    ]:
+        ch.clear()
+        await route(admin_event("callback", payload=f"a:b:e:{obj['id']}:{field}",
+                                callback_id="ob1"), ch)
+        await route(admin_event("text", text=value), ch)
+        fresh = await repo.get_object(obj["id"])
+        check(str(fresh[field]) == expect, f"{label} меняется из админки ({fresh[field]})")
+
+    ch.clear()
+    await route(guest_event("start", payload="demo1"), ch)
+    check("08:30" in ch.texts() and "15:00" in ch.texts(),
+          "в приветствии видны новые время доставки и время приёма")
+    await repo.update_object(obj["id"], delivery_time="09:00", cutoff_time="23:59",
+                             price_kop=obj["price_kop"])
+
     print("\n— Содержимое из ТЗ —")
     sets = await repo.list_sets()
     check(len(sets) == 4, f"в меню 4 сета ({len(sets)})")

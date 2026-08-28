@@ -57,6 +57,7 @@ OBJECT_FIELDS: list[FieldSpec] = [
     ("price_kop", "Цена завтрака", "money"),
     ("delivery_days", "Дни доставки", "days"),
     ("cutoff_time", "Приём заказов до", "time"),
+    ("delivery_time", "Время доставки", "time"),
     ("lead_days", "Минимум дней до доставки", "int"),
     ("max_days_ahead", "На сколько дней вперёд", "int"),
     ("min_qty", "Мин. наборов", "int"),
