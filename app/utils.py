@@ -55,19 +55,18 @@ def parse_clock(raw: str) -> Optional[str]:
 
 
 def parse_time_range(raw: str) -> Optional[tuple[str, str]]:
-    """Разобрать «с 9 до 10», «9:00-10:00», «9 — 10» в пару времён.
+    """Разобрать «9:00-10:00» в пару времён. Другие записи не принимаются.
 
-    Чтобы менеджеру не приходилось заполнять два поля по отдельности: привычную
-    фразу целиком бот разложит сам. Одиночное время сюда не подходит — для него
-    есть обычный разбор.
+    Формат намеренно один: чем меньше вариантов, тем меньше шансов ошибиться
+    и получить не то время доставки, которое имели в виду.
     """
-    text = raw.strip().lower().replace("—", "-").replace("–", "-")
-    text = re.sub(r"^с\s*", "", text)
-    parts = re.split(r"\s*(?:до|по|-)\s*", text, maxsplit=1)
-    if len(parts) != 2:
+    match = re.match(r"^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$",
+                     raw.strip().replace("—", "-").replace("–", "-"))
+    if not match:
         return None
-    start, end = parse_clock(parts[0]), parse_clock(parts[1])
-    if not start or not end:
+    start = parse_clock(f"{match.group(1)}:{match.group(2)}")
+    end = parse_clock(f"{match.group(3)}:{match.group(4)}")
+    if not start or not end or end <= start:
         return None
     return start, end
 

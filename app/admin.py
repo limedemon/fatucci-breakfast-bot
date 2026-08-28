@@ -58,8 +58,7 @@ OBJECT_FIELDS: list[FieldSpec] = [
     ("price_kop", "Цена завтрака", "money"),
     ("delivery_days", "Дни доставки", "days"),
     ("cutoff_time", "Приём заказов до", "time"),
-    ("delivery_time", "Доставка с", "time"),
-    ("delivery_time_to", "Доставка до (— чтобы убрать)", "time_opt"),
+    ("delivery_time", "Время доставки", "window"),
     ("lead_days", "Минимум дней до доставки", "int"),
     ("max_days_ahead", "На сколько дней вперёд", "int"),
     ("min_qty", "Мин. наборов", "int"),
@@ -1661,18 +1660,23 @@ async def _in_field(ev: Event, ch: Channel, ctx: dict, text: str, photo: str) ->
         return
     kind = next((t for k, _, t in specs if k == key), "text")
 
-    # «Доставка с» принимает и диапазон целиком: «с 9 до 10» разложим сами
-    if entity == "obj" and key == "delivery_time":
+    # время доставки — это промежуток, он хранится в двух колонках
+    if kind == "window":
         window = parse_time_range(text)
-        if window:
-            await repo.update_object(entity_id, delivery_time=window[0],
-                                     delivery_time_to=window[1])
-            await repo.clear_admin_state(int(ev.user_id))
+        if not window:
             await ch.send(ev.chat_id, Out(
-                text=f"✅ Доставка: с {window[0]} до {window[1]}.",
-                kb=[[Btn(text="⬅️ Назад", data=f"a:b:c:{entity_id}"),
-                     Btn(text="🏠 Админка", data="a:h")]]))
+                text="⚠️ Нужен промежуток в формате <code>9:00-10:00</code>: "
+                     "часы и минуты через двоеточие, времена через дефис, "
+                     "второе позже первого."))
             return
+        await repo.update_object(entity_id, delivery_time=window[0],
+                                 delivery_time_to=window[1])
+        await repo.clear_admin_state(int(ev.user_id))
+        await ch.send(ev.chat_id, Out(
+            text=f"✅ Время доставки: с {window[0]} до {window[1]}.",
+            kb=[[Btn(text="⬅️ Назад", data=f"a:b:c:{entity_id}"),
+                 Btn(text="🏠 Админка", data="a:h")]]))
+        return
 
     if kind == "photo":
         if not photo:
@@ -1849,18 +1853,15 @@ async def _edit_field(ev: Event, ch: Channel, entity: str, entity_id: int, key: 
         "money_opt": "Сумма в рублях или <code>-</code>, чтобы брать цену объекта",
         "int": "Целое число",
         "time": "Формат <code>ЧЧ:ММ</code>, например <code>20:00</code>",
-        "time_opt": ("Формат <code>ЧЧ:ММ</code>, например <code>10:00</code>. "
-                     "Прочерк <code>-</code> — убрать второе время"),
+        "window": "Формат <code>ЧЧ:ММ-ЧЧ:ММ</code>, например <code>9:00-10:00</code>",
         "days": "Дни недели цифрами через запятую: 1=Пн … 7=Вс. Например <code>1,2,3,4,5</code>",
         "code": "Только латиница, цифры, <code>_</code> и <code>-</code>",
         "photo": "Пришлите фотографию одним сообщением",
         "text": "Пришлите новый текст",
     }
+    if kind == "window" and row is not None:
+        current = f"{row['delivery_time']}-{row['delivery_time_to']}".strip("-")
     hint = hints.get(kind, "")
-    if entity == "obj" and key == "delivery_time":
-        # можно вписать сразу окно — так привычнее, чем два поля по отдельности
-        hint += ("\n\nМожно указать сразу промежуток: <code>с 9 до 10</code> "
-                 "или <code>9:00-10:00</code> — второе время заполнится само.")
     await _ask(ev, ch, "field", {"entity": entity, "id": entity_id, "key": key},
                f"✏️ <b>{esc(label)}</b>\n\nСейчас: <code>{esc(current) or '—'}</code>\n\n"
                f"{hint}")

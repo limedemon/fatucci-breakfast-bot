@@ -846,7 +846,7 @@ async def main() -> None:
     print("\n— Правка объекта из админки —")
     obj = await repo.get_object_by_code("demo1")
     for field, value, expect, label in [
-        ("delivery_time", "08:30", "08:30", "время доставки"),
+        ("delivery_time", "8:30-9:30", "08:30", "время доставки"),
         ("cutoff_time", "15:00", "15:00", "приём заказов до"),
         ("price_kop", "1000", "100000", "цена завтрака"),
     ]:
@@ -861,19 +861,41 @@ async def main() -> None:
     await route(guest_event("start", payload="demo1"), ch)
     check("08:30" in ch.texts() and "15:00" in ch.texts(),
           "в приветствии видны новые время доставки и время приёма")
-    await repo.update_object(obj["id"], delivery_time="09:00", cutoff_time="23:59",
-                             price_kop=obj["price_kop"])
+    await repo.update_object(obj["id"], delivery_time="09:00", delivery_time_to="10:00",
+                             cutoff_time="23:59", price_kop=obj["price_kop"])
 
     print("\n— Окно доставки —")
     obj = await repo.get_object_by_code("demo1")
     ch.clear()
-    await route(admin_event("callback", payload=f"a:b:e:{obj['id']}:delivery_time_to",
+    await route(admin_event("callback", payload=f"a:b:e:{obj['id']}:delivery_time",
                             callback_id="w1"), ch)
-    await route(admin_event("text", text="10:00"), ch)
+    check("9:00-10:00" in ch.texts(), "подсказка показывает единственный формат")
+    await route(admin_event("text", text="9:00-10:00"), ch)
     fresh = await repo.get_object(obj["id"])
-    check(fresh["delivery_time_to"] == "10:00", "время окончания доставки сохранилось")
+    check((fresh["delivery_time"], fresh["delivery_time_to"]) == ("09:00", "10:00"),
+          "промежуток разложился по двум колонкам")
+    check("с 09:00 до 10:00" in ch.texts(), "админу показали, что получилось")
     check(repo.delivery_window(fresh) == "с 09:00 до 10:00",
           f"окно собирается фразой: {repo.delivery_window(fresh)!r}")
+
+    from app.utils import parse_time_range
+    for typed, expect in [("9:00-10:00", ("09:00", "10:00")),
+                          ("09:00-10:00", ("09:00", "10:00")),
+                          ("9:00 - 10:00", ("09:00", "10:00")),
+                          ("с 9 до 10", None),
+                          ("9-10", None),
+                          ("9:00", None),
+                          ("10:00-9:00", None),
+                          ("9:60-10:00", None)]:
+        check(parse_time_range(typed) == expect, f"«{typed}» → {parse_time_range(typed)}")
+
+    ch.clear()
+    await route(admin_event("callback", payload=f"a:b:e:{obj['id']}:delivery_time",
+                            callback_id="w2"), ch)
+    await route(admin_event("text", text="с 9 до 10"), ch)
+    fresh = await repo.get_object(obj["id"])
+    check(fresh["delivery_time"] == "09:00" and "9:00-10:00" in ch.texts(),
+          "другой формат отклоняется с подсказкой, значение не портится")
 
     ch.clear()
     await route(guest_event("start", payload="demo1"), ch)
@@ -882,62 +904,22 @@ async def main() -> None:
                            ("g:rules", "условиях заказа"),
                            ("g:faq", "частых вопросах")]:
         ch.clear()
-        await route(guest_event("callback", payload=payload, callback_id="w2"), ch)
+        await route(guest_event("callback", payload=payload, callback_id="w3"), ch)
         check("с 09:00 до 10:00" in ch.texts(), f"окно видно в {where}")
 
     ch.clear()
-    await route(guest_event("callback", payload="g:order", callback_id="w3"), ch)
+    await route(guest_event("callback", payload="g:order", callback_id="w4"), ch)
     first_date = ch.find_button("g:date:")
-    await route(guest_event("callback", payload=first_date, callback_id="w4"), ch)
-    await route(guest_event("callback", payload="g:dates", callback_id="w5"), ch)
-    await route(guest_event("callback", payload="g:qty:1", callback_id="w6"), ch)
-    await route(guest_event("callback", payload="g:reapt", callback_id="w7"), ch)
-    await route(guest_event("callback", payload="g:rephone", callback_id="w8"), ch)
-    await route(guest_event("callback", payload="g:skipa", callback_id="w9"), ch)
+    await route(guest_event("callback", payload=first_date, callback_id="w5"), ch)
+    await route(guest_event("callback", payload="g:dates", callback_id="w6"), ch)
+    await route(guest_event("callback", payload="g:qty:1", callback_id="w7"), ch)
+    await route(guest_event("callback", payload="g:reapt", callback_id="w8"), ch)
+    await route(guest_event("callback", payload="g:rephone", callback_id="w9"), ch)
+    await route(guest_event("callback", payload="g:skipa", callback_id="w10"), ch)
     ch.clear()
-    await route(guest_event("callback", payload="g:skip", callback_id="w10"), ch)
+    await route(guest_event("callback", payload="g:skip", callback_id="w11"), ch)
     check("с 09:00 до 10:00" in ch.texts(), "окно видно на экране подтверждения заказа")
-    await route(guest_event("callback", payload="g:menu", callback_id="w11"), ch)
-
-    # промежуток можно вписать одной строкой в поле «Доставка с»
-    from app.utils import parse_time_range
-    for typed, expect in [("с 9 до 10", ("09:00", "10:00")),
-                          ("9:00-10:00", ("09:00", "10:00")),
-                          ("9 — 10", ("09:00", "10:00")),
-                          ("с 08:30 до 09:45", ("08:30", "09:45")),
-                          ("10:00", None),
-                          ("ерунда", None)]:
-        check(parse_time_range(typed) == expect, f"«{typed}» → {parse_time_range(typed)}")
-
-    await repo.update_object(obj["id"], delivery_time="09:00", delivery_time_to="")
-    ch.clear()
-    await route(admin_event("callback", payload=f"a:b:e:{obj['id']}:delivery_time",
-                            callback_id="w13"), ch)
-    check("промежуток" in ch.texts(), "подсказка предлагает вписать промежуток")
-    await route(admin_event("text", text="с 9 до 10"), ch)
-    fresh = await repo.get_object(obj["id"])
-    check((fresh["delivery_time"], fresh["delivery_time_to"]) == ("09:00", "10:00"),
-          "промежуток из одного поля разложился по двум")
-    check("с 09:00 до 10:00" in ch.texts(), "админу показали, что получилось")
-
-    ch.clear()
-    await route(admin_event("callback", payload=f"a:b:e:{obj['id']}:delivery_time",
-                            callback_id="w14"), ch)
-    await route(admin_event("text", text="08:00"), ch)
-    fresh = await repo.get_object(obj["id"])
-    check(fresh["delivery_time"] == "08:00" and fresh["delivery_time_to"] == "10:00",
-          "одиночное время меняет только начало")
-    await repo.update_object(obj["id"], delivery_time="09:00")
-
-    # второе время необязательное: «-» убирает его, обещание снова точечное
-    ch.clear()
-    await route(admin_event("callback", payload=f"a:b:e:{obj['id']}:delivery_time_to",
-                            callback_id="w12"), ch)
-    await route(admin_event("text", text="-"), ch)
-    fresh = await repo.get_object(obj["id"])
-    check(fresh["delivery_time_to"] == "", "второе время очищается прочерком")
-    check(repo.delivery_window(fresh) == "к 09:00", "без него обещаем одно время")
-    await repo.update_object(obj["id"], delivery_time_to="10:00")
+    await route(guest_event("callback", payload="g:menu", callback_id="w12"), ch)
 
     print("\n— Содержимое из ТЗ —")
     sets = await repo.list_sets()
