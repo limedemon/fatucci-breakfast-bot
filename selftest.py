@@ -930,6 +930,38 @@ async def main() -> None:
     base.REGISTRY.pop("max", None)
     await repo.set_setting("max_username", "")
 
+    print("\n— Привязка рабочего чата командой /clip —")
+    GROUP = "-1009999"
+    before = await repo.get_setting("orders_chat_id")
+
+    ch.clear()
+    await route(Event(channel="tg", user_id=GUEST, chat_id=GROUP, kind="text",
+                      text="/clip", full_name="Гость"), ch)
+    check("только администратор" in ch.texts(), "гостю привязать чат не дают")
+    check(await repo.get_setting("orders_chat_id") == before, "настройка не изменилась")
+
+    ch.clear()
+    await route(admin_event("text", chat_id=GROUP, text="/clip"), ch)
+    check(await repo.get_setting("orders_chat_id") == GROUP, "админ привязал группу")
+    check("Чат привязан" in ch.texts(), "бот подтвердил привязку прямо в группе")
+    check(GROUP in ch.texts(), "и показал ID чата")
+
+    ch.clear()
+    await route(admin_event("text", chat_id=GROUP, text="/clip@fatucci_test_bot"), ch)
+    check("уже рабочий" in ch.texts(), "повторная привязка не дублируется")
+
+    ch.clear()
+    await route(admin_event("text", text="/clip"), ch)
+    check("для группы" in ch.texts().lower(), "в личке объясняют, что команда для группы")
+
+    # заказ теперь уходит в привязанную группу
+    await repo.set_setting("pm_token", TEST_TOKEN)
+    ch.clear()
+    await place_order(ch, dates=1, qty=1)
+    check("НОВЫЙ ЗАКАЗ" in ch.to(GROUP), "новый заказ пришёл в привязанный чат")
+
+    await repo.set_setting("orders_chat_id", before)
+
     print("\n— Админка —")
     ch.clear()
     await route(admin_event("text", text="/admin"), ch)

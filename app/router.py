@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 
-from . import admin, admins, flow
+from . import admin, admins, flow, repo
 from .channels.base import TG, Btn, Channel, Event, Out
 from .channels.telegram import ADMIN_BUTTON, SUPPORT_BUTTON
 
@@ -37,6 +37,11 @@ async def _route(ev: Event, ch: Channel) -> None:
 
     is_group = ch.name == TG and str(ev.chat_id) != str(ev.user_id)
 
+    # привязка рабочего чата прямо из группы — чтобы не искать ID руками
+    if text.startswith("/clip"):
+        await _clip_chat(ev, ch, is_group)
+        return
+
     # самый первый написавший боту в личку становится владельцем
     if ch.name == TG and not is_group:
         await _claim_owner(ev, ch)
@@ -55,6 +60,39 @@ async def _route(ev: Event, ch: Channel) -> None:
         return
 
     await flow.handle(ev, ch)
+
+
+async def _clip_chat(ev: Event, ch: Channel, is_group: bool) -> None:
+    """Сделать эту группу рабочим чатом заказов.
+
+    Команду отправляют прямо в группе — так не нужно узнавать ID и вписывать
+    его руками, а заодно сразу видно, что бот в этой группе умеет писать.
+    """
+    if not is_group:
+        await ch.send(ev.chat_id, Out(
+            text="ℹ️ <b>Команда для группы</b>\n\n"
+                 "Добавьте бота в чат менеджеров и отправьте <code>/clip</code> там — "
+                 "этот чат станет рабочим, и туда пойдут заказы."))
+        return
+
+    if not await admins.is_admin(ev.user_id):
+        await ch.send(ev.chat_id, Out(
+            text="⛔ Привязать чат может только администратор бота."))
+        return
+
+    chat_id = str(ev.chat_id)
+    if (await repo.get_setting("orders_chat_id")) == chat_id:
+        await ch.send(ev.chat_id, Out(
+            text="✅ Этот чат уже рабочий — заказы приходят сюда."))
+        return
+
+    await repo.set_setting("orders_chat_id", chat_id)
+    await ch.send(ev.chat_id, Out(
+        text="✅ <b>Чат привязан</b>\n\n"
+             "Сюда будут приходить новые заказы, оплаты и запросы адресов — "
+             "с кнопками, чтобы отвечать прямо отсюда.\n\n"
+             f"ID чата: <code>{chat_id}</code>"))
+    log.info("Рабочий чат заказов привязан: %s (админ %s)", chat_id, ev.user_id)
 
 
 async def _claim_owner(ev: Event, ch: Channel) -> None:
