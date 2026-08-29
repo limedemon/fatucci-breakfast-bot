@@ -36,6 +36,7 @@ Row = Any
 # состояния
 S_NONE = ""
 S_ADDRESS = "address"
+S_REQUEST = "request"
 S_DATE = "date"
 S_QTY = "qty"
 S_APARTMENT = "apartment"
@@ -49,6 +50,7 @@ SKIP_LABEL = "⏭ Пропустить"
 CONTACT_LABEL = "📞 Поделиться контактом"
 
 #: сколько дат максимум можно отметить в одном заказе
+OBJECTS_PER_PAGE = 8
 MAX_DATES = 14
 
 
@@ -111,6 +113,10 @@ async def _cmd_start(ev: Event, ch: Channel) -> None:
 
     await repo.save_session(ev.channel, ev.user_id, S_NONE, {}, chat_id=ev.chat_id,
                             object_id=session_object)
+    if session_object is None:
+        # дом неизвестен: по QR не пришли или код не подошёл — предлагаем выбрать
+        await _ask_object(ev, ch, new_message=True)
+        return
     await _show_main_menu(ev, ch, new_message=True)
 
 
@@ -150,6 +156,9 @@ async def _show_main_menu(ev: Event, ch: Channel, new_message: bool = False) -> 
         kb.append([Btn(text="📦 Мои заказы", data="g:my")])
     if await repo.list_offers(active_only=True):
         kb.append([Btn(text="🤍 Ещё от Fatucci", data="g:offers")])
+    if obj is not None and len(await repo.list_objects(active_only=True, selectable=True)) > 1:
+        # домов несколько — гость мог выбрать не тот или переехать
+        kb.append([Btn(text="🏠 Сменить апартаменты", data="g:objs")])
     kb.append([_manager_btn()])
 
     await _respond(ev, ch, Out(text=text, kb=kb), new_message=new_message)
@@ -225,6 +234,10 @@ async def _on_callback(ev: Event, ch: Channel, user: Row) -> None:
         "faq": lambda: _show_info(ev, ch, "faq"),
         "rules": lambda: _show_info(ev, ch, "rules"),
         "manager": lambda: _contact_manager(ev, ch),
+        "objs": lambda: _ask_object(ev, ch),
+        "objp": lambda: _ask_object(ev, ch, page=int(arg or 0)),
+        "obj": lambda: _pick_object(ev, ch, int(arg or 0)),
+        "objnew": lambda: _ask_new_object(ev, ch),
         "offers": lambda: _show_offers(ev, ch),
         "offer": lambda: _show_offer(ev, ch, int(arg or 0)),
         "my": lambda: _show_my_orders(ev, ch),
@@ -499,12 +512,81 @@ async def _start_order(ev: Event, ch: Channel) -> None:
 
     obj, data = await _session_object(ev)
     if obj is None:
-        await _ask_address(ev, ch)
+        await _ask_object(ev, ch)
         return
     if obj["is_general"] and not data.get("address"):
         await _ask_address(ev, ch)
         return
     await _ask_date(ev, ch)
+
+
+# ------------------------------------------------------- выбор апартаментов
+async def _ask_object(ev: Event, ch: Channel, page: int = 0,
+                      new_message: bool = False) -> None:
+    """Список домов кнопками. Когда дом неизвестен — с этого начинается заказ."""
+    objects = await repo.list_objects(active_only=True, selectable=True)
+    if not objects:
+        # объектов ещё не завели — гостю остаётся только оставить адрес
+        await _ask_new_object(ev, ch, new_message=new_message)
+        return
+
+    pages = chunk(objects, OBJECTS_PER_PAGE)
+    page = max(0, min(page, len(pages) - 1))
+    kb = [[Btn(text=f"🏢 {obj['title']}", data=f"g:obj:{obj['id']}")] for obj in pages[page]]
+    if len(pages) > 1:
+        nav = []
+        if page:
+            nav.append(Btn(text="⬅️ Назад", data=f"g:objp:{page - 1}"))
+        nav.append(Btn(text=f"{page + 1}/{len(pages)}", data="g:noop"))
+        if page + 1 < len(pages):
+            nav.append(Btn(text="Ещё ➡️", data=f"g:objp:{page + 1}"))
+        kb.append(nav)
+    kb.append([Btn(text="➕ Моих апартаментов нет", data="g:objnew")])
+    kb.append([Btn(text="📋 Меню и цены", data="g:sets"), _manager_btn()])
+    await _respond(ev, ch, Out(text=await repo.render_text("choose_object"), kb=kb),
+                   new_message=new_message)
+
+
+async def _pick_object(ev: Event, ch: Channel, object_id: int) -> None:
+    """Гость выбрал дом — запоминаем его и открываем меню."""
+    obj = await repo.get_object(object_id)
+    if obj is None or not obj["is_active"] or obj["is_general"]:
+        await _ask_object(ev, ch)
+        return
+    await repo.update_user(ev.channel, ev.user_id, object_id=obj["id"])
+    await repo.save_session(ev.channel, ev.user_id, S_NONE, {}, chat_id=ev.chat_id,
+                            object_id=obj["id"])
+    await _show_main_menu(ev, ch)
+
+
+async def _ask_new_object(ev: Event, ch: Channel, new_message: bool = False) -> None:
+    _, data = await _session_object(ev)
+    await _set_state(ev, S_REQUEST, data)
+    kb = [[Btn(text="⬅️ К списку домов", data="g:objs")],
+          [Btn(text="🏠 В начало", data="g:menu")]]
+    await _respond(ev, ch, Out(text=await repo.render_text("request_object"), kb=kb),
+                   new_message=new_message)
+
+
+async def _input_request(ev: Event, ch: Channel, text: str, data: dict[str, Any]) -> None:
+    """Гость прислал адрес, которого нет в списке."""
+    address = " ".join(text.split())[:200]
+    if len(address) < 5:
+        await ch.send(ev.chat_id, Out(
+            text="⚠️ Напишите улицу и номер дома — например, <b>Советская 16</b>."))
+        return
+
+    await repo.save_session(ev.channel, ev.user_id, S_NONE, {}, chat_id=ev.chat_id)
+    user = await repo.get_user(ev.channel, ev.user_id)
+    delivered = await notify.new_object_request(
+        ev.channel, str(ev.user_id), ev.username or (user["username"] if user else ""),
+        ev.full_name or (user["full_name"] if user else ""), address)
+    if not delivered:
+        log.warning("Запрос апартаментов «%s» никому не доставлен", address)
+
+    await _respond(ev, ch, Out(
+        text=await repo.render_text("request_sent", address=esc(address)),
+        kb=[[Btn(text="🏠 В начало", data="g:menu")], [_manager_btn()]]), new_message=True)
 
 
 # ------------------------------------------------------------------- адрес
@@ -1004,6 +1086,9 @@ async def _on_text(ev: Event, ch: Channel, user: Row) -> None:
 
     if state == S_ADDRESS:
         await _input_address(ev, ch, text, data)
+        return
+    if state == S_REQUEST:
+        await _input_request(ev, ch, text, data)
         return
     if state == S_APARTMENT:
         await _input_apartment(ev, ch, text, data)

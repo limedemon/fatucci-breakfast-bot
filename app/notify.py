@@ -190,6 +190,45 @@ async def send_to_admins(text: str, kb: Optional[list[list[Btn]]] = None) -> lis
     return sent
 
 
+async def send_to_admin_dms(text: str, kb: Optional[list[list[Btn]]] = None) -> int:
+    """Личное сообщение каждому администратору.
+
+    Отдельно от send_to_admins: то шлёт в рабочий чат, а есть вещи, которые
+    должны дойти лично — например, просьба гостя подключить новый адрес.
+    """
+    channel = get_channel(TG)
+    if channel is None:
+        log.warning("Telegram-канал не запущен — личное уведомление пропущено")
+        return 0
+    delivered = 0
+    for admin_id in sorted(await admins.ids()):
+        if await channel.send(str(admin_id), Out(text=text, kb=kb)):
+            delivered += 1
+    if not delivered:
+        log.warning("Никому из админов не удалось доставить личное уведомление")
+    return delivered
+
+
+async def new_object_request(channel_name: str, user_id: str, username: str,
+                             full_name: str, address: str) -> int:
+    """Гость просит подключить свой дом — зовём администраторов лично."""
+    who = esc(full_name.strip() or "гость")
+    link = guest_link(channel_name, username)
+    lines = [
+        "🏠 <b>Запрос новых апартаментов</b>",
+        "",
+        f"📍 Адрес: <b>{esc(address)}</b>",
+        f"👤 Гость: {who}" + (f" (@{esc(username)})" if username else ""),
+        f"🆔 <code>{esc(str(user_id))}</code> · {channel_title(channel_name)}",
+        "",
+        "Если возим по этому адресу — заведите объект и напишите гостю.",
+    ]
+    kb = [[Btn(text="🏢 Добавить объект", data="a:b:n")]]
+    if link:
+        kb.append([Btn(text="✉️ Написать гостю", url=link)])
+    return await send_to_admin_dms("\n".join(lines), kb)
+
+
 async def notify_new_order(orders: list[Row] | Row) -> None:
     """Новый заказ -> одна карточка в рабочий чат, даже если дней несколько."""
     group = orders if isinstance(orders, list) else [orders]

@@ -485,6 +485,66 @@ async def main() -> None:
     check(not ok and "не похож" in report, "кривой токен подсвечивается")
     await repo.set_setting("pm_token", TEST_TOKEN)
 
+    print("\n— Выбор апартаментов на старте —")
+    NEW = "999"
+    ch.clear()
+    await route(guest_event("start", NEW), ch)          # пришёл без QR-кода
+    check("апартаменты" in ch.texts().lower(), "новому гостю предложено выбрать дом")
+    buttons = ch.find_all("g:obj:")
+    check(len(buttons) >= 1, f"дома показаны кнопками ({len(buttons)})")
+    check(bool(ch.find_button("g:objnew")), "есть кнопка «Моих апартаментов нет»")
+    check(not ch.find_button("g:order"), "меню заказа не показывается, пока дом не выбран")
+
+    ch.clear()
+    await route(guest_event("callback", NEW, payload=buttons[0], callback_id="c1"), ch)
+    check(bool(ch.find_button("g:order")), "после выбора дома открылось меню")
+    session = await repo.get_session("tg", NEW)
+    picked = await repo.get_object(session["object_id"])
+    check(picked is not None and not picked["is_general"], "дом запомнен в сессии")
+    user = await repo.get_user("tg", NEW)
+    check(user["object_id"] == picked["id"], "и в карточке гостя — при следующем старте не спросим")
+
+    ch.clear()
+    await route(guest_event("start", NEW), ch)
+    check(bool(ch.find_button("g:order")) and not ch.find_button("g:obj:"),
+          "повторный старт сразу открывает меню")
+    check(not ch.find_button("g:objs"),
+          "когда дом всего один, менять нечего — кнопки нет")
+
+    second = await repo.create_object(code="beta", title="Бета-Апартаменты",
+                                      address="г. Сочи, ул. Южная, д. 3", price_kop=90000)
+    ch.clear()
+    await route(guest_event("start", NEW), ch)
+    check(bool(ch.find_button("g:objs")), "когда домов несколько — можно сменить из меню")
+    ch.clear()
+    await route(guest_event("callback", NEW, payload="g:objs", callback_id="c1b"), ch)
+    check(len(ch.find_all("g:obj:")) == 2, "в списке оба дома")
+    await repo.delete_object(second)
+
+    print("\n— Запрос новых апартаментов —")
+    ch.clear()
+    await route(guest_event("callback", NEW, payload="g:objnew", callback_id="c2"), ch)
+    check("адрес" in ch.texts().lower(), "у гостя спросили адрес")
+
+    ch.clear()
+    await route(guest_event("text", NEW, text="Сов"), ch)
+    check("улицу и номер дома" in ch.texts(), "слишком короткий адрес не принимается")
+    session = await repo.get_session("tg", NEW)
+    check(session["state"] == "request", "гость остаётся на том же шаге")
+
+    ch.clear()
+    await route(guest_event("text", NEW, text="Советская 16"), ch)
+    check("Советская 16" in ch.to(NEW), "гостю подтвердили заявку с адресом")
+    admin_text = ch.to(ADMIN)
+    check("Запрос новых апартаментов" in admin_text, "админу пришло уведомление в личку")
+    check("Советская 16" in admin_text, "в уведомлении есть адрес")
+    check(NEW in admin_text, "и кто просит")
+    check(bool(ch.find_button("a:b:n")), "из уведомления можно сразу завести объект")
+    check(not any(chat == CHAT for chat, _ in ch.sent),
+          "в рабочий чат заказов это не летит — только в личку")
+    session = await repo.get_session("tg", NEW)
+    check(session["state"] == "", "после заявки гость не застрял в вводе адреса")
+
     print("\n— Общий QR: гость вводит адрес —")
     ch.clear()
     await route(guest_event("start", payload="obshiy"), ch)
