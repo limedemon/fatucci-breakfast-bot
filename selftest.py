@@ -37,7 +37,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import re  # noqa: E402
 from datetime import timedelta  # noqa: E402
 
-from app import courier, db, guide, media, payments, pricing, repo, statuses  # noqa: E402
+from app import (availability, courier, db, guide, media, payments,  # noqa: E402
+                 pricing, repo, statuses)
 from app.channels import base  # noqa: E402
 from app.channels.base import Channel, Event, Out  # noqa: E402
 from app.channels.telegram import ADMIN_BUTTON, SUPPORT_BUTTON  # noqa: E402
@@ -545,12 +546,18 @@ async def main() -> None:
     session = await repo.get_session("tg", NEW)
     check(session["state"] == "", "после заявки гость не застрял в вводе адреса")
 
-    print("\n— Общий QR: гость вводит адрес —")
+    print("\n— Общий QR: выбор дома или свой адрес —")
     ch.clear()
     await route(guest_event("start", payload="obshiy"), ch)
     await route(guest_event("callback", payload="g:order", callback_id="a1"), ch)
-    check("адрес" in ch.texts().lower(), "по общему QR спрошен адрес")
-    check(not ch.find_button("g:obj:"), "список чужих объектов гостю не показывается")
+    check("апартаменты" in ch.texts().lower(), "по общему QR предложен выбор дома")
+    check(bool(ch.find_all("g:obj:")), "дома показаны кнопками")
+    check(bool(ch.find_button("g:addr")), "есть кнопка «Ввести свой адрес»")
+    check(bool(ch.find_button("g:objnew")), "и кнопка сообщить о новом доме")
+
+    ch.clear()
+    await route(guest_event("callback", payload="g:addr", callback_id="a1b"), ch)
+    check("адрес" in ch.texts().lower(), "по кнопке спрашивают адрес")
 
     ch.clear()
     await route(guest_event("text", text="Северная 12"), ch)
@@ -563,11 +570,52 @@ async def main() -> None:
     ch.clear()
     await route(guest_event("start", payload="obshiy"), ch)
     await route(guest_event("callback", payload="g:order", callback_id="a2"), ch)
+    await route(guest_event("callback", payload="g:addr", callback_id="a2b"), ch)
     await route(guest_event("text", text="Неизвестная улица 99"), ch)
     check("менеджер проверит" in ch.texts().lower() or "не найден" in ch.texts().lower()
           or "пока нет в списке" in ch.texts().lower(),
           "про незнакомый адрес честно сказано")
     check(bool(ch.find_button("g:date:")), "заказ всё равно можно продолжить")
+
+    print("\n— Общая цена для адресов вне списка —")
+    general = await repo.get_object_by_code("obshiy")
+    known = await repo.get_object_by_code("demo1")
+    await repo.set_setting("custom_price_kop", "150000")
+    check(await availability.price_of(general) == 150000,
+          "по общему адресу действует общая цена")
+    check(await availability.price_of(known) == known["price_kop"],
+          "у дома из списка остаётся своя цена")
+
+    ch.clear()
+    await route(guest_event("start", payload="obshiy"), ch)
+    await route(guest_event("callback", payload="g:order", callback_id="a3"), ch)
+    await route(guest_event("callback", payload="g:addr", callback_id="a4"), ch)
+    await route(guest_event("text", text="Неизвестная улица 99"), ch)
+    first_date = ch.find_button("g:date:")
+    await route(guest_event("callback", payload=first_date, callback_id="a5"), ch)
+    ch.clear()
+    await route(guest_event("callback", payload="g:dates", callback_id="a6"), ch)
+    check("1 500 ₽" in ch.texts(), "гость видит общую цену при выборе количества")
+
+    await route(guest_event("callback", payload="g:qty:2", callback_id="a7"), ch)
+    await route(guest_event("callback", payload="g:reapt", callback_id="a8"), ch)
+    await route(guest_event("callback", payload="g:rephone", callback_id="a9"), ch)
+    await route(guest_event("callback", payload="g:skipa", callback_id="a10"), ch)
+    ch.clear()
+    await route(guest_event("callback", payload="g:skip", callback_id="a11"), ch)
+    check("3 000 ₽" in ch.texts(), "итог считается по общей цене")
+
+    ch.clear()
+    await route(guest_event("callback", payload="g:confirm", callback_id="a12"), ch)
+    orders = await repo.list_orders(limit=1, user_key=("tg", GUEST))
+    check(bool(orders) and orders[0]["price_kop"] == 150000,
+          f"в заказе сохранилась общая цена ({orders[0]['price_kop'] if orders else '—'})")
+    check(bool(orders) and not orders[0]["address_ok"],
+          "заказ помечен как адрес вне списка")
+
+    await repo.set_setting("custom_price_kop", "")
+    check(await availability.price_of(general) == general["price_kop"],
+          "пустая настройка возвращает цену общего объекта")
 
     print("\n— Сопоставление адресов —")
     for typed, expect in [("г. Сочи, ул. Северная, д. 12", "demo1"),
@@ -636,7 +684,7 @@ async def main() -> None:
 
     print("\n— Время приёма и отмены —")
     obj = await repo.get_object_by_code("demo1")
-    from app import availability, orders_service
+    from app import orders_service
     await repo.update_object(obj["id"], cutoff_time="00:01", lead_days=1)
     obj = await repo.get_object_by_code("demo1")
     tomorrow = today() + timedelta(days=1)

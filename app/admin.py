@@ -111,7 +111,8 @@ SETTING_SECTIONS: dict[str, tuple[str, list[FieldSpec]]] = {
         ("daily_remind_time", "Во сколько напоминать", "time"),
         ("daily_remind_audience", "Кому: all или buyers", "text"),
     ]),
-    "price": ("💰 Скидки за количество", [
+    "price": ("💰 Цены и скидки", [
+        ("custom_price_kop", "Цена для адресов вне списка", "money_opt"),
         ("discount_tiers", "Пороги скидок", "text"),
     ]),
     "cur": ("🚚 Выгрузка курьерам", [
@@ -1264,6 +1265,8 @@ async def _settings_section(ev: Event, ch: Channel, code: str) -> None:
         else:
             if kind == "secret":
                 shown = mask_secret(value)
+            elif kind in ("money", "money_opt") and value.isdigit():
+                shown = fmt_money(int(value))
             else:
                 shown = value if len(value) <= 60 else value[:57] + "…"
             lines.append(f"{esc(label)}: <code>{esc(shown) or '—'}</code>")
@@ -1724,7 +1727,7 @@ async def _in_text(ev: Event, ch: Channel, ctx: dict, text: str, photo: str) -> 
 async def _in_setting(ev: Event, ch: Channel, ctx: dict, text: str, photo: str) -> None:
     key, kind = ctx["key"], ctx.get("kind", "text")
     raw = "" if text == "-" else text
-    if kind in ("int", "time", "money") and raw:
+    if kind in ("int", "time", "money", "money_opt") and raw:
         parsed = _parse_value(kind, raw)
         if parsed is None:
             await ch.send(ev.chat_id, Out(text="⚠️ Неверный формат, попробуйте ещё раз."))

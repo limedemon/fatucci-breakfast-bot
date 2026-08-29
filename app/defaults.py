@@ -78,6 +78,7 @@ DEFAULT_SETTINGS: dict[str, str] = {
 
     # Контакты
     "manager_contact": "@fatucci_manager",
+    "custom_price_kop": "",        # цена для адресов вне списка; пусто — как у общего объекта
     "pay_link": "",                # ссылка на оплату, если есть
     "pay_by_details": "0",         # 1 — платить переводом, даже если касса подключена
     "support_contact": "@marina_fatucci",   # техподдержка: кто чинит бота

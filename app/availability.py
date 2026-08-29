@@ -61,11 +61,22 @@ async def check_date(obj: Row, day: date) -> tuple[bool, str]:
     return True, ""
 
 
-def price_for(obj: Row, breakfast: Optional[Row]) -> int:
-    """Цена одного сета: индивидуальная цена сета важнее цены объекта."""
+def price_for(obj: Row, breakfast: Optional[Row], custom_kop: int = 0) -> int:
+    """Цена одного сета.
+
+    Своя цена сета важнее всего. Дальше — общая цена для адресов вне списка
+    (заказ по общему QR), и только потом цена самого объекта.
+    """
     if breakfast is not None and breakfast["price_kop"]:
         return int(breakfast["price_kop"])
+    if custom_kop and obj["is_general"]:
+        return int(custom_kop)
     return int(obj["price_kop"] or 0)
+
+
+async def price_of(obj: Row, breakfast: Optional[Row] = None) -> int:
+    """То же самое, но сама достаёт общую цену из настроек."""
+    return price_for(obj, breakfast, await repo.custom_address_price())
 
 
 def qty_limits(obj: Row) -> tuple[int, int]:
