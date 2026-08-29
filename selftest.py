@@ -572,10 +572,47 @@ async def main() -> None:
     await route(guest_event("callback", payload="g:order", callback_id="a2"), ch)
     await route(guest_event("callback", payload="g:addr", callback_id="a2b"), ch)
     await route(guest_event("text", text="Неизвестная улица 99"), ch)
-    check("менеджер проверит" in ch.texts().lower() or "не найден" in ch.texts().lower()
-          or "пока нет в списке" in ch.texts().lower(),
-          "про незнакомый адрес честно сказано")
-    check(bool(ch.find_button("g:date:")), "заказ всё равно можно продолжить")
+    guest_text = ch.to(GUEST)
+    check("Записали адрес" in guest_text, "адрес принят без лишних условий")
+    check("за сет" in guest_text, "гостю сразу названа цена по такому адресу")
+    check("проверит" not in guest_text.lower(),
+          "про проверку менеджером гостю больше не пишем")
+    check(bool(ch.find_button("g:date:")), "гость сразу переходит к выбору дат")
+
+    print("\n— Решение менеджера по адресу —")
+    admin_text = ch.to(CHAT)
+    check("Новый адрес вне списка" in admin_text, "карточка адреса ушла в чат менеджеров")
+    check("Неизвестная улица 99" in admin_text, "в ней виден адрес")
+    guest_row = await repo.get_user("tg", GUEST)
+    accept = ch.find_button(f"a:addr:ok:{guest_row['id']}")
+    reject = ch.find_button(f"a:addr:no:{guest_row['id']}")
+    check(bool(accept) and bool(reject), "есть кнопки «Принять» и «Отклонить»")
+    check(guest_row["address_status"] == repo.ADDRESS_PENDING,
+          "адрес помечен как ожидающий решения")
+
+    # до решения гость спокойно заказывает
+    ch.clear()
+    first_date = ch.find_all("g:date:")[0] if ch.find_all("g:date:") else ""
+    await route(guest_event("callback", payload="g:order", callback_id="a2c"), ch)
+    check(bool(ch.find_button("g:date:")), "до решения заказ доступен")
+
+    ch.clear()
+    await route(admin_event("callback", chat_id=CHAT, payload=accept, callback_id="a2d"), ch)
+    guest_row = await repo.get_user("tg", GUEST)
+    check(guest_row["address_status"] == repo.ADDRESS_OK, "адрес принят")
+    check("подтверждён" in ch.to(GUEST), "гостю сообщили о подтверждении")
+
+    ch.clear()
+    await route(admin_event("callback", chat_id=CHAT, payload=reject, callback_id="a2e"), ch)
+    guest_row = await repo.get_user("tg", GUEST)
+    check(guest_row["address_status"] == repo.ADDRESS_REJECTED, "адрес отклонён")
+    check("не возим" in ch.to(GUEST), "гостю сказали, что по адресу не возим")
+    check(bool(ch.find_button("g:addr")) and bool(ch.find_button("g:objs")),
+          "гостю предложено вписать другой адрес или выбрать дом")
+    session = await repo.get_session("tg", GUEST)
+    check(session is not None and not session["object_id"],
+          "черновик сброшен — заказ начнётся заново")
+    await repo.update_user("tg", GUEST, custom_address="", address_status="")
 
     print("\n— Общая цена для адресов вне списка —")
     general = await repo.get_object_by_code("obshiy")

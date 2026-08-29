@@ -15,7 +15,7 @@ import logging
 from typing import Any, Optional
 
 from . import availability, notify, orders_service, payments, pricing, repo, statuses
-from .channels.base import Btn, Channel, Event, Out
+from .channels.base import Btn, Channel, Event, Out, get_channel
 from .utils import (
     chunk,
     esc,
@@ -595,6 +595,29 @@ async def _input_request(ev: Event, ch: Channel, text: str, data: dict[str, Any]
 
 
 # ------------------------------------------------------------------- адрес
+async def address_rejected(user: Row) -> None:
+    """Менеджер отказал по адресу — просим у гостя другой."""
+    channel = get_channel(user["channel"])
+    if channel is None:
+        return
+    text = await repo.render_text("address_rejected",
+                                  address=esc(user["custom_address"] or "—"))
+    kb = [[Btn(text="🏢 Выбрать из списка", data="g:objs")],
+          [Btn(text="✍️ Ввести другой адрес", data="g:addr")]]
+    await channel.send(user["chat_id"] or user["ext_id"], Out(text=text, kb=kb))
+
+
+async def address_accepted(user: Row) -> None:
+    """Менеджер подтвердил адрес — сообщаем гостю."""
+    channel = get_channel(user["channel"])
+    if channel is None:
+        return
+    await channel.send(user["chat_id"] or user["ext_id"], Out(
+        text=await repo.render_text("address_accepted",
+                                    address=esc(user["custom_address"] or "—")),
+        kb=[[Btn(text="🥐 Заказать завтрак", data="g:order")]]))
+
+
 async def _ask_address(ev: Event, ch: Channel) -> None:
     _, data = await _session_object(ev)
     await _set_state(ev, S_ADDRESS, data)
@@ -609,7 +632,7 @@ async def _ask_address(ev: Event, ch: Channel) -> None:
 
 
 async def _input_address(ev: Event, ch: Channel, text: str, data: dict[str, Any]) -> None:
-    address = text.strip()
+    address = " ".join(text.split())[:200]
     if len(address) < 5:
         await ch.send(ev.chat_id, Out(
             text="⚠️ Напишите улицу и номер дома — например, <b>Северная 12</b>."))
@@ -618,14 +641,37 @@ async def _input_address(ev: Event, ch: Channel, text: str, data: dict[str, Any]
     matched = await repo.find_object_by_address(address)
     data["address"] = address
     data["address_ok"] = bool(matched)
-    session = await repo.get_session(ev.channel, ev.user_id)
-    object_id = matched["id"] if matched else (session["object_id"] if session else None)
-    await repo.save_session(ev.channel, ev.user_id, S_DATE, data, chat_id=ev.chat_id,
-                            object_id=object_id)
 
-    if matched is None:
-        await ch.send(ev.chat_id, Out(
-            text=await repo.render_text("address_unknown", address=esc(address))))
+    if matched is not None:
+        await repo.update_user(ev.channel, ev.user_id, object_id=matched["id"],
+                               custom_address="", address_status="")
+        await repo.save_session(ev.channel, ev.user_id, S_DATE, data, chat_id=ev.chat_id,
+                                object_id=matched["id"])
+        await _ask_date(ev, ch)
+        return
+
+    # дома нет в списке: заказ всё равно оформляем — по общей цене,
+    # а менеджеры решают отдельно, возим ли мы туда
+    general = await repo.general_object()
+    if general is None:
+        await ch.send(ev.chat_id, Out(text=await repo.render_text("address_unknown_closed")))
+        await _ask_object(ev, ch)
+        return
+
+    await repo.save_session(ev.channel, ev.user_id, S_DATE, data, chat_id=ev.chat_id,
+                            object_id=general["id"])
+    user = await repo.get_user(ev.channel, ev.user_id)
+    known = user["custom_address"] if user else ""
+    await repo.update_user(ev.channel, ev.user_id, object_id=general["id"],
+                           custom_address=address, address_status=repo.ADDRESS_PENDING)
+
+    await ch.send(ev.chat_id, Out(text=await repo.render_text(
+        "address_unknown", address=esc(address),
+        price=fmt_money(await availability.price_of(general)))))
+    if user is not None and known.lower() != address.lower():
+        # про один и тот же адрес менеджеров дёргаем один раз
+        user = await repo.get_user(ev.channel, ev.user_id)
+        await notify.new_address(user, address)
     await _ask_date(ev, ch)
 
 
@@ -633,7 +679,7 @@ async def _input_address(ev: Event, ch: Channel, text: str, data: dict[str, Any]
 async def _ask_date(ev: Event, ch: Channel) -> None:
     obj, data = await _session_object(ev)
     if obj is None:
-        await _ask_address(ev, ch)
+        await _ask_object(ev, ch)
         return
 
     dates = await availability.available_dates(obj, limit=MAX_DATES)

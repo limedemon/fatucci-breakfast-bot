@@ -103,6 +103,16 @@ async def default_delivery_window() -> str:
     return delivery_window(row) or "к 09:00"
 
 
+async def general_object() -> Optional[Row]:
+    """Объект «общий QR» — к нему привязываются заказы по адресам вне списка."""
+    return await db.fetchone(
+        "SELECT * FROM objects WHERE is_general = 1 AND is_active = 1 ORDER BY id LIMIT 1")
+
+
+async def get_user_by_id(user_pk: int) -> Optional[Row]:
+    return await db.fetchone("SELECT * FROM users WHERE id = ?", (int(user_pk),))
+
+
 async def custom_address_price() -> int:
     """Цена сета для адресов, которых нет в списке домов.
 
@@ -355,7 +365,10 @@ async def get_user_pk(user_pk: int) -> Optional[Row]:
 
 
 USER_FIELDS = ("phone", "apartment", "customer_name", "object_id", "source_code",
-               "is_blocked", "chat_id")
+               "is_blocked", "chat_id", "custom_address", "address_status")
+
+#: адрес вне списка домов: ждёт решения менеджера / разрешён / отклонён
+ADDRESS_PENDING, ADDRESS_OK, ADDRESS_REJECTED = "pending", "ok", "rejected"
 
 
 async def update_user(channel: str, ext_id: str, **fields: Any) -> None:

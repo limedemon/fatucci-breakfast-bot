@@ -229,6 +229,32 @@ async def new_object_request(channel_name: str, user_id: str, username: str,
     return await send_to_admin_dms("\n".join(lines), kb)
 
 
+async def new_address(user: Row, address: str) -> None:
+    """Гость заказывает по адресу вне списка — сообщаем в рабочий чат.
+
+    Заказывать он может уже сейчас: менеджеры решают спокойно, а не держат
+    гостя на паузе. Решение прилетает кнопками из этого же сообщения.
+    """
+    link = guest_link(user["channel"], user["username"])
+    lines = [
+        "📍 <b>Новый адрес вне списка</b>",
+        "",
+        f"Адрес: <b>{esc(address)}</b>",
+        f"Гость: {esc(user['full_name'] or 'без имени')}"
+        + (f" (@{esc(user['username'])})" if user["username"] else ""),
+        f"Цена для таких адресов: <b>{fmt_money(await repo.custom_address_price())}</b>",
+        "",
+        "Гость уже может оформить заказ — он придёт сюда как обычный.",
+        "Если по этому адресу не возим, нажмите «Отклонить»: гостю сообщим "
+        "и попросим другой адрес.",
+    ]
+    kb = [[Btn(text="✅ Принять", data=f"a:addr:ok:{user['id']}", intent="positive"),
+           Btn(text="⛔ Отклонить", data=f"a:addr:no:{user['id']}", intent="negative")]]
+    if link:
+        kb.append([Btn(text="✉️ Написать гостю", url=link)])
+    await send_to_admins("\n".join(lines), kb)
+
+
 async def notify_new_order(orders: list[Row] | Row) -> None:
     """Новый заказ -> одна карточка в рабочий чат, даже если дней несколько."""
     group = orders if isinstance(orders, list) else [orders]

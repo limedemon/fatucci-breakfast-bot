@@ -225,6 +225,7 @@ async def handle_callback(ev: Event, ch: Channel) -> None:
         "o": lambda: _orders_route(ev, ch, args),
         "ord": lambda: _order_action(ev, ch, args),
         "nopay": lambda: _payment_not_received(ev, ch, args),
+        "addr": lambda: _address_decision(ev, ch, args),
         "m": lambda: _sets_route(ev, ch, args),
         "r": lambda: _rotation_route(ev, ch, args),
         "b": lambda: _objects_route(ev, ch, args),
@@ -542,6 +543,41 @@ async def _order_action(ev: Event, ch: Channel, args: list[str]) -> None:
         return
     if ev.chat_id and not _is_orders_chat(ev):
         await _order_card(ev, ch, order_id)
+
+
+async def _address_decision(ev: Event, ch: Channel, args: list[str]) -> None:
+    """Менеджер решает, возим ли мы по адресу вне списка."""
+    if len(args) < 2:
+        return
+    from . import flow          # локально: flow не должен зависеть от админки
+
+    decision, user_pk = args[0], int(args[1])
+    user = await repo.get_user_by_id(user_pk)
+    if user is None:
+        await _answer(ev, ch, "Гость не найден")
+        return
+
+    address = user["custom_address"] or "—"
+    if decision == "ok":
+        await repo.update_user(user["channel"], user["ext_id"],
+                               address_status=repo.ADDRESS_OK)
+        await flow.address_accepted(await repo.get_user_by_id(user_pk))
+        await _answer(ev, ch, f"Адрес принят: {address}"[:180])
+        await ch.send(ev.chat_id, Out(
+            text=f"✅ Адрес <b>{esc(address)}</b> принят — гость уведомлён."))
+        return
+
+    await repo.update_user(user["channel"], user["ext_id"],
+                           address_status=repo.ADDRESS_REJECTED)
+    await flow.address_rejected(await repo.get_user_by_id(user_pk))
+    # черновик сбрасываем: пусть гость выберет дом или напишет другой адрес
+    await repo.save_session(user["channel"], user["ext_id"], "", {},
+                            chat_id=user["chat_id"], object_id=None)
+    await _answer(ev, ch, f"Отказ по адресу: {address}"[:180])
+    await ch.send(ev.chat_id, Out(
+        text=f"⛔ По адресу <b>{esc(address)}</b> отказано — гостя попросили "
+             "выбрать другой.\n\nУже оформленные заказы остаются: отмените их "
+             "в карточке, если доставки не будет."))
 
 
 async def _payment_not_received(ev: Event, ch: Channel, args: list[str]) -> None:
