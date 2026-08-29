@@ -945,8 +945,22 @@ async def main() -> None:
             continue
         if not rendered.strip():
             broken_texts.append(f"{key}: пусто")
+        left = re.findall(r"{[a-zA-Z_][a-zA-Z0-9_]*}", rendered)
+        if left:
+            broken_texts.append(f"{key}: не заполнено {left}")
     check(not broken_texts, f"все {len(defaults.DEFAULT_TEXTS)} текстов бота собираются"
                             + (f" — сломаны: {broken_texts}" if broken_texts else ""))
+
+    # текст правили под новую версию, а бот ещё старый — гость скобок не увидит
+    from app.utils import drop_unknown_placeholders
+    await repo.set_text("faq", "Привозим {delivery_window_new}, спрашивайте: {manager_contact}")
+    rendered = await repo.render_text("faq")
+    check("{" not in rendered, f"неизвестная подстановка вырезана: {rendered!r}")
+    check("@" in rendered, "известные подстановки при этом на месте")
+    cleaned, missing = drop_unknown_placeholders("Утром, {gone}.")
+    check(cleaned == "Утром." and missing == ["gone"],
+          f"пробел и запятая перед точкой прибираются: {cleaned!r}")
+    await repo.set_text("faq", defaults.DEFAULT_TEXTS["faq"])
 
     print("\n— Чёрный список —")
     user = await repo.get_user("tg", GUEST)

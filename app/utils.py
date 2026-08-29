@@ -216,6 +216,25 @@ def slug_code(value: str, fallback: str = "obj") -> str:
     return code or fallback
 
 
+def drop_unknown_placeholders(text: str) -> tuple[str, list[str]]:
+    """Убрать из готового текста подстановки, которые некому было заполнить.
+
+    Такое бывает, когда текст правили под новую версию бота, а сам бот ещё
+    старый. Гостю лучше увидеть фразу без одного уточнения, чем «{delivery_window}»
+    посреди предложения. Возвращаем очищенный текст и список пропавших имён —
+    чтобы записать их в лог.
+    """
+    names = re.findall(r"{([a-zA-Z_][a-zA-Z0-9_]*)}", text)
+    if not names:
+        return text, []
+    cleaned = re.sub(r"{[a-zA-Z_][a-zA-Z0-9_]*}", "", text)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)          # двойные пробелы
+    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)   # пробел перед знаком
+    cleaned = re.sub(r"([,;:])\s*([.!?])", r"\2", cleaned)
+    cleaned = re.sub(r" +$", "", cleaned, flags=re.M)
+    return cleaned, names
+
+
 def safe_format(template: str, **kwargs: Any) -> str:
     """format(), который не падает на неизвестном плейсхолдере в тексте из админки."""
 

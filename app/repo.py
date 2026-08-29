@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import uuid
 from datetime import date
 from typing import Any, Optional, Sequence
 
 from . import db, statuses
-from .utils import fmt_money, safe_format, utc_stamp
+from .utils import drop_unknown_placeholders, fmt_money, safe_format, utc_stamp
+
+log = logging.getLogger(__name__)
 
 #: строка результата: aiosqlite.Row или asyncpg.Record — обе ведут себя как словарь
 Row = Any
@@ -70,7 +73,11 @@ async def render_text(key: str, **kwargs: Any) -> str:
         "delivery_window": kwargs.pop("delivery_window", await default_delivery_window()),
     }
     common.update(kwargs)
-    return safe_format(template, **common)
+    text, missing = drop_unknown_placeholders(safe_format(template, **common))
+    if missing:
+        log.warning("Текст %s: нечем заполнить %s — показал гостю без них",
+                    key, ", ".join(sorted(set(missing))))
+    return text
 
 
 def delivery_window(obj: Optional[Row]) -> str:
