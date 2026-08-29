@@ -545,6 +545,36 @@ async def _order_action(ev: Event, ch: Channel, args: list[str]) -> None:
         await _order_card(ev, ch, order_id)
 
 
+async def _check_orders_chat(chat_id: str) -> str:
+    """Проверить, доходят ли заказы в указанный чат — сразу, а не при первом заказе."""
+    chat_id = chat_id.strip()
+    if not chat_id:
+        return ("ℹ️ Чат не задан — заказы будут приходить лично администраторам.")
+
+    channel = get_channel(TG)
+    if channel is None:
+        return "⚠️ Telegram-канал не запущен, проверить не удалось."
+
+    sent = await channel.send(chat_id, Out(
+        text="✅ <b>Проверка связи</b>\n\nСюда будут приходить заказы."))
+    if sent:
+        where = "группу" if chat_id.startswith("-") else "личный чат"
+        return f"✅ Сообщение доставлено в {where} <code>{esc(chat_id)}</code>."
+
+    hint = ""
+    if not chat_id.startswith("-"):
+        hint = ("\n\nПохоже, это ID пользователя, а не группы: у групп он "
+                "начинается с <code>-100</code>.")
+    return (
+        "⚠️ <b>Сообщение туда не доходит</b>" + hint + "\n\n"
+        "Как узнать нужный ID: добавьте бота в группу менеджеров, дайте ему право "
+        "писать и отправьте в ней команду <code>/id</code> — бот пришлёт ID чата. "
+        "Его и впишите сюда.\n\n"
+        "Пока чат не работает, заказы приходят лично администраторам — "
+        "они не потеряются."
+    )
+
+
 async def _address_decision(ev: Event, ch: Channel, args: list[str]) -> None:
     """Менеджер решает, возим ли мы по адресу вне списка."""
     if len(args) < 2:
@@ -1773,6 +1803,8 @@ async def _in_setting(ev: Event, ch: Channel, ctx: dict, text: str, photo: str) 
     await repo.clear_admin_state(int(ev.user_id))
 
     note = ""
+    if key == "orders_chat_id":
+        note = "\n\n" + await _check_orders_chat(raw)
     if key == "max_token":
         # username для ссылок в QR узнаём сами — администратору вводить нечего
         note = "\n\n" + await _check_max()

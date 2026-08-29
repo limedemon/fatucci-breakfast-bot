@@ -14,7 +14,8 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from . import availability, notify, orders_service, payments, pricing, repo, statuses
+from . import (availability, media, notify, orders_service, payments, pricing, repo,
+               statuses)
 from .channels.base import Btn, Channel, Event, Out, get_channel
 from .utils import (
     chunk,
@@ -37,6 +38,7 @@ Row = Any
 S_NONE = ""
 S_ADDRESS = "address"
 S_REQUEST = "request"
+S_RECEIPT = "receipt"
 S_DATE = "date"
 S_QTY = "qty"
 S_APARTMENT = "apartment"
@@ -247,6 +249,7 @@ async def _on_callback(ev: Event, ch: Channel, user: Row) -> None:
         "cancelall": lambda: _cancel_order(ev, ch, int(arg or 0), whole=True),
         "got": lambda: _confirm_received(ev, ch, int(arg or 0)),
         "paid": lambda: _mark_paid(ev, ch, int(arg or 0)),
+        "paidnp": lambda: _send_paid(ev, ch, int(arg or 0)),
         "date": lambda: _toggle_date(ev, ch, arg),
         "dates": lambda: _dates_done(ev, ch),
         "date_back": lambda: _ask_date(ev, ch),
@@ -476,12 +479,60 @@ async def _confirm_received(ev: Event, ch: Channel, order_id: int) -> None:
 
 
 async def _mark_paid(ev: Event, ch: Channel, order_id: int) -> None:
-    """Гость нажал «Я оплатил» — передаём менеджеру на сверку."""
-    ok, message = await orders_service.guest_marked_paid(order_id, ev.user_id, ev.channel)
-    await _answer(ev, ch, "Спасибо!" if ok else message[:180])
+    """Гость нажал «Я оплатил» — сначала просим скриншот платежа."""
+    order = await repo.get_order(order_id)
+    if order is None or order["ext_id"] != str(ev.user_id) or order["channel"] != ev.channel:
+        await _answer(ev, ch, "Это не ваш заказ")
+        return
+    if order["status"] not in (statuses.NEW, statuses.ACCEPTED):
+        await _answer(ev, ch, f"Заказ уже в статусе «{statuses.label(order['status'])}»")
+        return
+
+    _, data = await _session_object(ev)
+    data["paid_order"] = order_id
+    await _set_state(ev, S_RECEIPT, data)
+    await _answer(ev, ch)
+    await _respond(ev, ch, Out(
+        text=await repo.render_text("ask_receipt"),
+        kb=[[Btn(text="Отправить без скриншота", data=f"g:paidnp:{order_id}")],
+            [Btn(text="⬅️ К заказу", data=f"g:ord:{order_id}")]]), new_message=True)
+
+
+async def _send_paid(ev: Event, ch: Channel, order_id: int, receipt: str = "") -> None:
+    """Сообщить менеджерам об оплате — со скриншотом, если он есть."""
+    _, data = await _session_object(ev)
+    data.pop("paid_order", None)
+    await _set_state(ev, S_NONE, data)
+    ok, message = await orders_service.guest_marked_paid(
+        order_id, ev.user_id, ev.channel, receipt=receipt)
     await _respond(ev, ch, Out(text=message if ok else f"⚠️ {esc(message)}",
                                kb=[[Btn(text="📦 Мои заказы", data="g:my")],
-                                   [_manager_btn()]]))
+                                   [_manager_btn()]]), new_message=True)
+
+
+async def _input_receipt(ev: Event, ch: Channel, data: dict[str, Any]) -> None:
+    """Скриншот оплаты от гостя."""
+    order_id = int(data.get("paid_order") or 0)
+    if not order_id:
+        await _show_main_menu(ev, ch, new_message=True)
+        return
+
+    file_id = str(ev.raw.get("photo_file_id", ""))
+    if not file_id:
+        await ch.send(ev.chat_id, Out(
+            text="⚠️ Нужен именно скриншот — пришлите его картинкой.\n"
+                 "Если скриншота нет, нажмите «Отправить без скриншота».",
+            kb=[[Btn(text="Отправить без скриншота", data=f"g:paidnp:{order_id}")]]))
+        return
+
+    receipt = ""
+    raw = await ch.download_bytes(file_id)
+    key = f"receipt:{order_id}"
+    if raw and await media.save(key, raw):
+        receipt = key
+    else:
+        log.warning("Скриншот оплаты по заказу %s не сохранился", order_id)
+    await _send_paid(ev, ch, order_id, receipt)
 
 
 async def _on_payment(ev: Event, ch: Channel) -> None:
@@ -1142,6 +1193,9 @@ async def _on_text(ev: Event, ch: Channel, user: Row) -> None:
         return
     if state == S_REQUEST:
         await _input_request(ev, ch, text, data)
+        return
+    if state == S_RECEIPT:
+        await _input_receipt(ev, ch, data)
         return
     if state == S_APARTMENT:
         await _input_apartment(ev, ch, text, data)

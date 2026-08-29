@@ -154,7 +154,8 @@ async def _send_invoice(group: list[Row], total: int) -> bool:
     return ok
 
 
-async def guest_marked_paid(order_id: int, ext_id: str, channel: str) -> tuple[bool, str]:
+async def guest_marked_paid(order_id: int, ext_id: str, channel: str,
+                            receipt: str = "") -> tuple[bool, str]:
     """Гость нажал «Я оплатил» — зовём менеджера сверить поступление."""
     order = await repo.get_order(order_id)
     if order is None or order["ext_id"] != str(ext_id) or order["channel"] != channel:
@@ -166,7 +167,7 @@ async def guest_marked_paid(order_id: int, ext_id: str, channel: str) -> tuple[b
     number = order["group_key"] or order["number"]
     await repo.add_event(order["id"], order["status"], "гость", "Отметил заказ как оплаченный")
     await notify.send_to_admins(
-        f"💳 <b>Гость сообщил об оплате</b>\n\n"
+        f"💳 <b>Гость сообщил об оплате</b>{' · со скриншотом' if receipt else ''}\n\n"
         f"Заказ <b>№{number}</b> — {fmt_money(notify.group_total(group))}\n"
         f"{notify.schedule_lines(group)}\n"
         f"{esc(order['object_title'])}, апарт. {esc(order['apartment'])}\n"
@@ -175,6 +176,7 @@ async def guest_marked_paid(order_id: int, ext_id: str, channel: str) -> tuple[b
         [[Btn(text="✅ Подтвердить оплату", data=f"a:ord:{order['id']}:{statuses.PAID}",
               intent="positive")],
          [Btn(text="❌ Оплата не пришла", data=f"a:nopay:{order['id']}", intent="negative")]],
+        photo=receipt,
     )
     return True, await repo.render_text("paid_thanks")
 

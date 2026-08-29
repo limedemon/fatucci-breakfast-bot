@@ -387,7 +387,23 @@ async def main() -> None:
     ch.clear()
     await route(guest_event("callback", GUEST2, payload=f"g:paid:{group[0]['id']}",
                             callback_id="r2"), ch)
+    check("скриншот" in ch.texts().lower(), "после «Я оплатил» бот просит скриншот")
+    check(bool(ch.find_button("g:paidnp:")), "есть путь без скриншота")
+    check(not ch.to(CHAT), "пока скриншота нет, менеджерам ничего не ушло")
+
+    ch.clear()
+    await route(guest_event("text", GUEST2, text="перевёл"), ch)
+    check("картинкой" in ch.texts(), "на текст вместо картинки бот просит именно скрин")
+
+    ch.clear()
+    await route(Event(channel="tg", user_id=GUEST2, chat_id=GUEST2, kind="text",
+                      raw={"photo_file_id": "receipt-1"}), ch)
+    receipt_key = f"receipt:{group[0]['id']}"
+    check(await media.load(receipt_key) is not None, "скриншот сохранён в базе")
+    check(any(out.photo == receipt_key for chat, out in ch.sent if chat == CHAT),
+          "скриншот ушёл в чат менеджеров вместе с сообщением")
     admin_text = ch.to(CHAT)
+    check("со скриншотом" in admin_text, "в сообщении помечено, что скрин приложен")
     check("сообщил об оплате" in admin_text, "менеджеру пришло сообщение об оплате")
     check(group[0]["group_key"] in admin_text, "в нём виден номер заказа")
     check("апарт. 214" in admin_text, "и куда везти")
@@ -411,6 +427,9 @@ async def main() -> None:
     ch.clear()
     await route(guest_event("callback", GUEST2, payload=f"g:paid:{group[0]['id']}",
                             callback_id="r4"), ch)
+    await route(guest_event("callback", GUEST2, payload=f"g:paidnp:{group[0]['id']}",
+                            callback_id="r4b"), ch)
+    check("Спасибо" in ch.to(GUEST2), "без скриншота тоже можно — гостя не держим")
     await route(admin_event("callback", chat_id=CHAT, payload=confirm, callback_id="r5"), ch)
     fresh = await repo.group_orders(group[0]["group_key"])
     check(all(row["status"] == statuses.PAID for row in fresh),

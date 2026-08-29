@@ -166,7 +166,8 @@ async def admin_targets() -> list[str]:
     return [str(admin_id) for admin_id in sorted(await admins.ids())]
 
 
-async def send_to_admins(text: str, kb: Optional[list[list[Btn]]] = None) -> list[dict[str, Any]]:
+async def send_to_admins(text: str, kb: Optional[list[list[Btn]]] = None,
+                         photo: str = "") -> list[dict[str, Any]]:
     channel = get_channel(TG)
     if channel is None:
         log.warning("Telegram-канал не запущен — уведомление админам пропущено")
@@ -174,7 +175,7 @@ async def send_to_admins(text: str, kb: Optional[list[list[Btn]]] = None) -> lis
     sent: list[dict[str, Any]] = []
     targets = await admin_targets()
     for chat_id in targets:
-        message_id = await channel.send(chat_id, Out(text=text, kb=kb))
+        message_id = await channel.send(chat_id, Out(text=text, kb=kb, photo=photo))
         if message_id:
             sent.append({"chat_id": chat_id, "message_id": message_id})
 
@@ -184,7 +185,7 @@ async def send_to_admins(text: str, kb: Optional[list[list[Btn]]] = None) -> lis
         if personal:
             log.warning("Рабочий чат %s недоступен — шлю заказ лично админам", targets)
         for chat_id in personal:
-            message_id = await channel.send(chat_id, Out(text=text, kb=kb))
+            message_id = await channel.send(chat_id, Out(text=text, kb=kb, photo=photo))
             if message_id:
                 sent.append({"chat_id": chat_id, "message_id": message_id})
     return sent
