@@ -33,7 +33,8 @@ TEXT_LIMIT = 4096
 #: подпись постоянной кнопки админа под полем ввода
 ADMIN_BUTTON = "🛠 Админ-панель"
 
-#: подпись постоянной кнопки гостя под полем ввода
+#: подписи постоянных кнопок гостя под полем ввода
+MENU_BUTTON = "🏠 Главное меню"
 SUPPORT_BUTTON = "🆘 Поддержка"
 
 Router = Callable[[Event, Channel], Awaitable[None]]
@@ -118,17 +119,18 @@ class TelegramChannel(Channel):
 
     # ------------------------------------------------ кнопка админ-панели
     def _admin_markup(self) -> ReplyKeyboardMarkup:
-        """Постоянные кнопки администратора: панель и поддержка — в один ряд."""
+        """Постоянные кнопки администратора: панель отдельно, остальное — под ней."""
         return ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text=ADMIN_BUTTON), KeyboardButton(text=SUPPORT_BUTTON)]],
+            keyboard=[[KeyboardButton(text=ADMIN_BUTTON)],
+                      [KeyboardButton(text=MENU_BUTTON), KeyboardButton(text=SUPPORT_BUTTON)]],
             resize_keyboard=True,
             is_persistent=True,
         )
 
     def _support_markup(self) -> ReplyKeyboardMarkup:
-        """Постоянная кнопка под полем ввода — для гостей."""
+        """Постоянные кнопки под полем ввода — для гостей."""
         return ReplyKeyboardMarkup(
-            keyboard=[[KeyboardButton(text=SUPPORT_BUTTON)]],
+            keyboard=[[KeyboardButton(text=MENU_BUTTON), KeyboardButton(text=SUPPORT_BUTTON)]],
             resize_keyboard=True,
             is_persistent=True,
         )

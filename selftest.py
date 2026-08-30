@@ -41,7 +41,8 @@ from app import (availability, courier, db, guide, media, payments,  # noqa: E40
                  pricing, repo, statuses)
 from app.channels import base  # noqa: E402
 from app.channels.base import Channel, Event, Out  # noqa: E402
-from app.channels.telegram import ADMIN_BUTTON, SUPPORT_BUTTON  # noqa: E402
+from app.channels.telegram import (ADMIN_BUTTON, MENU_BUTTON,  # noqa: E402
+                                   SUPPORT_BUTTON)
 from app.router import route  # noqa: E402
 from app.utils import fmt_date_iso, today, utc_stamp  # noqa: E402
 
@@ -835,9 +836,9 @@ async def main() -> None:
     from app.channels.telegram import TelegramChannel
 
     tg = TelegramChannel.__new__(TelegramChannel)
-    labels = [b.text for row in tg._admin_markup().keyboard for b in row]
-    check(labels == [ADMIN_BUTTON, SUPPORT_BUTTON],
-          f"у админа под полем ввода обе кнопки в одном ряду: {labels}")
+    rows = [[b.text for b in row] for row in tg._admin_markup().keyboard]
+    check(rows == [[ADMIN_BUTTON], [MENU_BUTTON, SUPPORT_BUTTON]],
+          f"у админа: панель сверху, меню и поддержка под ней — {rows}")
 
     # ключевое: постоянные кнопки не должны исчезать ни от меню, ни от чего ещё
     menu_like = Out(text="меню", kb=[[Btn(text="🥐 Заказать", data="g:order")]])
@@ -848,22 +849,36 @@ async def main() -> None:
     plain = await tg._markup(GUEST, Out(text="просто текст"))
     check(isinstance(plain, ReplyKeyboardMarkup),
           "сообщение без кнопок под текстом обновляет постоянные кнопки")
-    check([b.text for row in plain.keyboard for b in row] == [SUPPORT_BUTTON],
-          "гостю возвращается его кнопка, а не пустая клавиатура")
+    check([[b.text for b in row] for row in plain.keyboard] == [[MENU_BUTTON, SUPPORT_BUTTON]],
+          "гостю возвращаются «Главное меню» и «Поддержка» одним рядом")
 
     admin_plain = await tg._markup(ADMIN, Out(text="просто текст"))
     check([b.text for row in admin_plain.keyboard for b in row]
-          == [ADMIN_BUTTON, SUPPORT_BUTTON], "админу возвращаются обе кнопки")
+          == [ADMIN_BUTTON, MENU_BUTTON, SUPPORT_BUTTON], "админу возвращаются все кнопки")
 
     contact = await tg._markup(GUEST, Out(text="телефон?", reply_contact="📱 Отправить телефон"))
     rows = [[b.text for b in row] for row in contact.keyboard]
-    check(rows == [["📱 Отправить телефон"], [SUPPORT_BUTTON]],
-          f"на шаге телефона поддержка остаётся рядом: {rows}")
+    check(rows == [["📱 Отправить телефон"], [MENU_BUTTON, SUPPORT_BUTTON]],
+          f"на шаге телефона постоянные кнопки остаются рядом: {rows}")
     check(any(b.request_contact for row in contact.keyboard for b in row),
           "кнопка отправки телефона осталась рабочей")
 
     check(await tg._markup(CHAT, Out(text="заказ")) is None,
           "в рабочем чате менеджеров клавиатуру под вводом не ставим")
+
+    ch.clear()
+    await route(guest_event("text", text=MENU_BUTTON), ch)
+    check(bool(ch.find_button("g:order")) or bool(ch.find_button("g:obj:")),
+          "кнопка «Главное меню» открывает начальный экран")
+
+    ch.clear()
+    await route(guest_event("text", text=MENU_BUTTON, who=GUEST2), ch)
+    check(bool(ch.sent), "кнопка работает у любого гостя")
+
+    ch.clear()
+    await route(Event(channel="tg", user_id=GUEST, chat_id=CHAT, kind="callback",
+                      payload="a:h", callback_id="deny"), ch)
+    check(not ch.sent, "чужому нажатию админской кнопки бот ничего не шлёт в чат")
 
     ch.clear()
     await route(admin_event("text", text=SUPPORT_BUTTON), ch)

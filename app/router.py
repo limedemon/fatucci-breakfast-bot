@@ -5,7 +5,7 @@ import logging
 
 from . import admin, admins, flow, repo
 from .channels.base import TG, Btn, Channel, Event, Out
-from .channels.telegram import ADMIN_BUTTON, SUPPORT_BUTTON
+from .channels.telegram import ADMIN_BUTTON, MENU_BUTTON, SUPPORT_BUTTON
 
 log = logging.getLogger(__name__)
 
@@ -22,6 +22,10 @@ async def _route(ev: Event, ch: Channel) -> None:
     if text == ADMIN_BUTTON:
         # нажали постоянную кнопку под полем ввода — это то же самое, что /admin
         ev.text = text = "/admin"
+
+    if text == MENU_BUTTON:
+        # «Главное меню» под полем ввода = /menu, откуда бы её ни нажали
+        ev.text = text = "/menu"
 
     # кнопка «Поддержка» работает в любой момент и не сбивает оформление заказа
     if text == SUPPORT_BUTTON or text == "/support":
@@ -46,10 +50,18 @@ async def _route(ev: Event, ch: Channel) -> None:
     if ch.name == TG and not is_group:
         await _claim_owner(ev, ch)
 
-    if ch.name == TG and await admins.is_admin(ev.user_id):
-        if ev.kind == "callback" and (ev.payload or "").startswith("a:"):
-            await admin.handle_callback(ev, ch)
+    if ev.kind == "callback" and (ev.payload or "").startswith("a:"):
+        # кнопки менеджеров: не админу отвечаем понятно, а не молчим
+        if not (ch.name == TG and await admins.is_admin(ev.user_id)):
+            await ch.answer_callback(
+                ev.callback_id,
+                "Эти кнопки доступны только администраторам бота. "
+                "Если вы админ — нажмите от своего имени, а не от имени группы.")
             return
+        await admin.handle_callback(ev, ch)
+        return
+
+    if ch.name == TG and await admins.is_admin(ev.user_id):
         # ввод для админки принимаем только в личном чате с ботом,
         # чтобы обычная переписка в рабочем чате не попала в форму
         if ev.kind == "text" and not is_group and await admin.handle_text(ev, ch):
