@@ -70,6 +70,7 @@ class FakeChannel(Channel):
         self.invoices: list[dict] = []
         self.admin_button_shown = False
         self.support_button_shown = False
+        self.chat_admins: set[str] = set()
         self.description = ""
         self._id = 0
 
@@ -102,6 +103,9 @@ class FakeChannel(Channel):
     async def set_description(self, text: str) -> bool:
         self.description = text
         return True
+
+    async def is_chat_admin(self, chat_id: str, user_id: str) -> bool:
+        return str(user_id) in self.chat_admins
 
     async def show_admin_button(self, chat_id: str, text: str) -> bool:
         self.admin_button_shown = True
@@ -963,7 +967,7 @@ async def main() -> None:
 
     ch.clear()
     await route(admin_event("text", chat_id=GROUP, text="/clip@fatucci_test_bot"), ch)
-    check("уже рабочий" in ch.texts(), "повторная привязка не дублируется")
+    check("уже привязан" in ch.texts(), "повторная привязка не дублируется")
 
     ch.clear()
     await route(admin_event("text", text="/clip"), ch)
@@ -976,6 +980,96 @@ async def main() -> None:
     check("НОВЫЙ ЗАКАЗ" in ch.to(GROUP), "новый заказ пришёл в привязанный чат")
 
     await repo.set_setting("orders_chat_id", before)
+
+    print("\n— Отзывы —")
+    REVIEWS, REVIEWER = "-1008888", "558"
+    ch.clear()
+    await route(admin_event("text", chat_id=REVIEWS, text="/clip2"), ch)
+    check(await repo.get_setting("reviews_chat_id") == REVIEWS, "чат отзывов привязан /clip2")
+    check("отзывы" in ch.texts().lower(), "бот сказал, что сюда пойдут отзывы")
+
+    # отзыв просят после первого завершённого заказа — берём гостя без истории
+    await repo.set_setting("pm_token", TEST_TOKEN)
+    group = await place_order(ch, dates=1, qty=1, who=REVIEWER)
+    await route(admin_event("callback", chat_id=CHAT,
+                            payload=f"a:ord:{group[0]['id']}:{statuses.ACCEPTED}",
+                            callback_id="v1"), ch)
+    await route(admin_event("callback", chat_id=CHAT,
+                            payload=f"a:ord:{group[0]['id']}:{statuses.DELIVERED}",
+                            callback_id="v2"), ch)
+    ch.clear()
+    await route(guest_event("callback", REVIEWER, payload=f"g:got:{group[0]['id']}",
+                            callback_id="v3"), ch)
+    stars = ch.find_all("g:star:")
+    check(len(stars) == 5, f"после первого завершённого заказа предложены 5 оценок ({len(stars)})")
+    check("Как вам завтрак" in ch.to(REVIEWER), "приглашение оставить отзыв пришло гостю")
+
+    ch.clear()
+    await route(guest_event("callback", REVIEWER, payload=stars[4], callback_id="v4"), ch)
+    check("Пропустить" in "".join(b.text for row in ch.last().kb or [] for b in row),
+          "после оценки можно пропустить комментарий")
+    review = (await repo.last_reviews(1))[0]
+    check(review["stars"] == 5, f"оценка сохранена ({review['stars']})")
+
+    ch.clear()
+    await route(Event(channel="tg", user_id=REVIEWER, chat_id=REVIEWER, kind="text",
+                      text="Всё очень вкусно, спасибо!", raw={"photo_file_id": "rev-1"}), ch)
+    review = await repo.get_review(review["id"])
+    check(review["comment"] == "Всё очень вкусно, спасибо!", "комментарий сохранён")
+    check(review["photo_key"] == f"review:{review['id']}", "фото сохранено")
+    check(bool(review["sent"]), "отзыв отмечен как отправленный")
+
+    posted = [out for chat, out in ch.sent if chat == REVIEWS]
+    check(len(posted) == 1, f"в чат отзывов ушло одно сообщение ({len(posted)})")
+    if posted:
+        check("★★★★★" in posted[0].text, "в нём видны звёзды")
+        check("Всё очень вкусно" in posted[0].text, "и комментарий")
+        check(posted[0].photo == review["photo_key"], "и фото приложено")
+    check("Спасибо за отзыв" in ch.to(REVIEWER), "гостя поблагодарили")
+
+    # второй завершённый заказ отзыв не просит
+    group = await place_order(ch, dates=1, qty=1, who=REVIEWER)
+    await route(admin_event("callback", chat_id=CHAT,
+                            payload=f"a:ord:{group[0]['id']}:{statuses.ACCEPTED}",
+                            callback_id="v5"), ch)
+    ch.clear()
+    await route(admin_event("callback", chat_id=CHAT,
+                            payload=f"a:ord:{group[0]['id']}:{statuses.RECEIVED}",
+                            callback_id="v6"), ch)
+    check(not ch.find_button("g:star:"), "после второго заказа отзыв не просят")
+
+    print("\n— Кнопки менеджеров в группе —")
+    ch.clear()
+    ch.chat_admins = {GUEST}          # гость — админ рабочего чата, но не бота
+    await repo.set_setting("orders_chat_id", CHAT)
+    await route(Event(channel="tg", user_id=GUEST, chat_id=CHAT, kind="callback",
+                      payload=f"a:ord:{group[0]['id']}:{statuses.DELIVERED}",
+                      callback_id="g1"), ch)
+    fresh = await repo.get_order(group[0]["id"])
+    check(fresh["status"] == statuses.DELIVERED, "админ рабочего чата может жать кнопки")
+
+    ch.clear()
+    await route(Event(channel="tg", user_id="1087968824", chat_id=CHAT, kind="callback",
+                      payload=f"a:ord:{group[0]['id']}:{statuses.RECEIVED}",
+                      callback_id="g2"), ch)
+    fresh = await repo.get_order(group[0]["id"])
+    check(fresh["status"] == statuses.RECEIVED, "сообщение от имени группы тоже принимается")
+
+    ch.chat_admins = set()
+    ch.clear()
+    await route(Event(channel="tg", user_id=GUEST, chat_id=CHAT, kind="callback",
+                      payload=f"a:ord:{group[0]['id']}:{statuses.CANCELLED}",
+                      callback_id="g3"), ch)
+    fresh = await repo.get_order(group[0]["id"])
+    check(fresh["status"] == statuses.RECEIVED, "посторонний в группе кнопки не нажмёт")
+
+    print("\n— Кому идёт ежедневное напоминание —")
+    await repo.set_setting("daily_remind_time", "00:00")
+    await repo.set_setting("daily_remind_sent", "")
+    await repo.set_setting("daily_remind_ordered", "1")
+    check(await repo.get_bool("daily_remind_ordered"),
+          "переключатель «напоминать и тем, кто уже заказал» есть")
+    await repo.set_setting("daily_remind_ordered", "0")
 
     print("\n— Админка —")
     ch.clear()

@@ -110,6 +110,10 @@ class Channel(ABC):
         """Закрепить кнопку админ-панели под полем ввода (есть только в Telegram)."""
         return False
 
+    async def is_chat_admin(self, chat_id: str, user_id: str) -> bool:
+        """Админ ли пользователь в этом чате (есть только в Telegram)."""
+        return False
+
     async def show_support_button(self, chat_id: str, text: str) -> bool:
         """Закрепить кнопку «Поддержка» под полем ввода (есть только в Telegram)."""
         return False

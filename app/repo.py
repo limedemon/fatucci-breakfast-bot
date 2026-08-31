@@ -427,6 +427,40 @@ async def broadcast_targets(channel: str = "") -> list[Row]:
     return await db.fetchall(sql, params)
 
 
+# ==================================================================== отзывы
+async def create_review(channel: str, ext_id: str, order_no: str, stars: int) -> int:
+    return await db.insert(
+        "INSERT INTO reviews (channel, ext_id, order_no, stars) VALUES (?, ?, ?, ?)",
+        (channel, str(ext_id), order_no, int(stars)))
+
+
+async def get_review(review_id: int) -> Optional[Row]:
+    return await db.fetchone("SELECT * FROM reviews WHERE id = ?", (int(review_id),))
+
+
+async def update_review(review_id: int, **fields: Any) -> None:
+    data = {k: v for k, v in fields.items()
+            if k in ("stars", "comment", "photo_key", "sent")}
+    if not data:
+        return
+    sets = ", ".join(f"{k} = ?" for k in data)
+    await db.execute(f"UPDATE reviews SET {sets} WHERE id = ?",
+                     [*data.values(), int(review_id)])
+
+
+async def last_reviews(limit: int = 10) -> list[Row]:
+    return await db.fetchall("SELECT * FROM reviews ORDER BY id DESC LIMIT ?", (limit,))
+
+
+async def count_success_orders(channel: str, ext_id: str) -> int:
+    """Сколько заказов гость довёл до конца — считаем заказами, а не датами."""
+    value = await db.fetchval(
+        "SELECT COUNT(DISTINCT COALESCE(NULLIF(group_key, ''), number)) FROM orders "
+        "WHERE channel = ? AND ext_id = ? AND status = ?",
+        (channel, str(ext_id), statuses.RECEIVED), 0)
+    return int(value or 0)
+
+
 # ==================================================================== сессии
 async def get_session(channel: str, ext_id: str) -> Optional[Row]:
     return await db.fetchone(

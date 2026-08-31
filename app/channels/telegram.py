@@ -135,6 +135,15 @@ class TelegramChannel(Channel):
             is_persistent=True,
         )
 
+    async def is_chat_admin(self, chat_id: str, user_id: str) -> bool:
+        """Проверить права в конкретном чате — чтобы менеджеры жали кнопки заказов."""
+        try:
+            member = await self.bot.get_chat_member(chat_id, int(user_id))
+        except (TelegramAPIError, TypeError, ValueError) as exc:
+            log.debug("get_chat_member(%s, %s): %s", chat_id, user_id, exc)
+            return False
+        return member.status in ("creator", "administrator")
+
     async def set_description(self, text: str) -> bool:
         """Текст, который гость видит до нажатия Start."""
         if not text.strip():

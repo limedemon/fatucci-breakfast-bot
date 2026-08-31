@@ -212,6 +212,18 @@ CREATE TABLE IF NOT EXISTS qr_visits (
     PRIMARY KEY (code, d, channel)
 );
 
+CREATE TABLE IF NOT EXISTS reviews (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel    TEXT NOT NULL,
+    ext_id     TEXT NOT NULL,
+    order_no   TEXT NOT NULL DEFAULT '',
+    stars      INTEGER NOT NULL DEFAULT 0,
+    comment    TEXT NOT NULL DEFAULT '',
+    photo_key  TEXT NOT NULL DEFAULT '',
+    sent       INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS admin_state (
     admin_id INTEGER PRIMARY KEY,
     state    TEXT NOT NULL DEFAULT '',
@@ -520,6 +532,7 @@ def where() -> str:
 #: таблицы, которые показываем в проверке базы: (таблица, подпись)
 HEALTH_TABLES = [
     ("orders", "Заказов"),
+    ("reviews", "Отзывов"),
     ("order_events", "Записей истории"),
     ("users", "Гостей"),
     ("objects", "Объектов"),

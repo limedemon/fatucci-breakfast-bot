@@ -230,6 +230,32 @@ async def new_object_request(channel_name: str, user_id: str, username: str,
     return await send_to_admin_dms("\n".join(lines), kb)
 
 
+async def send_review(review: Row, user: Row) -> bool:
+    """Отзыв — одним сообщением в чат отзывов (или менеджерам, если он не задан)."""
+    channel = get_channel(TG)
+    if channel is None:
+        return False
+
+    stars = max(0, min(5, int(review["stars"] or 0)))
+    lines = ["⭐️ <b>Новый отзыв</b>", "", "★" * stars + "☆" * (5 - stars) + f"  {stars} из 5"]
+    if review["comment"]:
+        lines += ["", f"«{esc(review['comment'])}»"]
+    who = esc((user["full_name"] if user else "") or "гость")
+    if user and user["username"]:
+        who += f" (@{esc(user['username'])})"
+    tail = f"Гость: {who}"
+    if review["order_no"]:
+        tail += f" · заказ №{esc(review['order_no'])}"
+    lines += ["", tail]
+
+    target = (await repo.get_setting("reviews_chat_id")).strip()
+    out = Out(text="\n".join(lines), photo=review["photo_key"] or "")
+    if target:
+        return bool(await channel.send(target, out))
+    # чат отзывов не привязан — не теряем отзыв, шлём менеджерам
+    return bool(await send_to_admins(out.text, photo=out.photo))
+
+
 async def new_address(user: Row, address: str) -> None:
     """Гость заказывает по адресу вне списка — сообщаем в рабочий чат.
 

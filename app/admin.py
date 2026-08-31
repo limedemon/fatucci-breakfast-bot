@@ -88,6 +88,8 @@ OFFER_FIELDS: list[FieldSpec] = [
 SETTING_SECTIONS: dict[str, tuple[str, list[FieldSpec]]] = {
     "gen": ("⚙️ Общие", [
         ("orders_chat_id", "Чат для заказов (проще — /clip в группе)", "text"),
+        ("reviews_chat_id", "Чат для отзывов (проще — /clip2 в группе)", "text"),
+        ("review_after", "После каких заказов просить отзыв", "text"),
         ("manager_contact", "Контакт менеджера", "text"),
         ("manager_phone", "Телефон менеджера", "text"),
         ("support_contact", "Контакт техподдержки", "text"),
@@ -110,6 +112,7 @@ SETTING_SECTIONS: dict[str, tuple[str, list[FieldSpec]]] = {
         ("daily_remind_enabled", "Ежедневное «успейте заказать»", "bool"),
         ("daily_remind_time", "Во сколько напоминать", "time"),
         ("daily_remind_audience", "Кому: all или buyers", "text"),
+        ("daily_remind_ordered", "Напоминать и тем, кто уже заказал", "bool"),
     ]),
     "price": ("💰 Цены и скидки", [
         ("custom_price_kop", "Цена для адресов вне списка", "money_opt"),

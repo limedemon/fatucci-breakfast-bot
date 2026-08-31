@@ -39,6 +39,7 @@ S_NONE = ""
 S_ADDRESS = "address"
 S_REQUEST = "request"
 S_RECEIPT = "receipt"
+S_REVIEW = "review"
 S_DATE = "date"
 S_QTY = "qty"
 S_APARTMENT = "apartment"
@@ -250,6 +251,8 @@ async def _on_callback(ev: Event, ch: Channel, user: Row) -> None:
         "got": lambda: _confirm_received(ev, ch, int(arg or 0)),
         "paid": lambda: _mark_paid(ev, ch, int(arg or 0)),
         "paidnp": lambda: _send_paid(ev, ch, int(arg or 0)),
+        "star": lambda: _pick_stars(ev, ch, parts[2:]),
+        "revskip": lambda: _finish_review(ev, ch, int(arg or 0)),
         "date": lambda: _toggle_date(ev, ch, arg),
         "dates": lambda: _dates_done(ev, ch),
         "date_back": lambda: _ask_date(ev, ch),
@@ -572,6 +575,72 @@ async def _start_order(ev: Event, ch: Channel) -> None:
         await _ask_object(ev, ch)
         return
     await _ask_date(ev, ch)
+
+
+# ------------------------------------------------------------------ отзывы
+async def offer_review(order: Row) -> None:
+    """Предложить оценить сервис — после первого и пятого завершённых заказов."""
+    channel = get_channel(order["channel"])
+    if channel is None:
+        return
+    kb = [[Btn(text="★" * n, data=f"g:star:{order['id']}:{n}") for n in (1, 2, 3)],
+          [Btn(text="★" * n, data=f"g:star:{order['id']}:{n}") for n in (4, 5)]]
+    await channel.send(order["chat_id"] or order["ext_id"],
+                       Out(text=await repo.render_text("ask_review"), kb=kb))
+
+
+async def _pick_stars(ev: Event, ch: Channel, args: list[str]) -> None:
+    """Гость выбрал оценку — заводим отзыв и просим пару слов."""
+    if len(args) < 2:
+        return
+    order = await repo.get_order(int(args[0] or 0))
+    stars = max(1, min(5, int(args[1] or 5)))
+    number = (order["group_key"] or order["number"]) if order else ""
+    review_id = await repo.create_review(ev.channel, str(ev.user_id), number, stars)
+
+    _, data = await _session_object(ev)
+    data["review_id"] = review_id
+    await _set_state(ev, S_REVIEW, data)
+    await _answer(ev, ch, "Спасибо!")
+    await _respond(ev, ch, Out(
+        text="★" * stars + "☆" * (5 - stars) + "\n\n"
+             + await repo.render_text("ask_review_text"),
+        kb=[[Btn(text=SKIP_LABEL, data=f"g:revskip:{review_id}")]]))
+
+
+async def _input_review(ev: Event, ch: Channel, text: str, data: dict[str, Any]) -> None:
+    """Комментарий к отзыву: текст, фото или и то и другое."""
+    review_id = int(data.get("review_id") or 0)
+    if not review_id:
+        await _show_main_menu(ev, ch, new_message=True)
+        return
+
+    file_id = str(ev.raw.get("photo_file_id", ""))
+    photo_key = ""
+    if file_id:
+        raw = await ch.download_bytes(file_id)
+        key = f"review:{review_id}"
+        if raw and await media.save(key, raw):
+            photo_key = key
+    await repo.update_review(review_id, comment=text.strip()[:600], photo_key=photo_key)
+    await _finish_review(ev, ch, review_id)
+
+
+async def _finish_review(ev: Event, ch: Channel, review_id: int) -> None:
+    """Отправить готовый отзыв и поблагодарить гостя."""
+    _, data = await _session_object(ev)
+    data.pop("review_id", None)
+    await _set_state(ev, S_NONE, data)
+
+    review = await repo.get_review(review_id)
+    if review is not None and not review["sent"]:
+        user = await repo.get_user(ev.channel, ev.user_id)
+        if await notify.send_review(review, user):
+            await repo.update_review(review_id, sent=1)
+    await _answer(ev, ch, "Спасибо!")
+    await _respond(ev, ch, Out(text=await repo.render_text("review_thanks"),
+                               kb=[[Btn(text="🥐 Заказать ещё", data="g:order")]]),
+                   new_message=True)
 
 
 # ------------------------------------------------------- выбор апартаментов
@@ -1196,6 +1265,9 @@ async def _on_text(ev: Event, ch: Channel, user: Row) -> None:
         return
     if state == S_RECEIPT:
         await _input_receipt(ev, ch, data)
+        return
+    if state == S_REVIEW:
+        await _input_review(ev, ch, text, data)
         return
     if state == S_APARTMENT:
         await _input_apartment(ev, ch, text, data)

@@ -70,15 +70,16 @@ async def daily_remind_tick() -> int:
 
     tomorrow = fmt_date_iso(current.date() + timedelta(days=1))
     only_buyers = (await repo.get_setting("daily_remind_audience", "all")).strip() == "buyers"
+    remind_ordered = await repo.get_bool("daily_remind_ordered", False)
     text = await repo.render_text("daily_reminder")
     kb = [[Btn(text="🥐 Заказать завтрак", data="g:order", intent="positive")]]
 
     sent = 0
     for row in await repo.broadcast_targets():
-        if await repo.count_orders(user_key=(row["channel"], row["ext_id"]),
-                                   date_from=tomorrow, date_to=tomorrow,
-                                   status="new,accepted,paid"):
-            continue                       # на завтра заказ уже есть
+        if not remind_ordered and await repo.count_orders(
+                user_key=(row["channel"], row["ext_id"]),
+                date_from=tomorrow, date_to=tomorrow, status="new,accepted,paid"):
+            continue        # на завтра заказ уже есть — по умолчанию не тревожим
         if only_buyers and not await repo.count_orders(
                 user_key=(row["channel"], row["ext_id"])):
             continue

@@ -80,6 +80,7 @@ async def _notify_guest(group: list[Row], order: Row, status: str, note: str = "
     if status == statuses.RECEIVED:
         text = await notify.group_status_text([order], "status_received")
         await notify.notify_guest(order, text, [[Btn(text="🥐 Заказать ещё", data="g:order")]])
+        await _maybe_offer_review(order)
         return
 
     if status == statuses.REJECTED:
@@ -91,6 +92,27 @@ async def _notify_guest(group: list[Row], order: Row, status: str, note: str = "
     if status == statuses.CANCELLED:
         text = await notify.group_status_text([order], "status_cancelled")
         await notify.notify_guest(order, text)
+
+
+async def _maybe_offer_review(order: Row) -> None:
+    """Просим отзыв после первого и пятого доведённого до конца заказа.
+
+    Номера настраиваются («После каких заказов просить отзыв»): так можно
+    спросить один раз, а можно вернуться к теме у постоянных гостей.
+    """
+    from . import flow
+
+    raw = await repo.get_setting("review_after", "1,5")
+    wanted = {int(part) for part in raw.replace(" ", "").split(",") if part.isdigit()}
+    if not wanted:
+        return
+    done = await repo.count_success_orders(order["channel"], order["ext_id"])
+    if done not in wanted:
+        return
+    try:
+        await flow.offer_review(order)
+    except Exception:  # noqa: BLE001
+        log.exception("Не удалось предложить отзыв по заказу %s", order["number"])
 
 
 # ------------------------------------------------------------------- оплата
