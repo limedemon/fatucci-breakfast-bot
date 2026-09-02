@@ -1203,6 +1203,24 @@ async def main() -> None:
           "другой формат отклоняется с подсказкой, значение не портится")
 
     ch.clear()
+    await route(admin_event("callback", payload=f"a:b:c:{obj['id']}", callback_id="w1c"), ch)
+    check("Время доставки: с 09:00 до 10:00" in ch.texts(),
+          "окно видно прямо в карточке объекта")
+
+    # новый дом наследует расписание, а не остаётся с «к 09:00»
+    ch.clear()
+    await route(admin_event("callback", payload="a:b:n", callback_id="w1d"), ch)
+    await route(admin_event("text", text="Тестовый дом"), ch)
+    await route(admin_event("text", text="г. Сочи, ул. Тестовая, д. 1"), ch)
+    await route(admin_event("text", text="1000"), ch)
+    fresh = next(o for o in await repo.list_objects() if o["title"] == "Тестовый дом")
+    check(repo.delivery_window(fresh) == "с 09:00 до 10:00",
+          f"новый дом получил окно доставки: {repo.delivery_window(fresh)}")
+    check(fresh["cutoff_time"] == obj["cutoff_time"], "и время приёма заказов")
+    check("Доставка: с 09:00 до 10:00" in ch.texts(), "об этом сказано при создании")
+    await repo.delete_object(fresh["id"])
+
+    ch.clear()
     await route(guest_event("start", payload="demo1"), ch)
     check("с 09:00 до 10:00" in ch.texts(), "окно видно в приветствии")
     for payload, where in [("g:delivery", "разделе «Доставка»"),

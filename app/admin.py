@@ -827,6 +827,7 @@ async def _object_card(ev: Event, ch: Channel, object_id: int) -> None:
         f"📍 Адрес: {esc(obj['address']) or '—'}\n"
         f"💰 Цена завтрака: <b>{fmt_money(obj['price_kop'])}</b>\n"
         f"🚚 Дни доставки: {fmt_days(obj['delivery_days'])}\n"
+        f"🕘 Время доставки: {esc(repo.delivery_window(obj))}\n"
         f"⏰ Приём заказов до: {esc(obj['cutoff_time'])} (за {obj['lead_days']} дн.)\n"
         f"📅 Горизонт заказа: {obj['max_days_ahead']} дн.\n"
         f"🔢 Наборов: от {obj['min_qty']} до {obj['max_qty']}\n"
@@ -1676,14 +1677,30 @@ async def _in_obj_new(ev: Event, ch: Channel, ctx: dict, text: str, photo: str) 
     while await repo.code_taken(code):
         suffix += 1
         code = f"{base_code}{suffix}"
+    # новый дом наследует расписание уже настроенного — чтобы не забыть
+    # проставить окно доставки и получить «к 09:00» вместо «с 09:00 до 10:00»
+    sample = next(iter(await repo.list_objects(active_only=True, selectable=True)), None)
+    schedule = {}
+    if sample is not None:
+        schedule = {
+            "delivery_time": sample["delivery_time"],
+            "delivery_time_to": sample["delivery_time_to"],
+            "cutoff_time": sample["cutoff_time"],
+            "delivery_days": sample["delivery_days"],
+            "lead_days": sample["lead_days"],
+            "max_days_ahead": sample["max_days_ahead"],
+        }
     object_id = await repo.create_object(
         code=code, title=data["title"], address=data["address"], price_kop=price,
         group_title="", min_qty=await repo.get_int("default_min_qty", 1),
-        max_qty=await repo.get_int("default_max_qty", 10),
+        max_qty=await repo.get_int("default_max_qty", 10), **schedule,
     )
     await repo.clear_admin_state(int(ev.user_id))
     await ch.send(ev.chat_id, Out(
-        text=f"✅ Объект <b>{esc(data['title'])}</b> создан.\nКод QR: <code>{esc(code)}</code>",
+        text=f"✅ Объект <b>{esc(data['title'])}</b> создан.\n"
+             f"Код QR: <code>{esc(code)}</code>\n"
+             f"🕘 Доставка: {esc(repo.delivery_window(await repo.get_object(object_id)))}"
+             + ("" if sample is None else " — как у остальных домов"),
         kb=[[Btn(text="🔗 Получить QR", data=f"a:q:o:{object_id}")],
             [Btn(text="⚙️ Настроить объект", data=f"a:b:c:{object_id}")]]))
 
