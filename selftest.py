@@ -1123,6 +1123,44 @@ async def main() -> None:
     await route(admin_event("callback", payload="a:q:o:1", callback_id="x2"), ch)
     check("[png" in ch.texts(), "QR-код генерируется картинкой")
 
+    print("\n— Меню сетов листается —")
+    ch.clear()
+    await route(guest_event("callback", payload="g:sets", callback_id="c1"), ch)
+    sets_count = len(await repo.list_sets(active_only=True))
+    def btn_labels() -> str:
+        return " ".join(b.text for row in ch.last().kb or [] for b in row)
+
+    check(f"1 из {sets_count}" in btn_labels(), "видно, какой сет по счёту показан")
+    check(bool(ch.find_button("g:sets:1")) and bool(ch.find_button("g:sets:-1")),
+          "есть стрелки вперёд и назад")
+    check(bool(ch.find_button("g:order")), "заказать можно прямо отсюда")
+    first = ch.last().text
+
+    ch.clear()
+    await route(guest_event("callback", payload="g:sets:1", callback_id="c2"), ch)
+    check(ch.last().text != first, "стрелка показывает следующий сет")
+    check(f"2 из {sets_count}" in btn_labels(), "счётчик сменился")
+
+    ch.clear()
+    await route(guest_event("callback", payload=f"g:sets:{sets_count}", callback_id="c3"), ch)
+    check(f"1 из {sets_count}" in btn_labels(),
+          "после последнего сета листание идёт по кругу")
+
+    ch.clear()
+    await route(guest_event("callback", payload="g:sets:-1", callback_id="c4"), ch)
+    check(f"{sets_count} из {sets_count}" in btn_labels(),
+          "и назад с первого — на последний")
+
+    print("\n— Подсказки в заказе —")
+    ch.clear()
+    await route(guest_event("start", payload="demo1"), ch)
+    await route(guest_event("callback", payload="g:order", callback_id="c5"), ch)
+    check("Нажмите на дату" in ch.texts(), "на экране дат сказано, что нужно нажать дату")
+    first_date = ch.find_button("g:date:")
+    ch.clear()
+    await route(guest_event("callback", payload=first_date, callback_id="c6"), ch)
+    check("Далее" in ch.texts(), "после выбора подсказывают нажать «Далее»")
+
     print("\n— Фотография сета —")
     target = (await repo.list_sets())[0]
     ch.clear()

@@ -12,6 +12,7 @@ from aiogram.exceptions import TelegramAPIError, TelegramBadRequest, TelegramFor
 from aiogram.filters import Command, CommandObject, CommandStart
 from aiogram.types import (
     BufferedInputFile,
+    InputMediaPhoto,
     CallbackQuery,
     LabeledPrice,
     InlineKeyboardButton,
@@ -180,6 +181,8 @@ class TelegramChannel(Channel):
             return False
 
     async def edit(self, chat_id: str, message_id: str, out: Out) -> bool:
+        if out.photo:
+            return await self._edit_photo(chat_id, message_id, out)
         try:
             await self.bot.edit_message_text(
                 chat_id=chat_id,
@@ -194,6 +197,39 @@ class TelegramChannel(Channel):
             return False
         except TelegramAPIError:
             return False
+
+    async def _edit_photo(self, chat_id: str, message_id: str, out: Out) -> bool:
+        """Подменить картинку и подпись в том же сообщении.
+
+        Нужно для листания: гость нажимает стрелку, и сет меняется на месте,
+        а не уезжает новым сообщением вниз чата.
+        """
+        key = out.photo
+        cached = await repo.get_media_ref(key, TG)
+        data = None if cached else await media.load(key)
+        if not cached and data is None:
+            return False
+        photo: object = cached or BufferedInputFile(data or b"", _filename(key))
+        try:
+            message = await self.bot.edit_message_media(
+                chat_id=chat_id,
+                message_id=int(message_id),
+                media=InputMediaPhoto(media=photo,
+                                      caption=_cut(out.text, CAPTION_LIMIT),
+                                      parse_mode=ParseMode.HTML),
+                reply_markup=self._inline(out.kb),
+            )
+        except TelegramBadRequest as exc:
+            if "message is not modified" in str(exc).lower():
+                return True
+            log.debug("edit_message_media: %s", exc)
+            return False
+        except TelegramAPIError as exc:
+            log.debug("edit_message_media: %s", exc)
+            return False
+        if getattr(message, "photo", None):
+            await repo.set_media_ref(key, TG, message.photo[-1].file_id)
+        return True
 
     async def answer_callback(self, callback_id: str, text: str = "") -> None:
         try:

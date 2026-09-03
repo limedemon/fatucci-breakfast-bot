@@ -84,7 +84,7 @@ class Channel(ABC):
 
     async def send_or_edit(self, chat_id: str, message_id: str, out: Out) -> str:
         """Отредактировать, а если не вышло — отправить заново."""
-        if message_id and not out.photo and not out.reply_contact:
+        if message_id and not out.reply_contact:
             if await self.edit(chat_id, message_id, out):
                 return message_id
         return await self.send(chat_id, out)

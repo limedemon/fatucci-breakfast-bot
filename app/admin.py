@@ -146,7 +146,6 @@ TEXT_TITLES: dict[str, str] = {
     "bot_description": "Приветствие до кнопки Start",
     "welcome": "Приветствие (без объекта)",
     "welcome_object": "Приветствие (объект известен)",
-    "menu_intro": "Заголовок раздела «Сеты»",
     "delivery_info": "Доставка",
     "how_to_order": "Как заказать",
     "faq": "Частые вопросы",

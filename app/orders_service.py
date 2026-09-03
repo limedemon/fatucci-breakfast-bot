@@ -68,7 +68,9 @@ async def _notify_guest(group: list[Row], order: Row, status: str, note: str = "
 
     if status == statuses.PAID:
         text = await notify.group_status_text(active, "status_paid")
-        await notify.notify_guest(order, text, [[Btn(text="📦 Мои заказы", data="g:my")]])
+        await notify.notify_guest(order, text, [
+            [Btn(text="🥐 Заказать ещё", data="g:order", intent="positive")],
+            [Btn(text="📦 Мои заказы", data="g:my")]])
         return
 
     if status == statuses.DELIVERED:

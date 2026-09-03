@@ -230,8 +230,8 @@ async def _on_callback(ev: Event, ch: Channel, user: Row) -> None:
     handlers = {
         "menu": lambda: _to_menu(ev, ch),
         "order": lambda: _start_order(ev, ch),
-        "sets": lambda: _show_sets(ev, ch),
-        "set": lambda: _show_set(ev, ch, int(arg or 0)),
+        "sets": lambda: _show_sets(ev, ch, int(arg) if arg.lstrip("-").isdigit() else 0),
+        "set": lambda: _open_set(ev, ch, int(arg or 0)),
         "delivery": lambda: _show_info(ev, ch, "delivery_info"),
         "how": lambda: _show_info(ev, ch, "how_to_order"),
         "faq": lambda: _show_info(ev, ch, "faq"),
@@ -297,7 +297,6 @@ async def _respond(ev: Event, ch: Channel, out: Out, new_message: bool = False) 
         not new_message
         and ev.kind == "callback"
         and not ev.raw.get("_answered")
-        and not out.photo
         and not out.reply_contact
     ):
         return await ch.reply_to_callback(ev, out)
@@ -339,53 +338,60 @@ async def _contact_manager(ev: Event, ch: Channel) -> None:
                                kb=[[Btn(text="⬅️ В меню", data="g:menu")]]))
 
 
-async def _show_sets(ev: Event, ch: Channel) -> None:
+async def _show_sets(ev: Event, ch: Channel, index: int = 0) -> None:
+    """Меню как карусель: фото, состав и цена — листается стрелками.
+
+    Так сеты сравниваются без «открыл — назад — открыл»: сообщение одно
+    и то же, меняются только картинка и подпись.
+    """
     items = await repo.list_sets(active_only=True)
     if not items:
         await _respond(ev, ch, Out(text="Меню пока пустое. Загляните чуть позже 🙏",
                                    kb=[[Btn(text="⬅️ В меню", data="g:menu")]]))
         return
-    text = await repo.render_text("menu_intro")
-    rotation = await _rotation_hint(items)
-    if rotation:
-        text += "\n\n" + rotation
-    kb = [[Btn(text=item["title"], data=f"g:set:{item['id']}")] for item in items]
-    kb.append([Btn(text="🥐 Заказать", data="g:order"), Btn(text="⬅️ В меню", data="g:menu")])
-    await _respond(ev, ch, Out(text=text, kb=kb))
 
-
-async def _rotation_hint(items: list[Row]) -> str:
-    from .utils import WEEKDAYS_SHORT
-
-    week = await repo.rotation_week()
-    titles = {item["id"]: item["title"] for item in items}
-    lines = []
-    for weekday in range(1, 8):
-        set_id = week.get(weekday)
-        if set_id and set_id in titles:
-            lines.append(f"{WEEKDAYS_SHORT[weekday - 1]} — {esc(titles[set_id])}")
-    if not lines:
-        return ""
-    return "🗓 <b>Расписание недели</b>\n" + "\n".join(lines)
-
-
-async def _show_set(ev: Event, ch: Channel, set_id: int) -> None:
-    item = await repo.get_set(set_id)
-    if item is None:
-        await _show_sets(ev, ch)
-        return
+    index = index % len(items)
+    item = items[index]
     obj = (await _session_object(ev))[0]
     price = await availability.price_of(obj, item) if obj is not None \
         else (item["price_kop"] or 0)
-    text = f"🥐 <b>{esc(item['title'])}</b>"
+
+    text = [f"🥐 <b>{esc(item['title'])}</b>"]
     if item["description"]:
-        text += "\n\n" + esc(item["description"])
+        text.append("")
+        text.append(esc(item["description"]))
     if price:
-        text += f"\n\n💰 <b>{fmt_money(price)}</b> за сет"
-    kb = [[Btn(text="🥐 Заказать", data="g:order")],
-          [Btn(text="⬅️ К меню", data="g:sets"), Btn(text="🏠 В начало", data="g:menu")]]
-    await _respond(ev, ch, Out(text=text, kb=kb, photo=item["photo_path"]),
-                   new_message=bool(item["photo_path"]))
+        text.append("")
+        text.append(f"💰 <b>{fmt_money(price)}</b> за сет")
+    when = await _set_days(item["id"])
+    if when:
+        text.append(f"🗓 {when}")
+
+    kb: list[list[Btn]] = []
+    if len(items) > 1:
+        kb.append([Btn(text="⬅️", data=f"g:sets:{index - 1}"),
+                   Btn(text=f"{index + 1} из {len(items)}", data="g:noop"),
+                   Btn(text="➡️", data=f"g:sets:{index + 1}")])
+    kb.append([Btn(text="🥐 Заказать завтрак", data="g:order", intent="positive")])
+    kb.append([Btn(text="🏠 В начало", data="g:menu")])
+
+    await _respond(ev, ch, Out(text="\n".join(text), kb=kb, photo=item["photo_path"]))
+
+
+async def _set_days(set_id: int) -> str:
+    """В какие дни недели подают этот сет — по ротации."""
+    from .utils import WEEKDAYS_SHORT
+
+    week = await repo.rotation_week()
+    days = [WEEKDAYS_SHORT[day - 1] for day in range(1, 8) if week.get(day) == set_id]
+    return "Подаём: " + ", ".join(days) if days else ""
+
+
+async def _open_set(ev: Event, ch: Channel, set_id: int) -> None:
+    """Открыть карусель на конкретном сете — по ссылке или старой кнопке."""
+    items = await repo.list_sets(active_only=True)
+    index = next((i for i, item in enumerate(items) if item["id"] == set_id), 0)
+    await _show_sets(ev, ch, index)
 
 
 async def _show_offers(ev: Event, ch: Channel) -> None:
@@ -820,7 +826,7 @@ async def _ask_date(ev: Event, ch: Channel) -> None:
         kb.append([Btn(text=f"{mark}{fmt_date_btn(day)} · {breakfast['title']}",
                        data=f"g:date:{iso}")])
     if chosen:
-        kb.append([Btn(text=f"➡️ Далее · выбрано {len(chosen)} "
+        kb.append([Btn(text=f"✅ Далее · {len(chosen)} "
                             f"{plural(len(chosen), 'день', 'дня', 'дней')}",
                        data="g:dates", intent="positive")])
     kb.append([Btn(text="⬅️ В меню", data="g:menu")])
@@ -833,11 +839,14 @@ async def _ask_date(ev: Event, ch: Channel) -> None:
     text.append(f"💰 {fmt_money(await availability.price_of(obj))} за сет · "
                 f"доставка {esc(repo.delivery_window(obj))}")
     text.append("")
-    if multi:
-        text.append("Можно отметить <b>несколько дней сразу</b> — рядом с датой "
-                    "показан сет, который подадут в этот день.")
+    if chosen:
+        text.append("Отметьте ещё дни или нажмите <b>«Далее»</b> внизу.")
+    elif multi:
+        text.append("👆 <b>Нажмите на дату</b> — можно отметить сразу несколько. "
+                    "Рядом с датой показан сет, который подадут в этот день.")
     else:
-        text.append("Рядом с датой — сет, который подадут в этот день.")
+        text.append("👆 <b>Нажмите на дату.</b> Рядом с ней — сет, "
+                    "который подадут в этот день.")
     text.append(f"<i>Заказы принимаем до {esc(obj['cutoff_time'])} накануне.</i>")
     await _respond(ev, ch, Out(text="\n".join(text), kb=kb))
 
