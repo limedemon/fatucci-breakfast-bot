@@ -81,7 +81,6 @@ DEFAULT_SETTINGS: dict[str, str] = {
     "manager_contact": "@fatucci_manager",
     "reviews_chat_id": "",         # чат для отзывов; привязывается командой /clip2
     "review_after": "1,5",         # после каких по счёту заказов просить отзыв
-    "custom_price_kop": "",        # цена для адресов вне списка; пусто — как у общего объекта
     "pay_link": "",                # ссылка на оплату, если есть
     "pay_by_details": "0",         # 1 — платить переводом, даже если касса подключена
     "support_contact": "@marina_fatucci",   # техподдержка: кто чинит бота

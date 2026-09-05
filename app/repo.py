@@ -113,16 +113,6 @@ async def get_user_by_id(user_pk: int) -> Optional[Row]:
     return await db.fetchone("SELECT * FROM users WHERE id = ?", (int(user_pk),))
 
 
-async def custom_address_price() -> int:
-    """Цена сета для адресов, которых нет в списке домов.
-
-    Такие заказы идут по общему QR, у них нет своего объекта — поэтому цена
-    задаётся одна на всех в настройках. Пусто — берём цену общего объекта.
-    """
-    raw = (await get_setting("custom_price_kop", "")).strip()
-    return int(raw) if raw.isdigit() else 0
-
-
 async def default_delivery_time() -> str:
     """Время доставки первого активного объекта — для общих текстов."""
     value = await db.fetchval(

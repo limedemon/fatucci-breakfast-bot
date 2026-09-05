@@ -139,7 +139,7 @@ async def _show_main_menu(ev: Event, ch: Channel, new_message: bool = False) -> 
             "welcome_object",
             object_title=obj["title"],
             address=obj["address"] or obj["title"],
-            price=fmt_money(await availability.price_of(obj)),
+            price=fmt_money(availability.price_for(obj)),
             cutoff=obj["cutoff_time"],
             delivery_time=obj["delivery_time"],
             delivery_window=repo.delivery_window(obj),
@@ -349,7 +349,7 @@ async def _show_sets(ev: Event, ch: Channel, index: int = 0) -> None:
     index = index % len(items)
     item = items[index]
     obj = (await _session_object(ev))[0]
-    price = await availability.price_of(obj, item) if obj is not None \
+    price = availability.price_for(obj, item) if obj is not None \
         else (item["price_kop"] or 0)
 
     text = [f"🥐 <b>{esc(item['title'])}</b>"]
@@ -747,7 +747,7 @@ async def _input_address(ev: Event, ch: Channel, text: str, data: dict[str, Any]
 
     await ch.send(ev.chat_id, Out(text=await repo.render_text(
         "address_unknown", address=esc(address),
-        price=fmt_money(await availability.price_of(general)))))
+        price=fmt_money(availability.price_for(general)))))
     if user is not None and known.lower() != address.lower():
         # про один и тот же адрес менеджеров дёргаем один раз
         user = await repo.get_user(ev.channel, ev.user_id)
@@ -790,7 +790,7 @@ async def _ask_date(ev: Event, ch: Channel) -> None:
         text.append(f"📍 {esc(obj['address'])}")
     elif data.get("address"):
         text.append(f"📍 {esc(data['address'])}")
-    text.append(f"💰 {fmt_money(await availability.price_of(obj))} за сет · "
+    text.append(f"💰 {fmt_money(availability.price_for(obj))} за сет · "
                 f"доставка {esc(repo.delivery_window(obj))}")
     text.append("")
     if chosen:
@@ -861,7 +861,7 @@ async def _ask_qty(ev: Event, ch: Channel) -> None:
         return
 
     low, high = availability.qty_limits(obj)
-    price = await availability.price_of(obj)
+    price = availability.price_for(obj)
     tiers = await pricing.tiers()
     await _set_state(ev, S_QTY, data)
 
@@ -1014,7 +1014,6 @@ async def _order_lines(obj: Row, data: dict[str, Any]) -> tuple[list[str], int, 
     """Разбивка по датам, всего наборов и итоговая сумма."""
     qty = int(data.get("qty", 1))
     tiers = await pricing.tiers()
-    custom = await repo.custom_address_price()
     rows: list[str] = []
     total = 0
     sets = 0
@@ -1023,7 +1022,7 @@ async def _order_lines(obj: Row, data: dict[str, Any]) -> tuple[list[str], int, 
         if day is None:
             continue
         breakfast = await repo.set_for_date(day)
-        base = availability.price_for(obj, breakfast, custom)
+        base = availability.price_for(obj, breakfast)
         price = pricing.calc(base, qty, tiers)
         total += price.total
         sets += qty
@@ -1117,7 +1116,6 @@ async def _confirm_order(ev: Event, ch: Channel) -> None:
 
     qty = int(data["qty"])
     tiers = await pricing.tiers()
-    custom = await repo.custom_address_price()
     days: list[dict[str, Any]] = []
     skipped: list[str] = []
     for iso in data["dates"]:
@@ -1129,7 +1127,7 @@ async def _confirm_order(ev: Event, ch: Channel) -> None:
             skipped.append(f"{fmt_date(day, False)} — {reason}")
             continue
         breakfast = await repo.set_for_date(day)
-        base = availability.price_for(obj, breakfast, custom)
+        base = availability.price_for(obj, breakfast)
         price = pricing.calc(base, qty, tiers)
         days.append({
             "delivery_date": fmt_date_iso(day),

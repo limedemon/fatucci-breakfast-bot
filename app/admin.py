@@ -115,7 +115,6 @@ SETTING_SECTIONS: dict[str, tuple[str, list[FieldSpec]]] = {
         ("daily_remind_ordered", "Напоминать и тем, кто уже заказал", "bool"),
     ]),
     "price": ("💰 Цены и скидки", [
-        ("custom_price_kop", "Цена для адресов вне списка", "money_opt"),
         ("discount_tiers", "Пороги скидок", "text"),
     ]),
     "cur": ("🚚 Выгрузка курьерам", [
@@ -816,12 +815,14 @@ async def _object_card(ev: Event, ch: Channel, object_id: int) -> None:
         await _objects_list(ev, ch)
         return
     orders_count = await repo.count_orders(object_id=object_id)
+    # у общего объекта цена работает ещё и как цена для адресов вне списка
+    price_note = " — по ней считаются адреса вне списка" if obj["is_general"] else ""
     text = (
         f"🏢 <b>{esc(obj['title'])}</b>\n"
-        f"{'🌐 Общий QR — гость выбирает объект сам' if obj['is_general'] else ''}\n\n"
+        f"{'🌐 Общий QR — сюда попадают заказы по адресам вне списка' if obj['is_general'] else ''}\n\n"
         f"Сеть: {esc(obj['group_title']) or '—'}\n"
         f"📍 Адрес: {esc(obj['address']) or '—'}\n"
-        f"💰 Цена завтрака: <b>{fmt_money(obj['price_kop'])}</b>\n"
+        f"💰 Цена завтрака: <b>{fmt_money(obj['price_kop'])}</b>{price_note}\n"
         f"🚚 Дни доставки: {fmt_days(obj['delivery_days'])}\n"
         f"🕘 Время доставки: {esc(repo.delivery_window(obj))}\n"
         f"⏰ Приём заказов до: {esc(obj['cutoff_time'])} (за {obj['lead_days']} дн.)\n"

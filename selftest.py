@@ -598,25 +598,25 @@ async def main() -> None:
           "черновик сброшен — заказ начнётся заново")
     await repo.update_user("tg", GUEST, custom_address="", address_status="")
 
-    print("\n— Общая цена для адресов вне списка —")
+    print("\n— Цена для адресов вне списка —")
     general = await repo.get_object_by_code("obshiy")
     known = await repo.get_object_by_code("demo1")
-    await repo.set_setting("custom_price_kop", "150000")
-    check(await availability.price_of(general) == 150000,
-          "по общему адресу действует общая цена")
-    check(await availability.price_of(known) == known["price_kop"],
+    await repo.update_object(general["id"], price_kop=150000)
+    general = await repo.get_object(general["id"])
+    check(availability.price_for(general) == 150000,
+          "цена берётся из карточки объекта «общий QR»")
+    check(availability.price_for(known) == known["price_kop"],
           "у дома из списка остаётся своя цена")
 
     ch.clear()
     await route(guest_event("start", payload="obshiy"), ch)
     await route(guest_event("callback", payload="g:order", callback_id="a3"), ch)
-    await route(guest_event("callback", payload="g:addr", callback_id="a4"), ch)
     await route(guest_event("text", text="Неизвестная улица 99"), ch)
     first_date = ch.find_button("g:date:")
     await route(guest_event("callback", payload=first_date, callback_id="a5"), ch)
     ch.clear()
     await route(guest_event("callback", payload="g:dates", callback_id="a6"), ch)
-    check("1 500 ₽" in ch.texts(), "гость видит общую цену при выборе количества")
+    check("1 500 ₽" in ch.texts(), "гость видит эту цену при выборе количества")
 
     await route(guest_event("callback", payload="g:qty:2", callback_id="a7"), ch)
     await route(guest_event("callback", payload="g:reapt", callback_id="a8"), ch)
@@ -624,19 +624,22 @@ async def main() -> None:
     await route(guest_event("callback", payload="g:skipa", callback_id="a10"), ch)
     ch.clear()
     await route(guest_event("callback", payload="g:skip", callback_id="a11"), ch)
-    check("3 000 ₽" in ch.texts(), "итог считается по общей цене")
+    check("3 000 ₽" in ch.texts(), "итог считается по ней же")
 
     ch.clear()
     await route(guest_event("callback", payload="g:confirm", callback_id="a12"), ch)
     orders = await repo.list_orders(limit=1, user_key=("tg", GUEST))
     check(bool(orders) and orders[0]["price_kop"] == 150000,
-          f"в заказе сохранилась общая цена ({orders[0]['price_kop'] if orders else '—'})")
+          f"в заказе сохранилась эта цена ({orders[0]['price_kop'] if orders else '—'})")
     check(bool(orders) and not orders[0]["address_ok"],
           "заказ помечен как адрес вне списка")
 
-    await repo.set_setting("custom_price_kop", "")
-    check(await availability.price_of(general) == general["price_kop"],
-          "пустая настройка возвращает цену общего объекта")
+    ch.clear()
+    await route(admin_event("callback", payload=f"a:b:c:{general['id']}", callback_id="a13"), ch)
+    check("адреса вне списка" in ch.texts(),
+          "в карточке объекта сказано, на что влияет его цена")
+
+    await repo.update_object(general["id"], price_kop=90000)
 
     print("\n— Сопоставление адресов —")
     for typed, expect in [("г. Сочи, ул. Северная, д. 12", "demo1"),

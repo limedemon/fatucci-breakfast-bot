@@ -230,6 +230,11 @@ async def new_object_request(channel_name: str, user_id: str, username: str,
     return await send_to_admin_dms("\n".join(lines), kb)
 
 
+def _general_price(general: Optional[Row]) -> int:
+    """Цена объекта «общий QR» — по ней считаются адреса вне списка."""
+    return int(general["price_kop"] or 0) if general is not None else 0
+
+
 async def send_review(review: Row, user: Row) -> bool:
     """Отзыв — одним сообщением в чат отзывов (или менеджерам, если он не задан)."""
     channel = get_channel(TG)
@@ -263,13 +268,14 @@ async def new_address(user: Row, address: str) -> None:
     гостя на паузе. Решение прилетает кнопками из этого же сообщения.
     """
     link = guest_link(user["channel"], user["username"])
+    general = await repo.general_object()
     lines = [
         "📍 <b>Новый адрес вне списка</b>",
         "",
         f"Адрес: <b>{esc(address)}</b>",
         f"Гость: {esc(user['full_name'] or 'без имени')}"
         + (f" (@{esc(user['username'])})" if user["username"] else ""),
-        f"Цена для таких адресов: <b>{fmt_money(await repo.custom_address_price())}</b>",
+        f"Цена по такому адресу: <b>{fmt_money(_general_price(general))}</b>",
         "",
         "Гость уже может оформить заказ — он придёт сюда как обычный.",
         "Если по этому адресу не возим, нажмите «Отклонить»: гостю сообщим "
