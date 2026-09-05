@@ -37,7 +37,6 @@ Row = Any
 # состояния
 S_NONE = ""
 S_ADDRESS = "address"
-S_REQUEST = "request"
 S_RECEIPT = "receipt"
 S_REVIEW = "review"
 S_DATE = "date"
@@ -53,7 +52,6 @@ SKIP_LABEL = "⏭ Пропустить"
 CONTACT_LABEL = "📞 Поделиться контактом"
 
 #: сколько дат максимум можно отметить в одном заказе
-OBJECTS_PER_PAGE = 8
 MAX_DATES = 14
 
 
@@ -118,7 +116,7 @@ async def _cmd_start(ev: Event, ch: Channel) -> None:
                             object_id=session_object)
     if session_object is None:
         # дом неизвестен: по QR не пришли или код не подошёл — предлагаем выбрать
-        await _ask_object(ev, ch, new_message=True)
+        await _ask_address(ev, ch, new_message=True)
         return
     await _show_main_menu(ev, ch, new_message=True)
 
@@ -159,9 +157,9 @@ async def _show_main_menu(ev: Event, ch: Channel, new_message: bool = False) -> 
         kb.append([Btn(text="📦 Мои заказы", data="g:my")])
     if await repo.list_offers(active_only=True):
         kb.append([Btn(text="🤍 Ещё от Fatucci", data="g:offers")])
-    if obj is not None and len(await repo.list_objects(active_only=True, selectable=True)) > 1:
-        # домов несколько — гость мог выбрать не тот или переехать
-        kb.append([Btn(text="🏠 Сменить апартаменты", data="g:objs")])
+    if obj is not None:
+        # гость мог ошибиться в адресе или переехать — путь назад всегда открыт
+        kb.append([Btn(text="🏠 Сменить адрес", data="g:addr")])
     kb.append([_manager_btn()])
 
     await _respond(ev, ch, Out(text=text, kb=kb), new_message=new_message)
@@ -237,11 +235,9 @@ async def _on_callback(ev: Event, ch: Channel, user: Row) -> None:
         "faq": lambda: _show_info(ev, ch, "faq"),
         "rules": lambda: _show_info(ev, ch, "rules"),
         "manager": lambda: _contact_manager(ev, ch),
-        "objs": lambda: _ask_object(ev, ch),
-        "objp": lambda: _ask_object(ev, ch, page=int(arg or 0)),
-        "obj": lambda: _pick_object(ev, ch, int(arg or 0)),
-        "objnew": lambda: _ask_new_object(ev, ch),
+        "objs": lambda: _ask_address(ev, ch),
         "addr": lambda: _ask_address(ev, ch),
+        "addrkeep": lambda: _keep_address(ev, ch),
         "offers": lambda: _show_offers(ev, ch),
         "offer": lambda: _show_offer(ev, ch, int(arg or 0)),
         "my": lambda: _show_my_orders(ev, ch),
@@ -574,11 +570,11 @@ async def _start_order(ev: Event, ch: Channel) -> None:
 
     obj, data = await _session_object(ev)
     if obj is None:
-        await _ask_object(ev, ch)
+        await _ask_address(ev, ch)
         return
     if obj["is_general"] and not data.get("address"):
         # общий QR: дом неизвестен — предлагаем выбрать из списка
-        await _ask_object(ev, ch)
+        await _ask_address(ev, ch)
         return
     await _ask_date(ev, ch)
 
@@ -650,76 +646,6 @@ async def _finish_review(ev: Event, ch: Channel, review_id: int) -> None:
 
 
 # ------------------------------------------------------- выбор апартаментов
-async def _ask_object(ev: Event, ch: Channel, page: int = 0,
-                      new_message: bool = False) -> None:
-    """Список домов кнопками. Когда дом неизвестен — с этого начинается заказ."""
-    objects = await repo.list_objects(active_only=True, selectable=True)
-    if not objects:
-        # объектов ещё не завели — гостю остаётся только оставить адрес
-        await _ask_new_object(ev, ch, new_message=new_message)
-        return
-
-    pages = chunk(objects, OBJECTS_PER_PAGE)
-    page = max(0, min(page, len(pages) - 1))
-    kb = [[Btn(text=f"🏢 {obj['title']}", data=f"g:obj:{obj['id']}")] for obj in pages[page]]
-    if len(pages) > 1:
-        nav = []
-        if page:
-            nav.append(Btn(text="⬅️ Назад", data=f"g:objp:{page - 1}"))
-        nav.append(Btn(text=f"{page + 1}/{len(pages)}", data="g:noop"))
-        if page + 1 < len(pages):
-            nav.append(Btn(text="Ещё ➡️", data=f"g:objp:{page + 1}"))
-        kb.append(nav)
-    kb.append([Btn(text="✍️ Ввести свой адрес", data="g:addr")])
-
-    kb.append([Btn(text="➕ Сообщить о новом доме", data="g:objnew")])
-    kb.append([Btn(text="📋 Меню и цены", data="g:sets"), _manager_btn()])
-    await _respond(ev, ch, Out(text=await repo.render_text("choose_object"), kb=kb),
-                   new_message=new_message)
-
-
-async def _pick_object(ev: Event, ch: Channel, object_id: int) -> None:
-    """Гость выбрал дом — запоминаем его и открываем меню."""
-    obj = await repo.get_object(object_id)
-    if obj is None or not obj["is_active"] or obj["is_general"]:
-        await _ask_object(ev, ch)
-        return
-    await repo.update_user(ev.channel, ev.user_id, object_id=obj["id"])
-    await repo.save_session(ev.channel, ev.user_id, S_NONE, {}, chat_id=ev.chat_id,
-                            object_id=obj["id"])
-    await _show_main_menu(ev, ch)
-
-
-async def _ask_new_object(ev: Event, ch: Channel, new_message: bool = False) -> None:
-    _, data = await _session_object(ev)
-    await _set_state(ev, S_REQUEST, data)
-    kb = [[Btn(text="⬅️ К списку домов", data="g:objs")],
-          [Btn(text="🏠 В начало", data="g:menu")]]
-    await _respond(ev, ch, Out(text=await repo.render_text("request_object"), kb=kb),
-                   new_message=new_message)
-
-
-async def _input_request(ev: Event, ch: Channel, text: str, data: dict[str, Any]) -> None:
-    """Гость прислал адрес, которого нет в списке."""
-    address = " ".join(text.split())[:200]
-    if len(address) < 5:
-        await ch.send(ev.chat_id, Out(
-            text="⚠️ Напишите улицу и номер дома — например, <b>Советская 16</b>."))
-        return
-
-    await repo.save_session(ev.channel, ev.user_id, S_NONE, {}, chat_id=ev.chat_id)
-    user = await repo.get_user(ev.channel, ev.user_id)
-    delivered = await notify.new_object_request(
-        ev.channel, str(ev.user_id), ev.username or (user["username"] if user else ""),
-        ev.full_name or (user["full_name"] if user else ""), address)
-    if not delivered:
-        log.warning("Запрос апартаментов «%s» никому не доставлен", address)
-
-    await _respond(ev, ch, Out(
-        text=await repo.render_text("request_sent", address=esc(address)),
-        kb=[[Btn(text="🏠 В начало", data="g:menu")], [_manager_btn()]]), new_message=True)
-
-
 # ------------------------------------------------------------------- адрес
 async def address_rejected(user: Row) -> None:
     """Менеджер отказал по адресу — просим у гостя другой."""
@@ -728,8 +654,7 @@ async def address_rejected(user: Row) -> None:
         return
     text = await repo.render_text("address_rejected",
                                   address=esc(user["custom_address"] or "—"))
-    kb = [[Btn(text="🏢 Выбрать из списка", data="g:objs")],
-          [Btn(text="✍️ Ввести другой адрес", data="g:addr")]]
+    kb = [[Btn(text="✍️ Ввести другой адрес", data="g:addr")], [_manager_btn()]]
     await channel.send(user["chat_id"] or user["ext_id"], Out(text=text, kb=kb))
 
 
@@ -744,17 +669,46 @@ async def address_accepted(user: Row) -> None:
         kb=[[Btn(text="🥐 Заказать завтрак", data="g:order")]]))
 
 
-async def _ask_address(ev: Event, ch: Channel) -> None:
+async def _ask_address(ev: Event, ch: Channel, new_message: bool = False) -> None:
+    """Единственный способ определить дом: гость пишет свой адрес.
+
+    Списком дома не показываем — это чужая клиентская база, гостю её видеть
+    незачем. Введённый адрес бот сам сопоставит с нужным домом.
+    """
     _, data = await _session_object(ev)
     await _set_state(ev, S_ADDRESS, data)
+
     kb: list[list[Btn]] = []
-    user = await repo.get_user(ev.channel, ev.user_id)
-    if user and user["object_id"]:
-        known = await repo.get_object(user["object_id"])
-        if known is not None and not known["is_general"] and known["address"]:
-            kb.append([Btn(text=f"📍 {known['address']}", data="g:noop")])
+    known = await _known_address(ev)
+    if known:
+        kb.append([Btn(text=f"📍 {known}", data="g:addrkeep", intent="positive")])
     kb.append([Btn(text="⬅️ В меню", data="g:menu")])
-    await _respond(ev, ch, Out(text=await repo.render_text("ask_address"), kb=kb,))
+    await _respond(ev, ch, Out(text=await repo.render_text("ask_address"), kb=kb),
+                   new_message=new_message)
+
+
+async def _known_address(ev: Event) -> str:
+    """Адрес, который гость называл раньше, — чтобы не набирать заново."""
+    user = await repo.get_user(ev.channel, ev.user_id)
+    if user is None:
+        return ""
+    if user["custom_address"] and user["address_status"] != repo.ADDRESS_REJECTED:
+        return user["custom_address"]
+    if user["object_id"]:
+        obj = await repo.get_object(user["object_id"])
+        if obj is not None and not obj["is_general"] and obj["address"]:
+            return obj["address"]
+    return ""
+
+
+async def _keep_address(ev: Event, ch: Channel) -> None:
+    """Гость подтвердил прошлый адрес — продолжаем без набора текста."""
+    known = await _known_address(ev)
+    if not known:
+        await _ask_address(ev, ch)
+        return
+    _, data = await _session_object(ev)
+    await _input_address(ev, ch, known, data)
 
 
 async def _input_address(ev: Event, ch: Channel, text: str, data: dict[str, Any]) -> None:
@@ -781,7 +735,7 @@ async def _input_address(ev: Event, ch: Channel, text: str, data: dict[str, Any]
     general = await repo.general_object()
     if general is None:
         await ch.send(ev.chat_id, Out(text=await repo.render_text("address_unknown_closed")))
-        await _ask_object(ev, ch)
+        await _ask_address(ev, ch)
         return
 
     await repo.save_session(ev.channel, ev.user_id, S_DATE, data, chat_id=ev.chat_id,
@@ -805,7 +759,7 @@ async def _input_address(ev: Event, ch: Channel, text: str, data: dict[str, Any]
 async def _ask_date(ev: Event, ch: Channel) -> None:
     obj, data = await _session_object(ev)
     if obj is None:
-        await _ask_object(ev, ch)
+        await _ask_address(ev, ch)
         return
 
     dates = await availability.available_dates(obj, limit=MAX_DATES)
@@ -1084,7 +1038,7 @@ async def _order_lines(obj: Row, data: dict[str, Any]) -> tuple[list[str], int, 
 async def _show_confirm(ev: Event, ch: Channel) -> None:
     obj, data = await _session_object(ev)
     if obj is None:
-        await _ask_object(ev, ch)
+        await _ask_address(ev, ch)
         return
     if not (data.get("dates") and data.get("qty") and data.get("apartment")
             and data.get("phone")):
@@ -1268,9 +1222,6 @@ async def _on_text(ev: Event, ch: Channel, user: Row) -> None:
 
     if state == S_ADDRESS:
         await _input_address(ev, ch, text, data)
-        return
-    if state == S_REQUEST:
-        await _input_request(ev, ch, text, data)
         return
     if state == S_RECEIPT:
         await _input_receipt(ev, ch, data)

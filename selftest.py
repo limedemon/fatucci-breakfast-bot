@@ -510,78 +510,43 @@ async def main() -> None:
     check(not ok and "не похож" in report, "кривой токен подсвечивается")
     await repo.set_setting("pm_token", TEST_TOKEN)
 
-    print("\n— Выбор апартаментов на старте —")
+    print("\n— Гость без QR вводит адрес —")
     NEW = "999"
     ch.clear()
     await route(guest_event("start", NEW), ch)          # пришёл без QR-кода
-    check("апартаменты" in ch.texts().lower(), "новому гостю предложено выбрать дом")
-    buttons = ch.find_all("g:obj:")
-    check(len(buttons) >= 1, f"дома показаны кнопками ({len(buttons)})")
-    check(bool(ch.find_button("g:objnew")), "есть кнопка «Моих апартаментов нет»")
-    check(not ch.find_button("g:order"), "меню заказа не показывается, пока дом не выбран")
+    check("адрес" in ch.texts().lower(), "новому гостю сразу предложили ввести адрес")
+    check(not ch.find_all("g:obj:"), "чужие дома списком не показываются")
+    check(not ch.find_button("g:order"), "меню заказа не открывается, пока адреса нет")
 
     ch.clear()
-    await route(guest_event("callback", NEW, payload=buttons[0], callback_id="c1"), ch)
-    check(bool(ch.find_button("g:order")), "после выбора дома открылось меню")
+    await route(guest_event("text", NEW, text="Северная 12"), ch)
+    check(bool(ch.find_button("g:date:")), "после адреса сразу выбор дат")
     session = await repo.get_session("tg", NEW)
     picked = await repo.get_object(session["object_id"])
-    check(picked is not None and not picked["is_general"], "дом запомнен в сессии")
+    check(picked is not None and picked["code"] == "demo1",
+          "адрес сопоставлен с нужным домом")
     user = await repo.get_user("tg", NEW)
-    check(user["object_id"] == picked["id"], "и в карточке гостя — при следующем старте не спросим")
+    check(user["object_id"] == picked["id"], "дом запомнен — второй раз не спросим")
 
     ch.clear()
     await route(guest_event("start", NEW), ch)
-    check(bool(ch.find_button("g:order")) and not ch.find_button("g:obj:"),
-          "повторный старт сразу открывает меню")
-    check(not ch.find_button("g:objs"),
-          "когда дом всего один, менять нечего — кнопки нет")
-
-    second = await repo.create_object(code="beta", title="Бета-Апартаменты",
-                                      address="г. Сочи, ул. Южная, д. 3", price_kop=90000)
-    ch.clear()
-    await route(guest_event("start", NEW), ch)
-    check(bool(ch.find_button("g:objs")), "когда домов несколько — можно сменить из меню")
-    ch.clear()
-    await route(guest_event("callback", NEW, payload="g:objs", callback_id="c1b"), ch)
-    check(len(ch.find_all("g:obj:")) == 2, "в списке оба дома")
-    await repo.delete_object(second)
-
-    print("\n— Запрос новых апартаментов —")
-    ch.clear()
-    await route(guest_event("callback", NEW, payload="g:objnew", callback_id="c2"), ch)
-    check("адрес" in ch.texts().lower(), "у гостя спросили адрес")
+    check(bool(ch.find_button("g:order")), "повторный старт сразу открывает меню")
+    check(bool(ch.find_button("g:addr")), "адрес можно сменить из меню")
 
     ch.clear()
-    await route(guest_event("text", NEW, text="Сов"), ch)
-    check("улицу и номер дома" in ch.texts(), "слишком короткий адрес не принимается")
-    session = await repo.get_session("tg", NEW)
-    check(session["state"] == "request", "гость остаётся на том же шаге")
-
+    await route(guest_event("callback", NEW, payload="g:addr", callback_id="c1"), ch)
+    keep = ch.find_button("g:addrkeep")
+    check(bool(keep), "прошлый адрес предлагается одной кнопкой")
     ch.clear()
-    await route(guest_event("text", NEW, text="Советская 16"), ch)
-    check("Советская 16" in ch.to(NEW), "гостю подтвердили заявку с адресом")
-    admin_text = ch.to(ADMIN)
-    check("Запрос новых апартаментов" in admin_text, "админу пришло уведомление в личку")
-    check("Советская 16" in admin_text, "в уведомлении есть адрес")
-    check(NEW in admin_text, "и кто просит")
-    check(bool(ch.find_button("a:b:n")), "из уведомления можно сразу завести объект")
-    check(not any(chat == CHAT for chat, _ in ch.sent),
-          "в рабочий чат заказов это не летит — только в личку")
-    session = await repo.get_session("tg", NEW)
-    check(session["state"] == "", "после заявки гость не застрял в вводе адреса")
+    await route(guest_event("callback", NEW, payload=keep, callback_id="c2"), ch)
+    check(bool(ch.find_button("g:date:")), "по кнопке продолжаем с тем же адресом")
 
-    print("\n— Общий QR: выбор дома или свой адрес —")
+    print("\n— Общий QR: гость вводит адрес —")
     ch.clear()
     await route(guest_event("start", payload="obshiy"), ch)
     await route(guest_event("callback", payload="g:order", callback_id="a1"), ch)
-    check("апартаменты" in ch.texts().lower(), "по общему QR предложен выбор дома")
-    check(bool(ch.find_all("g:obj:")), "дома показаны кнопками")
-    check(bool(ch.find_button("g:addr")), "есть кнопка «Ввести свой адрес»")
-    check(bool(ch.find_button("g:objnew")), "и кнопка сообщить о новом доме")
-
-    ch.clear()
-    await route(guest_event("callback", payload="g:addr", callback_id="a1b"), ch)
-    check("адрес" in ch.texts().lower(), "по кнопке спрашивают адрес")
+    check("адрес" in ch.texts().lower(), "по общему QR спрашивают адрес")
+    check(not ch.find_all("g:obj:"), "список домов не показывается и здесь")
 
     ch.clear()
     await route(guest_event("text", text="Северная 12"), ch)
@@ -594,13 +559,10 @@ async def main() -> None:
     ch.clear()
     await route(guest_event("start", payload="obshiy"), ch)
     await route(guest_event("callback", payload="g:order", callback_id="a2"), ch)
-    await route(guest_event("callback", payload="g:addr", callback_id="a2b"), ch)
     await route(guest_event("text", text="Неизвестная улица 99"), ch)
     guest_text = ch.to(GUEST)
     check("Записали адрес" in guest_text, "адрес принят без лишних условий")
     check("за сет" in guest_text, "гостю сразу названа цена по такому адресу")
-    check("проверит" not in guest_text.lower(),
-          "про проверку менеджером гостю больше не пишем")
     check(bool(ch.find_button("g:date:")), "гость сразу переходит к выбору дат")
 
     print("\n— Решение менеджера по адресу —")
@@ -614,9 +576,7 @@ async def main() -> None:
     check(guest_row["address_status"] == repo.ADDRESS_PENDING,
           "адрес помечен как ожидающий решения")
 
-    # до решения гость спокойно заказывает
     ch.clear()
-    first_date = ch.find_all("g:date:")[0] if ch.find_all("g:date:") else ""
     await route(guest_event("callback", payload="g:order", callback_id="a2c"), ch)
     check(bool(ch.find_button("g:date:")), "до решения заказ доступен")
 
@@ -631,8 +591,8 @@ async def main() -> None:
     guest_row = await repo.get_user("tg", GUEST)
     check(guest_row["address_status"] == repo.ADDRESS_REJECTED, "адрес отклонён")
     check("не возим" in ch.to(GUEST), "гостю сказали, что по адресу не возим")
-    check(bool(ch.find_button("g:addr")) and bool(ch.find_button("g:objs")),
-          "гостю предложено вписать другой адрес или выбрать дом")
+    check(bool(ch.find_button("g:addr")), "и предложили вписать другой адрес")
+    check(not ch.find_button("g:objs"), "списком домов при отказе не машем")
     session = await repo.get_session("tg", GUEST)
     check(session is not None and not session["object_id"],
           "черновик сброшен — заказ начнётся заново")
