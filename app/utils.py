@@ -43,6 +43,24 @@ def utc_stamp(minutes: int = 0, hours: int = 0) -> str:
     return moment.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def split_apartment(address: str) -> tuple[str, str]:
+    """Отделить номер квартиры от адреса: «Северная 12, кв 60» → («Северная 12», «60»).
+
+    Гость обычно пишет адрес целиком, вместе с квартирой. Раз номер уже назван,
+    спрашивать его отдельно незачем — вытаскиваем и убираем из адреса, чтобы
+    в курьерской выгрузке он не задваивался.
+    """
+    match = re.search(
+        r"[,;]?\s*(?:кв|кв[.]|квартира|апарт|апарты|апартаменты|ап[.]|apt|apartment)"
+        r"\s*[.№#]?\s*(\d{1,5}[A-Za-zА-Яа-я]?)\s*$",
+        address.strip(), flags=re.IGNORECASE)
+    if not match:
+        return address.strip(), ""
+    apartment = match.group(1).strip()
+    cleaned = address[:match.start()].strip().rstrip(",;").strip()
+    return (cleaned or address.strip()), apartment
+
+
 def parse_clock(raw: str) -> Optional[str]:
     """«9», «9:00», «9.00», «0900» → «09:00». Иначе None."""
     match = re.match(r"^(\d{1,2})(?:[:.\s]?(\d{2}))?$", raw.strip())

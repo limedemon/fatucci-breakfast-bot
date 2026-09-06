@@ -72,7 +72,7 @@ OBJECT_FIELDS: list[FieldSpec] = [
 SET_FIELDS: list[FieldSpec] = [
     ("title", "Название", "text"),
     ("description", "Состав / описание", "text"),
-    ("price_kop", "Своя цена (пусто — цена объекта)", "money_opt"),
+    ("price_kop", "Своя цена (важнее цены дома)", "money_opt"),
     ("photo_path", "Фотография", "photo"),
 ]
 
@@ -677,7 +677,9 @@ async def _set_card(ev: Event, ch: Channel, set_id: int) -> None:
     if item is None:
         await _sets_list(ev, ch)
         return
-    price = fmt_money(item["price_kop"]) if item["price_kop"] else "по цене объекта"
+    # своя цена сета важнее цены дома — на это легко напороться, поэтому пишем прямо
+    price = (f"{fmt_money(item['price_kop'])} — эта цена важнее цены дома"
+             if item["price_kop"] else "по цене дома")
     text = (
         f"🥐 <b>{esc(item['title'])}</b>\n\n"
         f"{esc(item['description']) or '<i>описание не задано</i>'}\n\n"

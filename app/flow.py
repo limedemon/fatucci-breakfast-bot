@@ -12,7 +12,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from . import (availability, media, notify, orders_service, payments, pricing, repo,
                statuses)
@@ -28,6 +28,7 @@ from .utils import (
     norm_phone,
     parse_date,
     plural,
+    split_apartment,
     today,
 )
 
@@ -129,6 +130,31 @@ def _clean_code(payload: str) -> str:
     return raw.strip()
 
 
+def _price_hint(obj: Row, breakfasts: Iterable[Optional[Row]]) -> str:
+    """Цена за сет так, как её посчитает счёт.
+
+    У сета может быть своя цена, и она важнее цены дома. Поэтому на экранах
+    показываем цены именно тех сетов, которые гость может получить, — иначе
+    на экране одна сумма, а в счёте другая.
+    """
+    prices = {availability.price_for(obj, breakfast) for breakfast in breakfasts}
+    prices.discard(0)
+    if not prices:
+        return fmt_money(availability.price_for(obj))
+    low, high = min(prices), max(prices)
+    return fmt_money(low) if low == high else f"от {fmt_money(low)} до {fmt_money(high)}"
+
+
+async def _price_hint_for_dates(obj: Row, isos: list[str]) -> str:
+    """То же самое, но по конкретным выбранным датам."""
+    breakfasts = []
+    for iso in isos:
+        day = parse_date(iso)
+        if day is not None:
+            breakfasts.append(await repo.set_for_date(day))
+    return _price_hint(obj, breakfasts)
+
+
 # ================================================================ главное меню
 async def _show_main_menu(ev: Event, ch: Channel, new_message: bool = False) -> None:
     session = await repo.get_session(ev.channel, ev.user_id)
@@ -139,7 +165,8 @@ async def _show_main_menu(ev: Event, ch: Channel, new_message: bool = False) -> 
             "welcome_object",
             object_title=obj["title"],
             address=obj["address"] or obj["title"],
-            price=fmt_money(availability.price_for(obj)),
+            price=_price_hint(obj, [b for _, b in
+                                    await availability.available_dates(obj, limit=MAX_DATES)]),
             cutoff=obj["cutoff_time"],
             delivery_time=obj["delivery_time"],
             delivery_window=repo.delivery_window(obj),
@@ -712,7 +739,10 @@ async def _keep_address(ev: Event, ch: Channel) -> None:
 
 
 async def _input_address(ev: Event, ch: Channel, text: str, data: dict[str, Any]) -> None:
-    address = " ".join(text.split())[:200]
+    address, apartment = split_apartment(" ".join(text.split())[:200])
+    if apartment:
+        # номер квартиры гость уже назвал в адресе — второй раз не спрашиваем
+        data["apartment"] = apartment
     if len(address) < 5:
         await ch.send(ev.chat_id, Out(
             text="⚠️ Напишите улицу и номер дома — например, <b>Северная 12</b>."))
@@ -769,7 +799,15 @@ async def _ask_date(ev: Event, ch: Channel) -> None:
             kb=[[_manager_btn()], [Btn(text="⬅️ В меню", data="g:menu")]]))
         return
 
-    chosen = set(data.get("dates", []))
+    # из черновика могли остаться даты, которые уже прошли: снимаем их отметки,
+    # иначе счётчик «выбрано 2 дня» врёт, а гость видит вчерашний заказ
+    offered = {fmt_date_iso(day) for day, _ in dates}
+    kept = [iso for iso in data.get("dates", []) if iso in offered]
+    dropped = len(data.get("dates", [])) - len(kept)
+    if dropped:
+        data["dates"] = kept
+    chosen = set(kept)
+
     multi = await repo.get_bool("multiday_enabled", True)
     await _set_state(ev, S_DATE, data)
 
@@ -790,7 +828,7 @@ async def _ask_date(ev: Event, ch: Channel) -> None:
         text.append(f"📍 {esc(obj['address'])}")
     elif data.get("address"):
         text.append(f"📍 {esc(data['address'])}")
-    text.append(f"💰 {fmt_money(availability.price_for(obj))} за сет · "
+    text.append(f"💰 {_price_hint(obj, [b for _, b in dates])} за сет · "
                 f"доставка {esc(repo.delivery_window(obj))}")
     text.append("")
     if chosen:
@@ -801,6 +839,10 @@ async def _ask_date(ev: Event, ch: Channel) -> None:
     else:
         text.append("👆 <b>Нажмите на дату.</b> Рядом с ней — сет, "
                     "который подадут в этот день.")
+    if dropped:
+        text.append("")
+        text.append(f"<i>Отметки с прошедших дат сняты — их уже не привезти "
+                    f"({dropped} шт.).</i>")
     text.append(f"<i>Заказы принимаем до {esc(obj['cutoff_time'])} накануне.</i>")
     await _respond(ev, ch, Out(text="\n".join(text), kb=kb))
 
@@ -861,7 +903,6 @@ async def _ask_qty(ev: Event, ch: Channel) -> None:
         return
 
     low, high = availability.qty_limits(obj)
-    price = availability.price_for(obj)
     tiers = await pricing.tiers()
     await _set_state(ev, S_QTY, data)
 
@@ -871,7 +912,8 @@ async def _ask_qty(ev: Event, ch: Channel) -> None:
     lines = ["🔢 <b>Сколько наборов привозить каждый день?</b>", ""]
     lines.append(await _dates_preview(dates))
     lines.append("")
-    lines.append(f"💰 {fmt_money(price)} за сет")
+    lines.append(f"💰 {await _price_hint_for_dates(obj, dates)} за сет")
+    price = availability.price_for(obj, breakfast)
     if tiers:
         lines.append("")
         lines.append("🎁 <b>Чем больше наборов в день, тем дешевле каждый:</b>")
@@ -918,6 +960,11 @@ async def _pick_qty(ev: Event, ch: Channel, qty: int) -> None:
         await _ask_qty(ev, ch)
         return
     data["qty"] = qty
+    if data.get("apartment"):
+        # квартиру гость уже назвал в адресе — шаг пропускаем
+        await _set_state(ev, S_PHONE, data)
+        await _ask_phone(ev, ch)
+        return
     await _set_state(ev, S_APARTMENT, data)
     await _ask_apartment(ev, ch)
 

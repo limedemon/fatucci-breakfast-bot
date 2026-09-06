@@ -641,6 +641,96 @@ async def main() -> None:
 
     await repo.update_object(general["id"], price_kop=90000)
 
+    print("\n— Цена сета важнее цены дома —")
+    obj = await repo.get_object_by_code("demo1")
+    sets = await repo.list_sets(active_only=True)
+    await repo.update_object(obj["id"], price_kop=5000)          # дом — 50 ₽
+    for item in sets:
+        await repo.update_set(item["id"], price_kop=100000)      # сеты — 1 000 ₽
+
+    ch.clear()
+    await route(guest_event("start", payload="demo1"), ch)
+    check("1 000 ₽" in ch.texts() and "50 ₽" not in ch.texts(),
+          "в приветствии цена сета, а не дома")
+
+    ch.clear()
+    await route(guest_event("callback", payload="g:order", callback_id="p1"), ch)
+    check("1 000 ₽ за сет" in ch.texts(), "на экране дат — та же цена")
+    first_date = ch.find_button("g:date:")
+    await route(guest_event("callback", payload=first_date, callback_id="p2"), ch)
+    ch.clear()
+    await route(guest_event("callback", payload="g:dates", callback_id="p3"), ch)
+    check("1 000 ₽ за сет" in ch.texts(), "и на экране количества")
+
+    await route(guest_event("callback", payload="g:qty:1", callback_id="p4"), ch)
+    await route(guest_event("callback", payload="g:reapt", callback_id="p5"), ch)
+    await route(guest_event("callback", payload="g:rephone", callback_id="p6"), ch)
+    await route(guest_event("callback", payload="g:skipa", callback_id="p7"), ch)
+    ch.clear()
+    await route(guest_event("callback", payload="g:skip", callback_id="p8"), ch)
+    check("1 000 ₽" in ch.texts(), "и в итоге к оплате — столько же")
+
+    ch.clear()
+    await route(guest_event("callback", payload="g:confirm", callback_id="p9"), ch)
+    order = (await repo.list_orders(limit=1, user_key=("tg", GUEST)))[0]
+    check(order["price_kop"] == 100000,
+          f"в заказ записана цена сета ({order['price_kop']})")
+
+    # у сетов разная цена — показываем диапазон, а не одну цифру
+    await repo.update_set(sets[0]["id"], price_kop=120000)
+    ch.clear()
+    await route(guest_event("callback", payload="g:order", callback_id="p10"), ch)
+    check("от 1 000 ₽ до 1 200 ₽" in ch.texts(),
+          "при разных ценах сетов показан диапазон")
+
+    for item in sets:
+        await repo.update_set(item["id"], price_kop=None)
+    await repo.update_object(obj["id"], price_kop=90000)
+    ch.clear()
+    await route(guest_event("callback", payload="g:order", callback_id="p11"), ch)
+    check("900 ₽ за сет" in ch.texts(), "без своей цены сета берётся цена дома")
+
+    print("\n— Старые даты в черновике —")
+    session = await repo.get_session("tg", GUEST)
+    data = repo.json_loads(session["data"], {})
+    data["dates"] = ["2020-01-01", "2020-01-02"] + data.get("dates", [])
+    await repo.save_session("tg", GUEST, "date", data, chat_id=GUEST,
+                            object_id=session["object_id"])
+    ch.clear()
+    await route(guest_event("callback", payload="g:order", callback_id="d1"), ch)
+    check("прошедших дат сняты" in ch.texts(), "гостю сказали, что старые даты сняты")
+    session = await repo.get_session("tg", GUEST)
+    left = repo.json_loads(session["data"], {}).get("dates", [])
+    check(not any(iso.startswith("2020") for iso in left),
+          f"прошедшие даты убраны из черновика: {left}")
+
+    print("\n— Номер квартиры из адреса —")
+    HOUSE = "601"
+    ch.clear()
+    await route(guest_event("start", HOUSE, payload="obshiy"), ch)
+    await route(guest_event("callback", HOUSE, payload="g:order", callback_id="k1"), ch)
+    await route(guest_event("text", HOUSE, text="Навагинская 16, кв 60"), ch)
+    session = await repo.get_session("tg", HOUSE)
+    draft = repo.json_loads(session["data"], {})
+    check(draft.get("apartment") == "60", f"номер квартиры взят из адреса: {draft.get('apartment')}")
+    check(draft.get("address") == "Навагинская 16",
+          f"в адресе он не задваивается: {draft.get('address')}")
+
+    picks = ch.find_all("g:date:")[:1]
+    for iso in picks:
+        await route(guest_event("callback", HOUSE, payload=iso, callback_id="k2"), ch)
+    await route(guest_event("callback", HOUSE, payload="g:dates", callback_id="k3"), ch)
+    ch.clear()
+    await route(guest_event("callback", HOUSE, payload="g:qty:1", callback_id="k4"), ch)
+    check("телефон" in ch.texts().lower(),
+          "про апартаменты второй раз не спрашивают — сразу телефон")
+
+    await route(guest_event("contact", HOUSE, phone="+7 999 123-45-67"), ch)
+    await route(guest_event("callback", HOUSE, payload="g:skipa", callback_id="k5"), ch)
+    ch.clear()
+    await route(guest_event("callback", HOUSE, payload="g:skip", callback_id="k6"), ch)
+    check("60" in ch.texts(), "в карточке заказа номер квартиры на месте")
+
     print("\n— Сопоставление адресов —")
     for typed, expect in [("г. Сочи, ул. Северная, д. 12", "demo1"),
                           ("северная 12", "demo1"),
