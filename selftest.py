@@ -636,8 +636,21 @@ async def main() -> None:
 
     ch.clear()
     await route(admin_event("callback", payload=f"a:b:c:{general['id']}", callback_id="a13"), ch)
-    check("адреса вне списка" in ch.texts(),
+    check("адресов вне списка" in ch.texts(),
           "в карточке объекта сказано, на что влияет его цена")
+    check("не перебивают" in ch.texts(),
+          "и что цены сетов её не перебивают")
+
+    # у сета своя цена, но адрес вне списка всё равно едет по цене «Общего QR»
+    day_set = (await repo.list_sets(active_only=True))[0]
+    await repo.update_set(day_set["id"], price_kop=100000)
+    day_set = await repo.get_set(day_set["id"])
+    check(availability.price_for(general, day_set) == 150000,
+          "цена «Общего QR» главнее цены сета")
+    known = await repo.get_object_by_code("demo1")
+    check(availability.price_for(known, day_set) == 100000,
+          "а у дома из списка цена сета по-прежнему важнее")
+    await repo.update_set(day_set["id"], price_kop=None)
 
     await repo.update_object(general["id"], price_kop=90000)
 
