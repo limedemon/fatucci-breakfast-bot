@@ -488,6 +488,41 @@ async def main() -> None:
     await repo.set_text("pay_details", "")
     await repo.set_setting("pm_token", TEST_TOKEN)
 
+    print("\n— Сумма меньше минимальной для счёта —")
+    obj = await repo.get_object_by_code("demo1")
+    old_price = obj["price_kop"]
+    await repo.set_setting("pm_token", TEST_TOKEN)
+    await repo.set_setting("pay_by_details", "0")
+    await repo.set_text("pay_details", "Перевод по номеру +7 900 000-00-00.")
+    await repo.update_object(obj["id"], price_kop=5000)      # 50 ₽ за сет
+    check(await payments.invoice_available(), "касса подключена")
+
+    group = await place_order(ch, dates=1, qty=1, who=GUEST2)
+    ch.clear()
+    await route(admin_event("callback", chat_id=CHAT,
+                            payload=f"a:ord:{group[0]['id']}:{statuses.ACCEPTED}",
+                            callback_id="m1"), ch)
+    guest_text = ch.to(GUEST2)
+    check(not ch.invoices, "счёт на 50 ₽ не выставляется — Telegram не примет")
+    check("Счёт придёт" not in guest_text,
+          "и гостю его не обещают")
+    check("+7 900 000-00-00" in guest_text, "вместо счёта пришли реквизиты")
+    check(bool(ch.find_button("g:paid:")), "с кнопкой «Я оплатил»")
+    check("не выставить" in ch.to(CHAT), "менеджерам объяснили, почему без счёта")
+
+    ok, report = await payments.check_setup()
+    check("ниже" in report and "не примет" in report,
+          "проверка оплаты предупреждает про низкие цены")
+
+    await repo.set_text("pay_details", "")
+    await repo.update_object(obj["id"], price_kop=old_price)
+    group = await place_order(ch, dates=1, qty=1, who=GUEST2)
+    ch.clear()
+    await route(admin_event("callback", chat_id=CHAT,
+                            payload=f"a:ord:{group[0]['id']}:{statuses.ACCEPTED}",
+                            callback_id="m2"), ch)
+    check(len(ch.invoices) == 1, "на нормальной сумме счёт выставляется как обычно")
+
     print("\n— Без настроенной оплаты заказ не оформляется —")
     await repo.set_setting("pm_token", "")
     await repo.set_text("pay_details", "")

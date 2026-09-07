@@ -183,6 +183,7 @@ async def check_setup() -> tuple[bool, str]:
             "Скопируйте токен заново: @BotFather → /mybots → бот → Payments."
         )
 
+    small = await _too_cheap_hint()
     if is_test(token):
         return True, (
             "✅ <b>Касса подключена — тестовый режим</b>\n\n"
@@ -192,11 +193,30 @@ async def check_setup() -> tuple[bool, str]:
             "<code>4111 1111 1111 1111</code>, срок — любой будущий, CVC любой.\n\n"
             "⚠️ В тестовом режиме Telegram показывает счёт не всем — проверяйте "
             "на своём аккаунте.\n\n"
-            "Для настоящих платежей получите у @BotFather токен LIVE."
+            "Для настоящих платежей получите у @BotFather токен LIVE." + small
         )
 
     return True, (
         "✅ <b>Касса подключена — боевой режим</b>\n\n"
         "Деньги списываются по-настоящему, оплата подтверждается автоматически.\n"
-        "Проверьте на небольшой сумме — например, оформите заказ на себя."
+        "Проверьте на небольшой сумме — например, оформите заказ на себя." + small
     )
+
+
+async def _too_cheap_hint() -> str:
+    """Предупредить, если цены ниже минимальной суммы счёта.
+
+    Telegram не пропускает совсем мелкие платежи. Такой заказ уходит на оплату
+    переводом — и это выглядит как «касса не работает», хотя дело в сумме.
+    """
+    prices = [int(row["price_kop"] or 0)
+              for row in await repo.list_objects(active_only=True)]
+    prices += [int(row["price_kop"] or 0) for row in await repo.list_sets(active_only=True)]
+    low = [price for price in prices if 0 < price < MIN_AMOUNT_KOP]
+    if not low:
+        return ""
+    from .utils import fmt_money
+
+    return (f"\n\n⚠️ Есть цены ниже {fmt_money(MIN_AMOUNT_KOP)} "
+            f"(минимум — {fmt_money(min(low))}). Счёт на такую сумму Telegram "
+            "не примет: по таким заказам гость получит реквизиты для перевода.")

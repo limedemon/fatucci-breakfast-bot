@@ -129,7 +129,10 @@ async def _send_payment_request(group: list[Row]) -> None:
     total = notify.group_total(group)
     number = head["group_key"] or head["number"]
 
-    if await payments.invoice_available():
+    # Telegram не принимает совсем мелкие суммы. Проверяем это заранее:
+    # иначе гостю обещали бы счёт, а следом приходили бы реквизиты.
+    too_small = total < payments.MIN_AMOUNT_KOP
+    if await payments.invoice_available() and not too_small:
         text = await notify.group_status_text(
             group, "status_accepted", pay_details=await repo.render_text("pay_by_invoice"))
         await notify.notify_guest(head, text)
@@ -144,6 +147,12 @@ async def _send_payment_request(group: list[Row]) -> None:
             [Btn(text="✅ Я оплатил", data=f"g:paid:{head['id']}", intent="positive")],
             [Btn(text="📦 Мои заказы", data="g:my")],
         ])
+        if too_small and await payments.invoice_available():
+            await notify.send_to_admins(
+                f"ℹ️ Заказ <b>№{number}</b> на {fmt_money(total)}: счёт в Telegram "
+                f"не выставить — меньше {fmt_money(payments.MIN_AMOUNT_KOP)}. "
+                "Гость получил реквизиты для перевода."
+            )
         return
 
     # оплатить нечем — гостя не бросаем, зовём менеджера
