@@ -775,9 +775,9 @@ async def _input_address(ev: Event, ch: Channel, text: str, data: dict[str, Any]
     await repo.update_user(ev.channel, ev.user_id, object_id=general["id"],
                            custom_address=address, address_status=repo.ADDRESS_PENDING)
 
-    await ch.send(ev.chat_id, Out(text=await repo.render_text(
-        "address_unknown", address=esc(address),
-        price=fmt_money(availability.price_for(general)))))
+    # Гостю про «дома нет в списке» не пишем: он читал это как «ждите менеджера»
+    # и не нажимал «Далее». Адрес и цена и так видны на экране выбора дат,
+    # а менеджеры получают карточку и решают отдельно.
     if user is not None and known.lower() != address.lower():
         # про один и тот же адрес менеджеров дёргаем один раз
         user = await repo.get_user(ev.channel, ev.user_id)

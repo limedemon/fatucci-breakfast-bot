@@ -173,7 +173,6 @@ TEXT_TITLES: dict[str, str] = {
     "daily_reminder": "Ежедневное «успейте заказать»",
     "too_late": "Приём заказов на завтра закрыт",
     "ask_address": "Запрос адреса (общий QR)",
-    "address_unknown": "Адрес не найден среди объектов",
     "ask_allergies": "Запрос про аллергии",
     "ask_apartment": "Запрос номера апартаментов",
     "ask_phone": "Запрос телефона",

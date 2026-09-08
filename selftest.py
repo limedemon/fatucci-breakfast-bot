@@ -596,8 +596,9 @@ async def main() -> None:
     await route(guest_event("callback", payload="g:order", callback_id="a2"), ch)
     await route(guest_event("text", text="Неизвестная улица 99"), ch)
     guest_text = ch.to(GUEST)
-    check("Записали адрес" in guest_text, "адрес принят без лишних условий")
-    check("за сет" in guest_text, "гостю сразу названа цена по такому адресу")
+    check("нет в списке" not in guest_text and "менеджер проверит" not in guest_text,
+          "гостя не пугаем сообщением, что дома нет в списке")
+    check("за сет" in guest_text, "цена по такому адресу видна на экране дат")
     check(bool(ch.find_button("g:date:")), "гость сразу переходит к выбору дат")
 
     print("\n— Решение менеджера по адресу —")
