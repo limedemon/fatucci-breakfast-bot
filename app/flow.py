@@ -480,7 +480,7 @@ async def _show_my_order(ev: Event, ch: Channel, order_id: int) -> None:
              "предыдущего дня доставки.</i>")
 
     kb: list[list[Btn]] = []
-    if order["status"] == statuses.ACCEPTED and not await payments.invoice_available():
+    if order["status"] == statuses.ACCEPTED and await payments.details_configured():
         kb.append([Btn(text="✅ Я оплатил", data=f"g:paid:{order['id']}", intent="positive")])
     if order["status"] == statuses.DELIVERED:
         kb.append([Btn(text="✅ Я получил заказ", data=f"g:got:{order['id']}", intent="positive")])

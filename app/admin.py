@@ -85,6 +85,13 @@ OFFER_FIELDS: list[FieldSpec] = [
     ("sort_order", "Порядок в списке", "int"),
 ]
 
+#: Поля-переключатели с несколькими положениями: нажатие меняет на следующее.
+#: Текущее значение у некоторых полей вычисляется, а не лежит в базе как есть.
+SETTING_CHOICES: dict[str, list[tuple[str, str]]] = {
+    "pay_mode": [(code, title) for code, title in payments.MODES.items()],
+}
+SETTING_CHOICE_CURRENT = {"pay_mode": lambda: payments.mode()}
+
 SETTING_SECTIONS: dict[str, tuple[str, list[FieldSpec]]] = {
     "gen": ("⚙️ Общие", [
         ("orders_chat_id", "Чат для заказов (проще — /clip в группе)", "text"),
@@ -136,7 +143,7 @@ SETTING_SECTIONS: dict[str, tuple[str, list[FieldSpec]]] = {
     "pay": ("💳 Оплата", [
         ("pay_enabled", "Принимать заказы и оплату", "bool"),
         ("pm_token", "Токен кассы от @BotFather", "secret"),
-        ("pay_by_details", "Платить переводом, а не счётом", "bool"),
+        ("pay_mode", "Способ оплаты", "choice"),
         ("pay_link", "Ссылка на оплату (если есть)", "text"),
     ]),
 }
@@ -170,6 +177,7 @@ TEXT_TITLES: dict[str, str] = {
     "no_dates": "Нет доступных дат",
     "rules": "Условия заказа (правила)",
     "pay_by_invoice": "Сообщение перед счётом",
+    "pay_choice": "Заголовок, когда способа два",
     "daily_reminder": "Ежедневное «успейте заказать»",
     "too_late": "Приём заказов на завтра закрыт",
     "ask_address": "Запрос адреса (общий QR)",
@@ -1322,6 +1330,14 @@ async def _settings_route(ev: Event, ch: Channel, args: list[str]) -> None:
         current = await repo.get_bool(key)
         await repo.set_setting(key, "0" if current else "1")
         await _settings_section(ev, ch, args[1])
+    elif action == "c":
+        code, key = args[1], args[2]
+        options = [option for option, _ in SETTING_CHOICES[key]]
+        resolver = SETTING_CHOICE_CURRENT.get(key)
+        current = await resolver() if resolver else await repo.get_setting(key)
+        index = options.index(current) if current in options else -1
+        await repo.set_setting(key, options[(index + 1) % len(options)])
+        await _settings_section(ev, ch, code)
     elif action == "yk":
         await _answer(ev, ch, "Проверяю…")
         ok, message = await payments.check_setup()
@@ -1347,6 +1363,14 @@ async def _settings_section(ev: Event, ch: Channel, code: str) -> None:
             state = "✅ вкл" if value in ("1", "true", "yes") else "🚫 выкл"
             lines.append(f"{esc(label)}: {state}")
             kb.append([Btn(text=f"{state} · {label}", data=f"a:cfg:t:{code}:{key}")])
+        elif kind == "choice":
+            options = SETTING_CHOICES[key]
+            resolver = SETTING_CHOICE_CURRENT.get(key)
+            current = await resolver() if resolver else value
+            titles = dict(options)
+            lines.append(f"{esc(label)}: {esc(titles.get(current, current))}")
+            kb.append([Btn(text=f"🔁 {titles.get(current, label)}",
+                           data=f"a:cfg:c:{code}:{key}")])
         else:
             if kind == "secret":
                 shown = mask_secret(value)
@@ -1398,17 +1422,31 @@ async def _pay_hint() -> str:
         return ("⛔ <b>Заказы сейчас не принимаются.</b>\n"
                 "Переключатель «Принимать заказы и оплату» выключен — гость видит "
                 "сообщение, что заказать пока нельзя. Включите его, и заработает "
-                "способ оплаты, настроенный ниже.")
-    if await payments.invoice_available():
+                "способ оплаты, выбранный ниже.")
+
+    current = await payments.mode()
+    invoice_ready = await payments.invoice_available()
+    details_ready = await payments.details_configured()
+
+    if current == payments.BOTH and invoice_ready and details_ready:
+        return ("✅ <b>Гость выбирает сам:</b> карта по счёту или перевод "
+                "по реквизитам. Карту подтверждает Telegram, перевод — вы кнопкой "
+                "в сообщении «Гость сообщил об оплате».")
+    if current == payments.INVOICE and invoice_ready:
+        note = ("" if not details_ready else
+                "\nРеквизиты заполнены — они уйдут запасным путём, если счёт "
+                "выставить не получится.")
         return ("✅ <b>Сейчас гость платит счётом в Telegram</b> — картой, "
-                "оплата подтверждается сама.\n"
-                "Чтобы вместо этого принимать переводы по реквизитам, включите "
-                "«Платить переводом, а не счётом».")
-    if await payments.details_configured():
+                "оплата подтверждается сама." + note)
+    if current == payments.DETAILS and details_ready:
         return ("✅ <b>Сейчас гость платит переводом по реквизитам</b> и нажимает "
                 "«Я оплатил» — вам придёт сообщение с кнопками «Подтвердить оплату» "
                 "и «Оплата не пришла».\n"
                 "Сами реквизиты — в ✍️ Тексты бота → «Реквизиты для оплаты».")
+    if invoice_ready or details_ready:
+        return ("⚠️ <b>Выбранный способ настроен не до конца</b> — нажмите "
+                "«Проверить оплату», там написано, чего не хватает. Пока работает "
+                "то, что настроено.")
     return ("⚠️ <b>Оплата не настроена — заказы не принимаются.</b>\n"
             "Заполните «Реквизиты для оплаты» в ✍️ Тексты бота либо вставьте токен "
             "кассы выше. Кнопка «Проверить оплату» подскажет подробнее.")

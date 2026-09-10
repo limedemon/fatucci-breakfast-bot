@@ -20,13 +20,33 @@ from typing import Any, Optional
 
 from . import repo
 from .config import cfg
-from .utils import fmt_date
+from .utils import fmt_date, fmt_money
 
 log = logging.getLogger(__name__)
 Row = Any
 
 #: Telegram не пропускает совсем мелкие суммы
 MIN_AMOUNT_KOP = 6000
+
+#: Способы оплаты. «Оба» — гость сам решает: картой по счёту или переводом.
+INVOICE, DETAILS, BOTH = "invoice", "details", "both"
+MODES = {
+    INVOICE: "💳 Только счёт картой",
+    DETAILS: "🏦 Только перевод по реквизитам",
+    BOTH: "💳🏦 Оба способа — гость выбирает",
+}
+
+
+async def mode() -> str:
+    """Какой способ оплаты сейчас включён.
+
+    Пустая настройка означает «как было раньше»: до появления режимов
+    способ задавался переключателем «платить переводом».
+    """
+    value = (await repo.get_setting("pay_mode", "")).strip().lower()
+    if value in MODES:
+        return value
+    return DETAILS if await repo.get_bool("pay_by_details", False) else INVOICE
 
 
 # --------------------------------------------------------- токен провайдера
@@ -53,12 +73,12 @@ async def is_enabled() -> bool:
 async def invoice_available() -> bool:
     """Можно ли выставить встроенный счёт Telegram.
 
-    Переключатель «Оплата по реквизитам» перебивает кассу: токен остаётся
-    в настройках, но счёт не выставляется — гость платит переводом.
+    Режим «только перевод» кассу не отключает: токен остаётся в настройках,
+    просто счёт не выставляется, пока режим не переключат обратно.
     """
     if not await is_enabled():
         return False
-    if await repo.get_bool("pay_by_details", False):
+    if await mode() == DETAILS:
         return False
     return token_looks_valid(await provider_token())
 
@@ -81,6 +101,11 @@ async def details_configured() -> bool:
         return False
     return bool((await repo.get_text("pay_details", "")).strip()
                 or (await repo.get_setting("pay_link")).strip())
+
+
+async def details_offered() -> bool:
+    """Показываем ли гостю реквизиты сами, а не только как запасной путь."""
+    return await details_configured() and await mode() in (DETAILS, BOTH)
 
 
 async def available() -> bool:
@@ -133,23 +158,46 @@ async def check_setup() -> tuple[bool, str]:
         )
 
     token = await provider_token()
-    if token and await repo.get_bool("pay_by_details", False):
+    current = await mode()
+
+    if current == BOTH:
+        if not token_looks_valid(token) or not await details_configured():
+            missing = []
+            if not token_looks_valid(token):
+                missing.append("токен кассы в поле выше")
+            if not await details_configured():
+                missing.append("текст «Реквизиты для оплаты» в ✍️ Тексты бота")
+            return False, (
+                "⚠️ <b>Для режима «Оба способа» не хватает настроек</b>\n\n"
+                "Заполните: " + ", ".join(missing) + ".\n\n"
+                "Или переключите способ оплаты на тот, что уже настроен."
+            )
+        return True, (
+            "✅ <b>Оба способа — гость выбирает</b>\n\n"
+            "После подтверждения заказа гость получает реквизиты для перевода "
+            "с кнопкой «Я оплатил» и счёт картой следующим сообщением. "
+            "Оплату картой подтверждает Telegram, перевод — вы кнопкой.\n\n"
+            "Счёт не выставляется, если сумма меньше "
+            f"{fmt_money(MIN_AMOUNT_KOP)} — такой заказ уйдёт только переводом.\n\n"
+            "Сейчас гость видит это:\n\n" + await details_text() + await _too_cheap_hint()
+        )
+
+    if current == DETAILS:
         if await details_configured():
+            saved = ("\n\nТокен кассы сохранён — переключите способ оплаты, "
+                     "чтобы вернуться к счетам, вводить заново не придётся."
+                     if token else "")
             return True, (
                 "✅ <b>Оплата по реквизитам</b>\n\n"
-                "Токен кассы сохранён, но выключен переключателем "
-                "<b>«Оплата по реквизитам»</b> — гость платит переводом "
-                "и нажимает «Я оплатил», а вы подтверждаете поступление кнопкой.\n\n"
-                "Выключите переключатель, когда захотите вернуться к счетам "
-                "в Telegram — токен вводить заново не придётся.\n\n"
+                "Гость платит переводом и нажимает «Я оплатил», а вы "
+                "подтверждаете поступление кнопкой." + saved + "\n\n"
                 "Сейчас гость видит это:\n\n" + await details_text()
             )
         return False, (
             "⚠️ <b>Реквизиты не заполнены — заказы не принимаются</b>\n\n"
-            "Включён переключатель «Оплата по реквизитам», но сами реквизиты "
+            "Выбран способ «Только перевод по реквизитам», но сами реквизиты "
             "пустые. Заполните текст <b>«Реквизиты для оплаты»</b> в разделе "
-            "✍️ Тексты бота — или выключите переключатель, тогда заработает "
-            "счёт от подключённой кассы."
+            "✍️ Тексты бота — или переключите способ оплаты на счёт."
         )
 
     if not token:
@@ -215,8 +263,6 @@ async def _too_cheap_hint() -> str:
     low = [price for price in prices if 0 < price < MIN_AMOUNT_KOP]
     if not low:
         return ""
-    from .utils import fmt_money
-
     return (f"\n\n⚠️ Есть цены ниже {fmt_money(MIN_AMOUNT_KOP)} "
             f"(минимум — {fmt_money(min(low))}). Счёт на такую сумму Telegram "
             "не примет: по таким заказам гость получит реквизиты для перевода.")

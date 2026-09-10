@@ -461,8 +461,8 @@ async def main() -> None:
     check(not ch.invoices and bool(ch.find_button("g:paid:")),
           "гость получает реквизиты, а не счёт")
     ok, report = await payments.check_setup()
-    check(ok and "переключател" in report.lower(),
-          "проверка оплаты объясняет, что счёт выключен переключателем")
+    check(ok and "способ оплаты" in report.lower(),
+          "проверка оплаты объясняет, что счёт выключен выбором способа")
     check(await repo.get_setting("pm_token") == TEST_TOKEN, "токен кассы при этом сохранён")
 
     ch.clear()
@@ -487,6 +487,66 @@ async def main() -> None:
 
     await repo.set_text("pay_details", "")
     await repo.set_setting("pm_token", TEST_TOKEN)
+
+    print("\n— Оба способа оплаты сразу —")
+    await repo.set_setting("pm_token", TEST_TOKEN)
+    await repo.set_text("pay_details", "Перевод по номеру +7 900 000-00-00.")
+    await repo.set_setting("pay_mode", payments.BOTH)
+    check(await payments.mode() == payments.BOTH, "режим «оба способа» включён")
+    check(await payments.invoice_available() and await payments.details_offered(),
+          "работают и счёт, и реквизиты")
+
+    group = await place_order(ch, dates=1, qty=1, who=GUEST2)
+    ch.clear()
+    await route(admin_event("callback", chat_id=CHAT,
+                            payload=f"a:ord:{group[0]['id']}:{statuses.ACCEPTED}",
+                            callback_id="b1"), ch)
+    guest_text = ch.to(GUEST2)
+    check("+7 900 000-00-00" in guest_text, "гость получил реквизиты")
+    check("картой или переводом" in guest_text, "и подсказку, что способа два")
+    check(len(ch.invoices) == 1, "и счёт картой тем же заходом")
+    check(bool(ch.find_button("g:paid:")), "кнопка «Я оплатил» на месте")
+
+    # платит картой — заказ закрывается сам
+    ch.clear()
+    await route(Event(channel="tg", user_id=GUEST2, chat_id=GUEST2, kind="payment",
+                      payload=payments.invoice_payload(group[0]["id"]),
+                      raw={"charge_id": "ch_both"}), ch)
+    fresh = await repo.group_orders(group[0]["group_key"])
+    check(all(row["status"] == statuses.PAID for row in fresh),
+          "оплата картой в этом режиме подтверждается сама")
+
+    # тот же режим, но гость выбрал перевод
+    group = await place_order(ch, dates=1, qty=1, who=GUEST2)
+    await route(admin_event("callback", chat_id=CHAT,
+                            payload=f"a:ord:{group[0]['id']}:{statuses.ACCEPTED}",
+                            callback_id="b2"), ch)
+    ch.clear()
+    await route(guest_event("callback", GUEST2, payload=f"g:paid:{group[0]['id']}",
+                            callback_id="b3"), ch)
+    check("скриншот" in ch.texts().lower(), "перевод идёт обычным путём — просят скрин")
+
+    ok, report = await payments.check_setup()
+    check(ok and "оба способа" in report.lower(),
+          "проверка оплаты описывает режим «оба»")
+
+    ch.clear()
+    await route(admin_event("callback", payload="a:cfg:s:pay", callback_id="b4"), ch)
+    check("выбирает сам" in ch.texts(), "в разделе оплаты видно, что способа два")
+    switch = ch.find_button("a:cfg:c:pay:pay_mode")
+    check(bool(switch), "есть кнопка переключения способа")
+
+    ch.clear()
+    await route(admin_event("callback", payload=switch, callback_id="b5"), ch)
+    check(await payments.mode() == payments.INVOICE,
+          f"нажатие переключает по кругу: {await payments.mode()}")
+    await route(admin_event("callback", payload=switch, callback_id="b6"), ch)
+    check(await payments.mode() == payments.DETAILS, "и дальше на реквизиты")
+    await route(admin_event("callback", payload=switch, callback_id="b7"), ch)
+    check(await payments.mode() == payments.BOTH, "и обратно на оба")
+
+    await repo.set_setting("pay_mode", payments.INVOICE)
+    await repo.set_text("pay_details", "")
 
     print("\n— Сумма меньше минимальной для счёта —")
     obj = await repo.get_object_by_code("demo1")

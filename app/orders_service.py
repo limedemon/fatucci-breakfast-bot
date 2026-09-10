@@ -132,21 +132,35 @@ async def _send_payment_request(group: list[Row]) -> None:
     # Telegram не принимает совсем мелкие суммы. Проверяем это заранее:
     # иначе гостю обещали бы счёт, а следом приходили бы реквизиты.
     too_small = total < payments.MIN_AMOUNT_KOP
-    if await payments.invoice_available() and not too_small:
+    can_invoice = await payments.invoice_available() and not too_small
+    with_details = await payments.details_offered()
+    # реквизиты годятся и как запасной путь: касса есть, но счёт не выставить
+    fallback = await payments.details_configured() and not can_invoice
+
+    if can_invoice and not with_details:
         text = await notify.group_status_text(
             group, "status_accepted", pay_details=await repo.render_text("pay_by_invoice"))
         await notify.notify_guest(head, text)
         if await _send_invoice(group, total):
             return
         log.warning("Счёт по заказу %s не выставлен", number)
+        fallback = await payments.details_configured()
 
-    if await payments.details_configured():
+    if with_details or fallback:
+        parts = []
+        if can_invoice:
+            # оба способа сразу: сначала про карту, потом реквизиты для перевода
+            parts.append(await repo.render_text("pay_choice"))
+            parts.append(await repo.render_text("pay_by_invoice"))
+        parts.append(await payments.details_text())
         text = await notify.group_status_text(
-            group, "status_accepted", pay_details=await payments.details_text())
+            group, "status_accepted", pay_details="\n\n".join(parts))
         await notify.notify_guest(head, text, [
             [Btn(text="✅ Я оплатил", data=f"g:paid:{head['id']}", intent="positive")],
             [Btn(text="📦 Мои заказы", data="g:my")],
         ])
+        if can_invoice and not await _send_invoice(group, total):
+            log.warning("Счёт по заказу %s не выставлен", number)
         if too_small and await payments.invoice_available():
             await notify.send_to_admins(
                 f"ℹ️ Заказ <b>№{number}</b> на {fmt_money(total)}: счёт в Telegram "
