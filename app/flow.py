@@ -190,8 +190,12 @@ async def _show_main_menu(ev: Event, ch: Channel, new_message: bool = False) -> 
     if ch.name == TG:
         kb.append([_manager_btn()])
     else:
-        # в MAX нет клавиатуры под полем ввода — «Поддержку» даём кнопкой здесь
+        # в MAX нет клавиатуры под полем ввода — «Поддержку» и админку даём кнопками
         kb.append([_manager_btn(), Btn(text="🆘 Поддержка", data="g:support")])
+        from . import admins
+
+        if await admins.is_admin(ev.user_id, ev.channel):
+            kb.append([Btn(text="🛠 Админ-панель", data="a:h")])
 
     await _respond(ev, ch, Out(text=text, kb=kb), new_message=new_message)
 

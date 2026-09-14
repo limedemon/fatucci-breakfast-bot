@@ -7,8 +7,8 @@
 Решает тот, кто нажал первым. У остальных сообщение с заявкой обновляется:
 видно, что уже решено и кем, — чтобы двое не выдали доступ одновременно.
 
-Права выдаются в том мессенджере, откуда пришла заявка. Админ-панель живёт
-в Telegram; админ из MAX получает заявки и решает их у себя.
+Права выдаются в том мессенджере, откуда пришла заявка: админ-панель есть
+и в Telegram, и в MAX.
 """
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ def is_request_command(text: str) -> bool:
     return len(words) == 2 and words[0].split("@")[0] == "/admin" and words[1] == "request"
 
 
-def _dm_chat(channel: str, user_id: int | str) -> str:
+def dm_chat(channel: str, user_id: int | str) -> str:
     """Адрес личного чата с человеком по его ID."""
     return f"u{user_id}" if channel != TG else str(user_id)
 
@@ -58,7 +58,8 @@ async def request_rights(ev: Event, ch: Channel) -> None:
     """Принять заявку от человека и разослать её администраторам."""
     # в Telegram у личного чата номер совпадает с номером человека; в группе
     # заявку не принимаем — там её увидели бы все участники
-    if ch.name == TG and str(ev.chat_id) != str(ev.user_id):
+    if (str(ev.chat_id) != str(ev.user_id) if ch.name == TG
+            else ev.raw.get("chat_type") == "chat"):
         await ch.send(ev.chat_id, Out(
             text="ℹ️ Запрос прав отправляется в личном чате с ботом."))
         return
@@ -104,7 +105,7 @@ async def _notify_admins(request: Row) -> int:
         channel = get_channel(channel_name)
         if channel is None:
             continue
-        chat = _dm_chat(channel_name, admin_id)
+        chat = dm_chat(channel_name, admin_id)
         message_id = await channel.send(chat, Out(text=text, kb=kb))
         if message_id:
             sent.append({"channel": channel_name, "chat_id": chat, "message_id": message_id})
@@ -161,13 +162,11 @@ async def decide(ev: Event, ch: Channel, action: str, request_id: int) -> None:
                          added_by=f"заявка, решил {actor}", channel=request["channel"])
         await _tell_requester(request, (
             "✅ <b>Вам выданы права администратора</b>\n\n"
-            + ("Откройте /admin — там управление ботом."
-               if request["channel"] == TG else
-               "Заявки на доступ будут приходить сюда. Админ-панель бота — в Telegram.")))
+            + "Откройте /admin — там управление ботом."))
         requester = get_channel(request["channel"])
         if request["channel"] == TG and requester is not None:
             await requester.show_admin_button(
-                _dm_chat(TG, request["ext_id"]),
+                dm_chat(TG, request["ext_id"]),
                 "🛠 Внизу закреплены <b>Админ-панель</b> и <b>Поддержка</b>.")
     elif status == REJECTED:
         await _tell_requester(request, "❌ <b>Запрос отклонён</b>\n\n"
@@ -186,7 +185,7 @@ async def _tell_requester(request: Row, text: str) -> None:
     channel = get_channel(request["channel"])
     if channel is None:
         return
-    await channel.send(request["chat_id"] or _dm_chat(request["channel"], request["ext_id"]),
+    await channel.send(request["chat_id"] or dm_chat(request["channel"], request["ext_id"]),
                        Out(text=text))
 
 

@@ -7,6 +7,7 @@ import logging
 from typing import Any, Iterable, Optional
 
 from . import admins, repo, statuses
+from .access import dm_chat
 from .channels.base import MAX, TG, Btn, Out, channel_title, get_channel
 from .config import cfg
 from .utils import esc, fmt_date, fmt_dt, fmt_money, fmt_phone, plural
@@ -158,36 +159,50 @@ async def guest_username(order: Row) -> str:
 
 
 # ------------------------------------------------- отправка менеджерам/админам
-async def admin_targets() -> list[str]:
-    """Куда слать заказы: рабочий чат, а если он не задан — личные чаты админов."""
+async def admin_dms() -> list[tuple[str, str]]:
+    """Личные чаты всех администраторов: (мессенджер, чат)."""
+    return [(channel, dm_chat(channel, admin_id)) for channel, admin_id in await admins.targets()]
+
+
+async def admin_targets() -> list[tuple[str, str]]:
+    """Куда слать заказы: рабочий чат, а если он не задан — лично админам.
+
+    Рабочий чат — группа в Telegram. Без него карточки получает каждый
+    администратор в своём мессенджере, в том числе в MAX.
+    """
     chat_id = (await repo.get_setting("orders_chat_id")) or cfg.orders_chat_id
     if chat_id.strip():
-        return [chat_id.strip()]
-    return [str(admin_id) for admin_id in sorted(await admins.ids())]
+        return [(TG, chat_id.strip())]
+    return await admin_dms()
+
+
+async def _deliver(targets: Iterable[tuple[str, str]], out: Out) -> list[dict[str, Any]]:
+    sent: list[dict[str, Any]] = []
+    for channel_name, chat_id in targets:
+        channel = get_channel(channel_name)
+        if channel is None:
+            continue
+        message_id = await channel.send(chat_id, out)
+        if message_id:
+            sent.append({"channel": channel_name, "chat_id": chat_id,
+                         "message_id": message_id})
+    return sent
 
 
 async def send_to_admins(text: str, kb: Optional[list[list[Btn]]] = None,
                          photo: str = "") -> list[dict[str, Any]]:
-    channel = get_channel(TG)
-    if channel is None:
-        log.warning("Telegram-канал не запущен — уведомление админам пропущено")
-        return []
-    sent: list[dict[str, Any]] = []
+    out = Out(text=text, kb=kb, photo=photo)
     targets = await admin_targets()
-    for chat_id in targets:
-        message_id = await channel.send(chat_id, Out(text=text, kb=kb, photo=photo))
-        if message_id:
-            sent.append({"chat_id": chat_id, "message_id": message_id})
+    sent = await _deliver(targets, out)
 
     if not sent:
         # рабочий чат недоступен (бот не добавлен, чат удалён) — не теряем заказ
-        personal = [str(a) for a in sorted(await admins.ids()) if str(a) not in targets]
+        personal = [t for t in await admin_dms() if t not in targets]
         if personal:
             log.warning("Рабочий чат %s недоступен — шлю заказ лично админам", targets)
-        for chat_id in personal:
-            message_id = await channel.send(chat_id, Out(text=text, kb=kb, photo=photo))
-            if message_id:
-                sent.append({"chat_id": chat_id, "message_id": message_id})
+        sent = await _deliver(personal, out)
+    if not sent:
+        log.warning("Уведомление админам никуда не доставлено")
     return sent
 
 
@@ -197,14 +212,7 @@ async def send_to_admin_dms(text: str, kb: Optional[list[list[Btn]]] = None) -> 
     Отдельно от send_to_admins: то шлёт в рабочий чат, а есть вещи, которые
     должны дойти лично — например, просьба гостя подключить новый адрес.
     """
-    channel = get_channel(TG)
-    if channel is None:
-        log.warning("Telegram-канал не запущен — личное уведомление пропущено")
-        return 0
-    delivered = 0
-    for admin_id in sorted(await admins.ids()):
-        if await channel.send(str(admin_id), Out(text=text, kb=kb)):
-            delivered += 1
+    delivered = len(await _deliver(await admin_dms(), Out(text=text, kb=kb)))
     if not delivered:
         log.warning("Никому из админов не удалось доставить личное уведомление")
     return delivered
@@ -237,9 +245,6 @@ def _general_price(general: Optional[Row]) -> int:
 
 async def send_review(review: Row, user: Row) -> bool:
     """Отзыв — одним сообщением в чат отзывов (или менеджерам, если он не задан)."""
-    channel = get_channel(TG)
-    if channel is None:
-        return False
 
     stars = max(0, min(5, int(review["stars"] or 0)))
     lines = ["⭐️ <b>Новый отзыв</b>", "", "★" * stars + "☆" * (5 - stars) + f"  {stars} из 5"]
@@ -255,7 +260,8 @@ async def send_review(review: Row, user: Row) -> bool:
 
     target = (await repo.get_setting("reviews_chat_id")).strip()
     out = Out(text="\n".join(lines), photo=review["photo_key"] or "")
-    if target:
+    channel = get_channel(TG)
+    if target and channel is not None:
         return bool(await channel.send(target, out))
     # чат отзывов не привязан — не теряем отзыв, шлём менеджерам
     return bool(await send_to_admins(out.text, photo=out.photo))
@@ -300,9 +306,6 @@ async def notify_new_order(orders: list[Row] | Row) -> None:
 
 async def refresh_order_cards(order: Row) -> None:
     """Обновить карточку заказа у менеджеров после смены статуса."""
-    channel = get_channel(TG)
-    if channel is None:
-        return
     group = await repo.group_of(order)
     head = group[0]
     targets = repo.json_loads(head["admin_msgs"], [])
@@ -312,6 +315,10 @@ async def refresh_order_cards(order: Row) -> None:
     text = await order_card(head, group=group)
     kb = order_admin_kb(head, await guest_username(head))
     for target in targets:
+        # в старых записях мессенджер не указан — тогда карточка была в Telegram
+        channel = get_channel(target.get("channel") or TG)
+        if channel is None:
+            continue
         try:
             await channel.edit(str(target["chat_id"]), str(target["message_id"]),
                                Out(text=text, kb=kb))

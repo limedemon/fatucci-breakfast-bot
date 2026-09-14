@@ -98,6 +98,11 @@ class Channel(ABC):
         """Отправить файл из памяти (нужно только админ-панели)."""
         return False
 
+    async def send_bytes(self, chat_id: str, data: bytes, filename: str,
+                         caption: str = "") -> bool:
+        """Отправить картинку из памяти (QR-коды в админ-панели)."""
+        return False
+
     async def download_bytes(self, file_id: str) -> bytes:
         """Скачать присланный файл в память."""
         return b''

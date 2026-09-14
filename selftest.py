@@ -1450,10 +1450,87 @@ async def main() -> None:
     request = await repo.pending_admin_request("max", "9200")
     check(request is None, "админ из MAX решил заявку прямо в MAX")
 
+    print("\n— Админ-панель в MAX —")
+
+    def max_admin(kind, **kw):
+        return Event(channel="max", user_id=MREQ, chat_id="55001", kind=kind,
+                     raw={"chat_type": "dialog"}, **kw)
+
     mx2.clear()
-    await route(Event(channel="max", user_id=MREQ, chat_id="55001", kind="text",
-                      text="/admin"), mx2)
-    check("в Telegram" in mx2.texts(), "в MAX /admin подсказывает, что панель в Telegram")
+    await route(max_admin("text", text="/admin"), mx2)
+    check("Админ-панель" in mx2.texts() and mx2.find_button("a:g:"),
+          "в MAX /admin открывает админ-панель")
+
+    too_big = []
+    for section in ["a:h", "a:o:l:new:0", "a:g:menu", "a:g:obj", "a:cur:m", "a:g:rep",
+                    "a:cfg:m", "a:bc:m", "a:hp", "a:db", "a:acc:l", "a:t:l", "a:m:l",
+                    "a:r:l", "a:b:l", "a:q:l", "a:f:l", "a:u:l:0", "a:x:m", "a:st:m"]:
+        mx2.clear()
+        await route(max_admin("callback", payload=section, callback_id="m"), mx2)
+        if not mx2.sent or len(mx2.last().text) < 10 or "Ошибка" in mx2.texts():
+            too_big.append(f"{section}: пусто или ошибка")
+        for _, out in mx2.sent:
+            # проверяем то, что реально уйдёт в MAX, — после укладки кнопок
+            keyboard = MaxChannel._keyboard(None, out)
+            rows = keyboard["payload"]["buttons"] if keyboard else []
+            if len(rows) > 30 or any(len(r) > 7 for r in rows) or sum(map(len, rows)) > 210:
+                too_big.append(f"{section}: клавиатура больше лимитов MAX")
+    check(not too_big, "все разделы админки открываются в MAX и влезают в лимиты кнопок"
+          + (f": {too_big}" if too_big else ""))
+
+    mx2.clear()
+    await route(max_admin("callback", payload="a:x:m", callback_id="m"), mx2)
+    export_btn = next((b.data for _, o in mx2.sent for r in (o.kb or []) for b in r
+                       if b.data.startswith("a:x:") and b.data != "a:x:m"), "")
+    if export_btn:
+        mx2.clear()
+        await route(max_admin("callback", payload=export_btn, callback_id="m"), mx2)
+        check("[файл]" in mx2.texts(), "выгрузка заказов приходит файлом и в MAX")
+
+    # ввод значений: у Telegram и MAX с одинаковым номером — разные черновики
+    mx2.clear()
+    await route(max_admin("callback", payload="a:acc:add", callback_id="m"), mx2)
+    check("MAX" in mx2.texts(), "добавление по ID в MAX просит ID из MAX")
+    tg_state, _ = await repo.get_admin_state(int(MREQ))
+    max_state, _ = await repo.get_admin_state(-int(MREQ))
+    check(max_state == "admin_add" and not tg_state,
+          "незаконченный ввод в MAX не смешивается с Telegram")
+    mx2.clear()
+    await route(max_admin("text", text="9300"), mx2)
+    check(await admins_mod.is_admin("9300", "max") and not await admins_mod.is_admin("9300", "tg"),
+          "по ID из админки MAX доступ выдаётся в MAX")
+    check(any(chat == "u9300" for chat, _ in mx2.sent), "новому админу написали в личку MAX")
+    await admins_mod.remove(9300, "max")
+
+    mx2.clear()
+    await route(Event(channel="max", user_id="9400", chat_id="55009", kind="text",
+                      text="/admin", raw={"chat_type": "dialog"}), mx2)
+    check("/admin request" in mx2.texts(), "гостю в MAX /admin подсказывает, как попросить доступ")
+    mx2.clear()
+    await route(Event(channel="max", user_id="9400", chat_id="55009", kind="callback",
+                      payload="a:h", callback_id="m", raw={"chat_type": "dialog"}), mx2)
+    check("Админ-панель" not in mx2.texts(), "чужие нажатия в MAX админку не открывают")
+
+    home = next(o for o in await repo.list_objects() if not o["is_general"])
+    await repo.update_user("max", MREQ, object_id=home["id"])
+    mx2.clear()
+    await route(max_admin("text", text="/menu"), mx2)
+    check(mx2.find_button("a:h"), "в меню MAX у админа есть кнопка админ-панели")
+
+    mx2.clear()
+    ch.clear()
+    from app import notify
+
+    await notify.send_to_admin_dms("Проверка личных уведомлений")
+    check(any(chat == f"u{MREQ}" for chat, _ in mx2.sent) and ch.to(ADMIN),
+          "личные уведомления админам уходят и в Telegram, и в MAX")
+
+    # длинный список в MAX не обрезается, а собирается в ряды
+    long_kb = [[Btn(text=f"Объект {i}", data=f"a:b:c:{i}")] for i in range(45)]
+    long_kb.append([Btn(text="⬅️ Назад", data="a:h"), Btn(text="🏠 Админка", data="a:h")])
+    packed = MaxChannel._keyboard(None, Out(text="x", kb=long_kb))["payload"]["buttons"]
+    check(len(packed) <= 30 and sum(map(len, packed)) == 47,
+          "длинный список кнопок в MAX укладывается в 30 рядов без потерь")
     base.REGISTRY.pop("max", None)
 
     # «Доступ»: одинаковый номер в Telegram и MAX — это разные люди

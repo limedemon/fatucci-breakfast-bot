@@ -43,18 +43,7 @@ async def _route(ev: Event, ch: Channel) -> None:
                  f"Ваш ID: <code>{ev.user_id}</code>"))
         return
 
-    is_group = ch.name == TG and str(ev.chat_id) != str(ev.user_id)
-
-    if ch.name != TG and text.lower().split("@")[0] == "/admin":
-        if await admins.is_admin(ev.user_id, ev.channel):
-            await ch.send(ev.chat_id, Out(
-                text="🛠 <b>Админ-панель — в Telegram</b>\n\n"
-                     "Здесь вам приходят заявки на доступ, их можно решать прямо в этом чате."))
-        else:
-            await ch.send(ev.chat_id, Out(
-                text="🔒 Нет доступа. Чтобы запросить права администратора, "
-                     "отправьте <code>/admin request</code>."))
-        return
+    is_group = _is_group(ev, ch)
 
     # заявка на права администратора — в любом мессенджере
     if access.is_request_command(text):
@@ -90,17 +79,32 @@ async def _route(ev: Event, ch: Channel) -> None:
                 "в администраторы бота или рабочего чата.")
         return
 
-    if ch.name == TG and await admins.is_admin(ev.user_id, ev.channel):
+    if await admins.is_admin(ev.user_id, ev.channel):
         # ввод для админки принимаем только в личном чате с ботом,
         # чтобы обычная переписка в рабочем чате не попала в форму
         if ev.kind == "text" and not is_group and await admin.handle_text(ev, ch):
             return
+    elif not is_group and text.lower().split("@")[0] == "/admin":
+        await ch.send(ev.chat_id, Out(
+            text="🔒 <b>Нет доступа к админ-панели</b>\n\n"
+                 "Чтобы запросить права администратора, отправьте "
+                 "<code>/admin request</code>."))
+        return
 
     if is_group:
         # в рабочем чате бот отвечает только на кнопки заказов
         return
 
     await flow.handle(ev, ch)
+
+
+def _is_group(ev: Event, ch: Channel) -> bool:
+    """Групповой чат, а не личка с ботом."""
+    if ch.name == TG:
+        # в Telegram у лички номер совпадает с номером человека
+        return str(ev.chat_id) != str(ev.user_id)
+    # в MAX у лички свой номер, поэтому смотрим на тип чата
+    return ev.raw.get("chat_type") == "chat"
 
 
 async def _may_manage(ev: Event, ch: Channel, is_group: bool) -> bool:
@@ -111,11 +115,9 @@ async def _may_manage(ev: Event, ch: Channel, is_group: bool) -> bool:
     Сообщения от имени группы (анонимный админ) тоже принимаем: писать так
     может только администратор этой группы.
     """
-    if ch.name != TG:
-        return False
     if await admins.is_admin(ev.user_id, ev.channel):
         return True
-    if not is_group:
+    if ch.name != TG or not is_group:
         return False
 
     orders_chat = (await repo.get_setting("orders_chat_id")) or str(cfg.orders_chat_id or "")

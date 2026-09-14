@@ -30,6 +30,10 @@ API_BASE = "https://platform-api2.max.ru"
 #: скриншоты и фото к отзывам больше этого не принимаем
 MAX_PHOTO_BYTES = 10 * 1024 * 1024
 TEXT_LIMIT = 4000
+#: лимиты клавиатуры MAX: больше — и сообщение не уйдёт целиком
+MAX_ROWS = 30
+MAX_ROW_BUTTONS = 7
+MAX_BUTTONS = 210
 
 Router = Callable[[Event, Channel], Awaitable[None]]
 
@@ -234,6 +238,54 @@ class MaxChannel(Channel):
         except Exception as exc:  # noqa: BLE001
             log.debug("MAX answer_callback: %s", exc)
 
+    async def send_bytes(self, chat_id: str, data: bytes, filename: str,
+                         caption: str = "") -> bool:
+        token = await self._upload("image", data, filename)
+        return await self._send_attachment(chat_id, "image", token, caption)
+
+    async def send_document(self, chat_id: str, data: bytes, filename: str,
+                            caption: str = "") -> bool:
+        token = await self._upload("file", data, filename)
+        return await self._send_attachment(chat_id, "file", token, caption)
+
+    async def _send_attachment(self, chat_id: str, kind: str, token: str,
+                               caption: str) -> bool:
+        if not token:
+            return False
+        body = {"text": _cut(caption, TEXT_LIMIT), "format": "html",
+                "attachments": [{"type": kind, "payload": {"token": token}}]}
+        try:
+            async with self._send_lock:
+                # MAX обрабатывает файл не мгновенно — _request повторит «not.ready»
+                await self._request("POST", "/messages", params=self._target(chat_id),
+                                    json_body=body, retries=4)
+                await asyncio.sleep(0.35)
+            return True
+        except Exception as exc:  # noqa: BLE001
+            log.warning("MAX: вложение не отправилось (%s): %s", chat_id, exc)
+            return False
+
+    async def _upload(self, kind: str, data: bytes, filename: str) -> str:
+        """Залить файл в MAX и получить токен вложения."""
+        try:
+            upload = await self._request("POST", "/uploads", params={"type": kind})
+            url = upload.get("url", "")
+            if not url:
+                return ""
+            session = await self.session()
+            form = aiohttp.FormData()
+            form.add_field("data", data, filename=filename,
+                           content_type="application/octet-stream")
+            async with session.post(url, data=form) as resp:
+                try:
+                    payload = await resp.json(content_type=None) or {}
+                except (aiohttp.ContentTypeError, ValueError):
+                    payload = {}
+            return _extract_photo_token(payload) or upload.get("token", "")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("MAX: не удалось загрузить %s %s: %s", kind, filename, exc)
+            return ""
+
     async def download_bytes(self, file_id: str) -> bytes:
         """Скачать картинку, которую прислал гость.
 
@@ -304,7 +356,7 @@ class MaxChannel(Channel):
                 rows.append(buttons)
         if not rows:
             return None
-        return {"type": "inline_keyboard", "payload": {"buttons": rows}}
+        return {"type": "inline_keyboard", "payload": {"buttons": _fit_rows(rows)}}
 
     async def _image_token(self, key: str) -> str:
         cached = await repo.get_media_ref(key, MAX)
@@ -313,24 +365,10 @@ class MaxChannel(Channel):
         data = await media.load(key)
         if not data:
             return ""
-        try:
-            upload = await self._request("POST", "/uploads", params={"type": "image"})
-            url = upload.get("url", "")
-            if not url:
-                return ""
-            session = await self.session()
-            form = aiohttp.FormData()
-            form.add_field("data", data, filename=key.replace(":", "_") + ".jpg",
-                           content_type="application/octet-stream")
-            async with session.post(url, data=form) as resp:
-                payload = await resp.json(content_type=None)
-            token = _extract_photo_token(payload) or upload.get("token", "")
-            if token:
-                await repo.set_media_ref(key, MAX, token)
-            return token
-        except Exception as exc:  # noqa: BLE001
-            log.warning("MAX: не удалось загрузить картинку %s: %s", key, exc)
-            return ""
+        token = await self._upload("image", data, key.replace(":", "_") + ".jpg")
+        if token:
+            await repo.set_media_ref(key, MAX, token)
+        return token
 
     # -------------------------------------------------------------- события
     def _parse(self, upd: dict[str, Any]) -> Optional[Event]:
@@ -371,6 +409,7 @@ class MaxChannel(Channel):
                 message_id=str(body.get("mid", "")),
                 raw=upd,
             )
+            base.raw["chat_type"] = recipient.get("chat_type") or "dialog"
             if photo_url:
                 # так же, как в Telegram: сценарию нужен только идентификатор,
                 # по которому потом можно скачать картинку
@@ -390,6 +429,7 @@ class MaxChannel(Channel):
             recipient = message.get("recipient") or {}
             body = message.get("body") or {}
             chat_id = recipient.get("chat_id") or f"u{user.get('user_id', '')}"
+            upd["chat_type"] = recipient.get("chat_type") or "dialog"
             return Event(
                 channel=MAX,
                 user_id=str(user.get("user_id", "")),
@@ -469,6 +509,43 @@ def _button(btn: Btn) -> dict[str, Any]:
     if btn.intent in ("positive", "negative"):
         button["intent"] = btn.intent
     return button
+
+
+def _fit_rows(rows: list[list[dict[str, Any]]]) -> list[list[dict[str, Any]]]:
+    """Уложить клавиатуру в лимиты MAX, не теряя кнопок.
+
+    Длинные списки (объекты, тексты) в Telegram идут столбиком. В MAX рядов
+    не больше 30 — тогда одиночные кнопки собираем по две, по три и т. д.
+    Ряды из нескольких кнопок (навигация, «Назад») остаются как были.
+    """
+    split: list[list[dict[str, Any]]] = []
+    for row in rows:
+        split += [row[i:i + MAX_ROW_BUTTONS] for i in range(0, len(row), MAX_ROW_BUTTONS)]
+    rows = split
+    width = 2
+    packed = rows
+    while len(packed) > MAX_ROWS and width <= MAX_ROW_BUTTONS:
+        packed, run = [], []
+        for row in rows:
+            if len(row) == 1 and row[0].get("type") == "callback":
+                run.append(row[0])
+                if len(run) == width:
+                    packed.append(run)
+                    run = []
+                continue
+            if run:
+                packed.append(run)
+                run = []
+            packed.append(row)
+        if run:
+            packed.append(run)
+        width += 1
+    if len(packed) > MAX_ROWS or sum(map(len, packed)) > MAX_BUTTONS:
+        log.warning("MAX: клавиатура не влезает в лимиты — лишние кнопки скрыты")
+        packed = packed[:MAX_ROWS - 2] + packed[-2:]
+        while sum(map(len, packed)) > MAX_BUTTONS:
+            packed.pop(len(packed) - 3)
+    return packed
 
 
 def _name(user: dict[str, Any]) -> str:

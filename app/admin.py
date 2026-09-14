@@ -12,7 +12,7 @@ import re
 from datetime import timedelta
 from typing import Any, Callable, Optional
 
-from . import (admins, courier, db, guide, media, notify, orders_service, payments,
+from . import (access, admins, courier, db, guide, media, notify, orders_service, payments,
                pricing, qrgen, repo, statuses)
 from .channels.base import MAX, TG, Btn, Channel, Event, Out, channel_title, get_channel
 from .config import cfg
@@ -192,7 +192,7 @@ TEXT_TITLES: dict[str, str] = {
 async def handle_text(ev: Event, ch: Channel) -> bool:
     """Текст от админа. True — событие обработано админкой."""
     text = (ev.text or "").strip()
-    admin_id = int(ev.user_id)
+    admin_id = _sid(ev)
 
     if text == "/admin":
         await repo.clear_admin_state(admin_id)
@@ -219,9 +219,9 @@ async def handle_callback(ev: Event, ch: Channel) -> None:
     args = parts[2:]
 
     # нажали кнопку — значит, предыдущий запрос ввода отменён
-    state, _ = await repo.get_admin_state(int(ev.user_id))
+    state, _ = await repo.get_admin_state(_sid(ev))
     if state:
-        await repo.clear_admin_state(int(ev.user_id))
+        await repo.clear_admin_state(_sid(ev))
 
     routes: dict[str, Callable[[], Any]] = {
         "h": lambda: _home(ev, ch),
@@ -255,6 +255,17 @@ async def handle_callback(ev: Event, ch: Channel) -> None:
         await ch.send(ev.chat_id, Out(text="⚠️ Ошибка в админ-панели, смотрите логи."))
     finally:
         await _answer(ev, ch)
+
+
+def _sid(ev: Event) -> int:
+    """Ключ незаконченного ввода в admin_state.
+
+    Номера людей в Telegram и MAX пересекаются, а таблица знает только число.
+    Telegram-админы остаются под своим ID, MAX-админы — под ним же со знаком
+    минус: у людей ID всегда положительные, так что записи не столкнутся.
+    """
+    user_id = int(ev.user_id)
+    return user_id if ev.channel == TG else -user_id
 
 
 async def _answer(ev: Event, ch: Channel, text: str = "") -> None:
@@ -1125,7 +1136,7 @@ async def _access_route(ev: Event, ch: Channel, args: list[str]) -> None:
         await _access_list(ev, ch)
     elif action == "add":
         await _ask(ev, ch, "admin_add", {},
-                   "👑 Пришлите <b>ID пользователя</b> в Telegram — числом.\n\n"
+                   f"👑 Пришлите <b>ID пользователя</b> в {channel_title(ev.channel)} — числом.\n\n"
                    "Где взять: пусть человек напишет этому боту команду <code>/id</code> "
                    "и пришлёт вам число.\n\n"
                    "Либо выберите его из тех, кто уже писал боту, — кнопка ниже.")
@@ -1166,7 +1177,8 @@ async def _access_list(ev: Event, ch: Channel) -> None:
                       f"<code>{', '.join(str(i) for i in cfg.admin_ids)}</code>"]
     lines += ["", "<i>Владельца убрать нельзя — это защита от потери доступа к боту.</i>",
               "<i>Попросить доступ можно самому: команда <code>/admin request</code> "
-              "в личке с ботом — в Telegram или MAX.</i>"]
+              "в личке с ботом — в Telegram или MAX.</i>",
+              f"<i>Кнопками ниже доступ выдаётся в {channel_title(ev.channel)}.</i>"]
 
     kb.append([Btn(text="➕ Добавить по ID", data="a:acc:add"),
                Btn(text="👥 Выбрать из гостей", data="a:acc:g:0")])
@@ -1175,9 +1187,10 @@ async def _access_list(ev: Event, ch: Channel) -> None:
 
 
 async def _access_guests(ev: Event, ch: Channel, page: int) -> None:
-    total = await repo.count_users(channel=TG)
-    users = await repo.list_users(limit=PAGE, offset=page * PAGE, channel=TG)
-    current = await admins.ids()
+    # доступ выдаётся в том мессенджере, где открыта админка
+    total = await repo.count_users(channel=ev.channel)
+    users = await repo.list_users(limit=PAGE, offset=page * PAGE, channel=ev.channel)
+    current = await admins.ids(ev.channel)
     kb: list[list[Btn]] = []
     for user in users:
         if int(user["ext_id"]) in current:
@@ -1193,17 +1206,18 @@ async def _access_guests(ev: Event, ch: Channel, page: int) -> None:
         kb.append(nav)
     kb.append(_back("a:acc:l", "⬅️ К доступу"))
     await _show(ev, ch, Out(
-        text="👥 <b>Кому выдать доступ?</b>\n\nПоказаны те, кто писал боту в Telegram.",
+        text="👥 <b>Кому выдать доступ?</b>\n\n"
+             f"Показаны те, кто писал боту в {channel_title(ev.channel)}.",
         kb=kb))
 
 
 async def _access_add_guest(ev: Event, ch: Channel, user_pk: int) -> None:
     user = await repo.get_user_pk(user_pk)
-    if user is None or user["channel"] != TG:
+    if user is None or user["channel"] != ev.channel:
         await _access_list(ev, ch)
         return
     added = await admins.add(int(user["ext_id"]), user["username"], user["full_name"],
-                             added_by=_actor(ev))
+                             added_by=_actor(ev), channel=ev.channel)
     await _answer(ev, ch, "Доступ выдан" if added else "У него уже есть доступ")
     if added:
         await _notify_new_admin(ch, int(user["ext_id"]))
@@ -1225,7 +1239,7 @@ async def _access_confirm_remove(ev: Event, ch: Channel, user_id: int,
 async def _notify_new_admin(ch: Channel, user_id: int) -> None:
     """Сообщить человеку, что ему выдали доступ."""
     try:
-        await ch.send(str(user_id), Out(
+        await ch.send(access.dm_chat(ch.name, user_id), Out(
             text="🛠 <b>Вам выдали доступ к админ-панели Fatucci</b>\n\n"
                  "Откройте её командой /admin.",
             kb=[[Btn(text="🛠 Открыть админ-панель", data="a:h", intent="positive")]]))
@@ -1672,7 +1686,7 @@ async def _export_route(ev: Event, ch: Channel, args: list[str]) -> None:
 # ============================================================ ввод значений
 async def _ask(ev: Event, ch: Channel, kind: str, ctx: dict[str, Any], prompt: str) -> None:
     ctx = dict(ctx)
-    await repo.set_admin_state(int(ev.user_id), kind, ctx)
+    await repo.set_admin_state(_sid(ev), kind, ctx)
     await _answer(ev, ch)
     await ch.send(ev.chat_id, Out(
         text=prompt + "\n\n<i>Отмена — /cancel</i>",
@@ -1680,7 +1694,7 @@ async def _ask(ev: Event, ch: Channel, kind: str, ctx: dict[str, Any], prompt: s
 
 
 async def _consume_input(ev: Event, ch: Channel, kind: str, ctx: dict[str, Any]) -> None:
-    admin_id = int(ev.user_id)
+    admin_id = _sid(ev)
     text = (ev.text or "").strip()
     photo_id = ev.raw.get("photo_file_id", "")
 
@@ -1718,13 +1732,13 @@ async def _in_obj_new(ev: Event, ch: Channel, ctx: dict, text: str, photo: str) 
     data = ctx.get("data", {})
     if step == "title":
         data["title"] = text[:120]
-        await repo.set_admin_state(int(ev.user_id), "obj_new", {"step": "address", "data": data})
+        await repo.set_admin_state(_sid(ev), "obj_new", {"step": "address", "data": data})
         await ch.send(ev.chat_id, Out(text="📍 Адрес доставки?\nНапример: "
                                            "<code>г. Сочи, ул. Северная, д. 12</code>"))
         return
     if step == "address":
         data["address"] = text[:200]
-        await repo.set_admin_state(int(ev.user_id), "obj_new", {"step": "price", "data": data})
+        await repo.set_admin_state(_sid(ev), "obj_new", {"step": "price", "data": data})
         await ch.send(ev.chat_id, Out(text="💰 Цена завтрака в рублях? Например: <code>900</code>"))
         return
 
@@ -1756,7 +1770,7 @@ async def _in_obj_new(ev: Event, ch: Channel, ctx: dict, text: str, photo: str) 
         group_title="", min_qty=await repo.get_int("default_min_qty", 1),
         max_qty=await repo.get_int("default_max_qty", 10), **schedule,
     )
-    await repo.clear_admin_state(int(ev.user_id))
+    await repo.clear_admin_state(_sid(ev))
     await ch.send(ev.chat_id, Out(
         text=f"✅ Объект <b>{esc(data['title'])}</b> создан.\n"
              f"Код QR: <code>{esc(code)}</code>\n"
@@ -1771,12 +1785,12 @@ async def _in_set_new(ev: Event, ch: Channel, ctx: dict, text: str, photo: str) 
     data = ctx.get("data", {})
     if step == "title":
         data["title"] = text[:120]
-        await repo.set_admin_state(int(ev.user_id), "set_new", {"step": "desc", "data": data})
+        await repo.set_admin_state(_sid(ev), "set_new", {"step": "desc", "data": data})
         await ch.send(ev.chat_id, Out(text="📝 Состав сета? Пришлите текст одним сообщением."))
         return
     set_id = await repo.create_set(title=data["title"], description=text[:2000],
                                    sort_order=100)
-    await repo.clear_admin_state(int(ev.user_id))
+    await repo.clear_admin_state(_sid(ev))
     await ch.send(ev.chat_id, Out(
         text=f"✅ Сет <b>{esc(data['title'])}</b> добавлен.\n"
              "Не забудьте загрузить фото и поставить его в ротацию.",
@@ -1789,18 +1803,18 @@ async def _in_offer_new(ev: Event, ch: Channel, ctx: dict, text: str, photo: str
     data = ctx.get("data", {})
     if step == "title":
         data["title"] = text[:120]
-        await repo.set_admin_state(int(ev.user_id), "offer_new", {"step": "desc", "data": data})
+        await repo.set_admin_state(_sid(ev), "offer_new", {"step": "desc", "data": data})
         await ch.send(ev.chat_id, Out(text="📝 Короткое описание предложения?"))
         return
     if step == "desc":
         data["description"] = text[:1000]
-        await repo.set_admin_state(int(ev.user_id), "offer_new", {"step": "url", "data": data})
+        await repo.set_admin_state(_sid(ev), "offer_new", {"step": "url", "data": data})
         await ch.send(ev.chat_id, Out(text="🔗 Ссылка (или <code>-</code>, если её нет)?"))
         return
     url = "" if text == "-" else text[:400]
     offer_id = await repo.create_offer(title=data["title"], description=data["description"],
                                        url=url, button_text="Подробнее", sort_order=100)
-    await repo.clear_admin_state(int(ev.user_id))
+    await repo.clear_admin_state(_sid(ev))
     await ch.send(ev.chat_id, Out(text=f"✅ Предложение <b>{esc(data['title'])}</b> добавлено.",
                                   kb=[[Btn(text="🍽 Открыть", data=f"a:f:c:{offer_id}")]]))
 
@@ -1825,7 +1839,7 @@ async def _in_field(ev: Event, ch: Channel, ctx: dict, text: str, photo: str) ->
             return
         await repo.update_object(entity_id, delivery_time=window[0],
                                  delivery_time_to=window[1])
-        await repo.clear_admin_state(int(ev.user_id))
+        await repo.clear_admin_state(_sid(ev))
         await ch.send(ev.chat_id, Out(
             text=f"✅ Время доставки: с {window[0]} до {window[1]}.",
             kb=[[Btn(text="⬅️ Назад", data=f"a:b:c:{entity_id}"),
@@ -1857,7 +1871,7 @@ async def _in_field(ev: Event, ch: Channel, ctx: dict, text: str, photo: str) ->
 
     updater = {"obj": repo.update_object, "set": repo.update_set, "offer": repo.update_offer}[entity]
     await updater(entity_id, **{key: value})
-    await repo.clear_admin_state(int(ev.user_id))
+    await repo.clear_admin_state(_sid(ev))
     back = {"obj": f"a:b:c:{entity_id}", "set": f"a:m:c:{entity_id}", "offer": f"a:f:c:{entity_id}"}
     await ch.send(ev.chat_id, Out(text="✅ Сохранено.",
                                   kb=[[Btn(text="⬅️ Назад", data=back[entity]),
@@ -1866,7 +1880,7 @@ async def _in_field(ev: Event, ch: Channel, ctx: dict, text: str, photo: str) ->
 
 async def _in_text(ev: Event, ch: Channel, ctx: dict, text: str, photo: str) -> None:
     await repo.set_text(ctx["key"], text)
-    await repo.clear_admin_state(int(ev.user_id))
+    await repo.clear_admin_state(_sid(ev))
     await ch.send(ev.chat_id, Out(text="✅ Текст обновлён.",
                                   kb=[[Btn(text="✍️ К текстам", data="a:t:l"),
                                        Btn(text="🏠 Админка", data="a:h")]]))
@@ -1882,7 +1896,7 @@ async def _in_setting(ev: Event, ch: Channel, ctx: dict, text: str, photo: str) 
             return
         raw = str(parsed)
     await repo.set_setting(key, raw)
-    await repo.clear_admin_state(int(ev.user_id))
+    await repo.clear_admin_state(_sid(ev))
 
     note = ""
     if key == "orders_chat_id":
@@ -1901,7 +1915,7 @@ async def _in_setting(ev: Event, ch: Channel, ctx: dict, text: str, photo: str) 
 
 async def _in_reject(ev: Event, ch: Channel, ctx: dict, text: str, photo: str) -> None:
     reason = "" if text == "-" else text[:300]
-    await repo.clear_admin_state(int(ev.user_id))
+    await repo.clear_admin_state(_sid(ev))
     ok, message = await orders_service.change_status(
         int(ctx["order_id"]), statuses.REJECTED, actor=_actor(ev), note=reason
     )
@@ -1910,7 +1924,7 @@ async def _in_reject(ev: Event, ch: Channel, ctx: dict, text: str, photo: str) -
 
 
 async def _in_broadcast(ev: Event, ch: Channel, ctx: dict, text: str, photo: str) -> None:
-    await repo.clear_admin_state(int(ev.user_id))
+    await repo.clear_admin_state(_sid(ev))
     target = ctx.get("target", "all")
     channels = [TG, MAX] if target == "all" else [target]
     photo_path = ""
@@ -1930,17 +1944,18 @@ async def _in_admin_add(ev: Event, ch: Channel, ctx: dict, text: str, photo: str
     if not raw.isdigit():
         await ch.send(ev.chat_id, Out(
             text="⚠️ Нужен именно числовой ID, например <code>123456789</code>.\n"
-                 "По @username выдать доступ нельзя — Telegram не даёт ботам "
+                 "По @username выдать доступ нельзя — мессенджер не даёт ботам "
                  "разрешать имена.\n\n"
                  "Пусть человек отправит боту <code>/id</code> и пришлёт вам число.",
             kb=[[Btn(text="👥 Выбрать из гостей", data="a:acc:g:0")],
                 [Btn(text="✖️ Отмена", data="a:acc:l")]]))
         return
-    await repo.clear_admin_state(int(ev.user_id))
+    await repo.clear_admin_state(_sid(ev))
     user_id = int(raw)
-    user = await repo.get_user(TG, str(user_id))
+    user = await repo.get_user(ev.channel, str(user_id))
     added = await admins.add(user_id, user["username"] if user else "",
-                             user["full_name"] if user else "", added_by=_actor(ev))
+                             user["full_name"] if user else "", added_by=_actor(ev),
+                             channel=ev.channel)
     if added:
         await _notify_new_admin(ch, user_id)
     await ch.send(ev.chat_id, Out(
@@ -1950,7 +1965,7 @@ async def _in_admin_add(ev: Event, ch: Channel, ctx: dict, text: str, photo: str
 
 
 async def _in_find_order(ev: Event, ch: Channel, ctx: dict, text: str, photo: str) -> None:
-    await repo.clear_admin_state(int(ev.user_id))
+    await repo.clear_admin_state(_sid(ev))
     order = await repo.get_order_by_number(text)
     if order is None and text.upper().startswith(await repo.get_setting("order_prefix", "F")):
         order = await repo.get_order_by_number(text.upper())
@@ -1963,7 +1978,7 @@ async def _in_find_order(ev: Event, ch: Channel, ctx: dict, text: str, photo: st
 
 
 async def _in_find_date(ev: Event, ch: Channel, ctx: dict, text: str, photo: str) -> None:
-    await repo.clear_admin_state(int(ev.user_id))
+    await repo.clear_admin_state(_sid(ev))
     day = parse_date(text)
     if day is None:
         await ch.send(ev.chat_id, Out(text="⚠️ Не разобрал дату. Формат: <code>ДД.ММ.ГГГГ</code>"))
@@ -1976,7 +1991,7 @@ async def _in_rot_date(ev: Event, ch: Channel, ctx: dict, text: str, photo: str)
     if day is None:
         await ch.send(ev.chat_id, Out(text="⚠️ Не разобрал дату. Формат: <code>ДД.ММ.ГГГГ</code>"))
         return
-    await repo.clear_admin_state(int(ev.user_id))
+    await repo.clear_admin_state(_sid(ev))
     items = await repo.list_sets(active_only=True)
     iso = fmt_date_iso(day)
     kb = [[Btn(text=item["title"], data=f"a:r:ds:{iso}:{item['id']}")] for item in items]
@@ -1990,7 +2005,7 @@ async def _in_digest_date(ev: Event, ch: Channel, ctx: dict, text: str, photo: s
     if day is None:
         await ch.send(ev.chat_id, Out(text="⚠️ Не разобрал дату. Формат: <code>ДД.ММ.ГГГГ</code>"))
         return
-    await repo.clear_admin_state(int(ev.user_id))
+    await repo.clear_admin_state(_sid(ev))
     await courier.send_digest(day, auto=False)
 
 
