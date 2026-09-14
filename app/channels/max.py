@@ -26,6 +26,9 @@ from .base import MAX, Btn, Channel, Event, Out
 log = logging.getLogger(__name__)
 
 API_BASE = "https://platform-api2.max.ru"
+
+#: скриншоты и фото к отзывам больше этого не принимаем
+MAX_PHOTO_BYTES = 10 * 1024 * 1024
 TEXT_LIMIT = 4000
 
 Router = Callable[[Event, Channel], Awaitable[None]]
@@ -231,6 +234,32 @@ class MaxChannel(Channel):
         except Exception as exc:  # noqa: BLE001
             log.debug("MAX answer_callback: %s", exc)
 
+    async def download_bytes(self, file_id: str) -> bytes:
+        """Скачать картинку, которую прислал гость.
+
+        В MAX у входящей картинки есть прямая ссылка на файл — по ней и берём.
+        """
+        url = (file_id or "").strip()
+        if not url.startswith(("http://", "https://")):
+            return b""
+        try:
+            async with aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=60),
+                connector=net.connector(net.max_ssl()),
+            ) as session:
+                async with session.get(url) as resp:
+                    if resp.status >= 400:
+                        log.warning("MAX: картинка не скачалась (%s)", resp.status)
+                        return b""
+                    data = await resp.content.read(MAX_PHOTO_BYTES + 1)
+                    if len(data) > MAX_PHOTO_BYTES:
+                        log.warning("MAX: картинка больше %s байт — пропускаю", MAX_PHOTO_BYTES)
+                        return b""
+                    return data
+        except Exception as exc:  # noqa: BLE001
+            log.warning("MAX: не удалось скачать картинку: %s", exc)
+            return b""
+
     def start_link(self, payload: str = "") -> str:
         base = f"https://max.ru/{self.username}" if self.username else "https://max.ru/"
         return f"{base}?start={payload}" if payload else base
@@ -326,7 +355,9 @@ class MaxChannel(Channel):
             recipient = message.get("recipient") or {}
             body = message.get("body") or {}
             chat_id = recipient.get("chat_id") or f"u{sender.get('user_id', '')}"
-            phone = _phone_from_attachments(body.get("attachments") or [])
+            attachments = body.get("attachments") or []
+            phone = _phone_from_attachments(attachments)
+            photo_url = _photo_url_from_attachments(attachments)
             text = body.get("text") or ""
             payload_start = _start_payload(text)
             base = Event(
@@ -340,6 +371,10 @@ class MaxChannel(Channel):
                 message_id=str(body.get("mid", "")),
                 raw=upd,
             )
+            if photo_url:
+                # так же, как в Telegram: сценарию нужен только идентификатор,
+                # по которому потом можно скачать картинку
+                base.raw["photo_file_id"] = photo_url
             if phone:
                 base.kind = "contact"
                 base.phone = phone
@@ -464,6 +499,18 @@ def _phone_from_attachments(attachments: list[dict[str, Any]]) -> str:
         phone = payload.get("phone") or ""
         if phone:
             return str(phone)
+    return ""
+
+
+def _photo_url_from_attachments(attachments: list[dict[str, Any]]) -> str:
+    """Ссылка на первую картинку во вложениях сообщения."""
+    for att in attachments:
+        if att.get("type") != "image":
+            continue
+        payload = att.get("payload") or {}
+        url = payload.get("url") or ""
+        if url:
+            return str(url)
     return ""
 
 

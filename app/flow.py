@@ -16,7 +16,7 @@ from typing import Any, Iterable, Optional
 
 from . import (availability, media, notify, orders_service, payments, pricing, repo,
                statuses)
-from .channels.base import Btn, Channel, Event, Out, get_channel
+from .channels.base import TG, Btn, Channel, Event, Out, get_channel
 from .utils import (
     chunk,
     esc,
@@ -187,7 +187,11 @@ async def _show_main_menu(ev: Event, ch: Channel, new_message: bool = False) -> 
     if obj is not None:
         # гость мог ошибиться в адресе или переехать — путь назад всегда открыт
         kb.append([Btn(text="🏠 Сменить адрес", data="g:addr")])
-    kb.append([_manager_btn()])
+    if ch.name == TG:
+        kb.append([_manager_btn()])
+    else:
+        # в MAX нет клавиатуры под полем ввода — «Поддержку» даём кнопкой здесь
+        kb.append([_manager_btn(), Btn(text="🆘 Поддержка", data="g:support")])
 
     await _respond(ev, ch, Out(text=text, kb=kb), new_message=new_message)
 
@@ -262,6 +266,7 @@ async def _on_callback(ev: Event, ch: Channel, user: Row) -> None:
         "faq": lambda: _show_info(ev, ch, "faq"),
         "rules": lambda: _show_info(ev, ch, "rules"),
         "manager": lambda: _contact_manager(ev, ch),
+        "support": lambda: show_support(ev, ch),
         "objs": lambda: _ask_address(ev, ch),
         "addr": lambda: _ask_address(ev, ch),
         "addrkeep": lambda: _keep_address(ev, ch),
@@ -588,7 +593,7 @@ async def _start_order(ev: Event, ch: Channel) -> None:
                                        [Btn(text="⬅️ В меню", data="g:menu")]]))
         return
 
-    if not await payments.available():
+    if not await payments.available(ev.channel):
         # ни реквизитов, ни кассы — оплатить будет нечем, не начинаем оформление
         await _respond(ev, ch, Out(text=await repo.render_text("no_payment"),
                                    kb=[[_manager_btn()],

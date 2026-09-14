@@ -108,8 +108,14 @@ async def details_offered() -> bool:
     return await details_configured() and await mode() in (DETAILS, BOTH)
 
 
-async def available() -> bool:
-    """Можно ли вообще принять оплату — от этого зависит, откроется ли заказ."""
+async def available(channel: str = "tg") -> bool:
+    """Можно ли вообще принять оплату — от этого зависит, откроется ли заказ.
+
+    В MAX встроенных счетов нет, поэтому там оплата возможна только
+    по реквизитам — касса гостю из MAX не поможет.
+    """
+    if channel != "tg":
+        return await details_configured()
     return await invoice_available() or await details_configured()
 
 

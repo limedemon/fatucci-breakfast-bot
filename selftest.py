@@ -1233,6 +1233,107 @@ async def main() -> None:
           "переключатель «напоминать и тем, кто уже заказал» есть")
     await repo.set_setting("daily_remind_ordered", "0")
 
+    print("\n— MAX: разбор входящих сообщений —")
+    from app.channels.max import MaxChannel
+
+    real_max = MaxChannel.__new__(MaxChannel)
+    photo_update = {
+        "update_type": "message_created",
+        "message": {
+            "sender": {"user_id": 9001, "name": "Гость MAX"},
+            "recipient": {"chat_id": 77001},
+            "body": {"mid": "m1", "text": "",
+                     "attachments": [{"type": "image",
+                                      "payload": {"url": "https://i.oneme.ru/p/abc.jpg"}}]},
+        },
+    }
+    parsed = real_max._parse(photo_update)
+    check(parsed is not None and parsed.raw.get("photo_file_id") == "https://i.oneme.ru/p/abc.jpg",
+          "картинка из MAX превращается в ссылку для скачивания")
+    started = real_max._parse({"update_type": "bot_started", "chat_id": 77001,
+                               "payload": "demo1", "user": {"user_id": 9001, "name": "Гость"}})
+    check(started is not None and started.kind == "start" and started.payload == "demo1",
+          "старт по QR в MAX разбирается")
+
+    print("\n— MAX: заказ проходит так же, как в Telegram —")
+    mx = FakeChannel("max")
+    base.REGISTRY["max"] = mx
+    MX_GUEST = "9001"
+
+    def max_event(kind: str, **kwargs) -> Event:
+        return Event(channel="max", user_id=MX_GUEST, chat_id=MX_GUEST, kind=kind,
+                     full_name="Гость MAX", **kwargs)
+
+    await repo.set_setting("pm_token", TEST_TOKEN)
+    await repo.set_setting("pay_mode", payments.BOTH)          # в Telegram — оба способа
+    await repo.set_text("pay_details", "Перевод по номеру +7 900 000-00-00.")
+
+    await route(max_event("start", payload="demo1"), mx)
+    check(bool(mx.find_button("g:order")), "в MAX открывается главное меню")
+    check(bool(mx.find_button("g:support")), "«Поддержка» в MAX — кнопкой в меню")
+
+    mx.clear()
+    await route(max_event("callback", payload="g:support", callback_id="x1"), mx)
+    check("Техподдержка" in mx.texts(), "поддержка в MAX отвечает")
+
+    mx.clear()
+    await route(max_event("callback", payload="g:order", callback_id="x2"), mx)
+    first_date = mx.find_button("g:date:")
+    check(bool(first_date), "даты в MAX предлагаются")
+    await route(max_event("callback", payload=first_date, callback_id="x3"), mx)
+    await route(max_event("callback", payload="g:dates", callback_id="x4"), mx)
+    await route(max_event("callback", payload="g:qty:1", callback_id="x5"), mx)
+    await route(max_event("text", text="12"), mx)
+    await route(max_event("contact", phone="+7 999 111-22-33"), mx)
+    await route(max_event("callback", payload="g:skipa", callback_id="x6"), mx)
+    await route(max_event("callback", payload="g:skip", callback_id="x7"), mx)
+    mx.clear()
+    await route(max_event("callback", payload="g:confirm", callback_id="x8"), mx)
+    orders = await repo.list_orders(limit=1, user_key=("max", MX_GUEST))
+    check(bool(orders) and orders[0]["channel"] == "max", "заказ из MAX создан")
+    check("НОВЫЙ ЗАКАЗ" in ch.to(CHAT), "и пришёл менеджерам в рабочий чат Telegram")
+
+    ch.clear()
+    mx.clear()
+    await route(admin_event("callback", chat_id=CHAT,
+                            payload=f"a:ord:{orders[0]['id']}:{statuses.ACCEPTED}",
+                            callback_id="x9"), ch)
+    guest_text = mx.to(MX_GUEST)
+    check("+7 900 000-00-00" in guest_text, "гость MAX получил реквизиты")
+    check(not mx.invoices, "счёт картой в MAX не выставляется — там его нет")
+    check("Счёт придёт" not in guest_text, "и гостю MAX счёт не обещают")
+    check(bool(mx.find_button("g:paid:")), "кнопка «Я оплатил» в MAX на месте")
+
+    mx.clear()
+    await route(max_event("callback", payload=f"g:paid:{orders[0]['id']}", callback_id="y1"), mx)
+    check("скриншот" in mx.texts().lower(), "в MAX бот просит скриншот оплаты")
+    ch.clear()
+    await route(Event(channel="max", user_id=MX_GUEST, chat_id=MX_GUEST, kind="text",
+                      raw={"photo_file_id": "https://i.oneme.ru/p/receipt.jpg"}), mx)
+    receipt_key = f"receipt:{orders[0]['id']}"
+    check(await media.load(receipt_key) is not None, "скриншот из MAX сохранён")
+    check(any(out.photo == receipt_key for chat, out in ch.sent if chat == CHAT),
+          "и ушёл менеджерам вместе с сообщением об оплате")
+
+    ch.clear()
+    await route(admin_event("callback", chat_id=CHAT,
+                            payload=f"a:ord:{orders[0]['id']}:{statuses.PAID}",
+                            callback_id="y2"), ch)
+    fresh = await repo.get_order(orders[0]["id"])
+    check(fresh["status"] == statuses.PAID, "менеджер подтвердил оплату заказа из MAX")
+    check("Оплата подтверждена" in mx.to(MX_GUEST), "гость MAX узнал об этом")
+
+    # без реквизитов гость MAX заказать не сможет, даже если касса подключена
+    await repo.set_text("pay_details", "")
+    check(not await payments.available("max") and await payments.available("tg"),
+          "без реквизитов MAX закрыт, а Telegram со счётом работает")
+    mx.clear()
+    await route(max_event("callback", payload="g:order", callback_id="y3"), mx)
+    check("недоступен" in mx.texts().lower(), "гостю MAX сказано, что заказать пока нельзя")
+
+    await repo.set_setting("pay_mode", payments.INVOICE)
+    base.REGISTRY.pop("max", None)
+
     print("\n— Админка —")
     ch.clear()
     await route(admin_event("text", text="/admin"), ch)

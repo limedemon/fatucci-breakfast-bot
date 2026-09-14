@@ -12,7 +12,7 @@ import logging
 from typing import Any, Optional
 
 from . import notify, payments, repo, statuses
-from .channels.base import Btn, get_channel
+from .channels.base import TG, Btn, get_channel
 from .utils import esc, fmt_date, fmt_money, now, parse_date, parse_time, utc_stamp
 
 log = logging.getLogger(__name__)
@@ -132,8 +132,11 @@ async def _send_payment_request(group: list[Row]) -> None:
     # Telegram не принимает совсем мелкие суммы. Проверяем это заранее:
     # иначе гостю обещали бы счёт, а следом приходили бы реквизиты.
     too_small = total < payments.MIN_AMOUNT_KOP
-    can_invoice = await payments.invoice_available() and not too_small
-    with_details = await payments.details_offered()
+    # счёт умеет только Telegram: гость из MAX платит по реквизитам всегда
+    in_telegram = head["channel"] == TG
+    can_invoice = in_telegram and await payments.invoice_available() and not too_small
+    with_details = await payments.details_offered() or (
+        not in_telegram and await payments.details_configured())
     # реквизиты годятся и как запасной путь: касса есть, но счёт не выставить
     fallback = await payments.details_configured() and not can_invoice
 
@@ -161,7 +164,7 @@ async def _send_payment_request(group: list[Row]) -> None:
         ])
         if can_invoice and not await _send_invoice(group, total):
             log.warning("Счёт по заказу %s не выставлен", number)
-        if too_small and await payments.invoice_available():
+        if in_telegram and too_small and await payments.invoice_available():
             await notify.send_to_admins(
                 f"ℹ️ Заказ <b>№{number}</b> на {fmt_money(total)}: счёт в Telegram "
                 f"не выставить — меньше {fmt_money(payments.MIN_AMOUNT_KOP)}. "
