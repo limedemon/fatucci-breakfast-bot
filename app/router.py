@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import logging
 
-from . import admin, admins, flow, repo
+from . import access, admin, admins, flow, repo
 from .channels.base import TG, Btn, Channel, Event, Out
 from .channels.telegram import ADMIN_BUTTON, MENU_BUTTON, SUPPORT_BUTTON
 from .config import cfg
@@ -45,6 +45,29 @@ async def _route(ev: Event, ch: Channel) -> None:
 
     is_group = ch.name == TG and str(ev.chat_id) != str(ev.user_id)
 
+    if ch.name != TG and text.lower().split("@")[0] == "/admin":
+        if await admins.is_admin(ev.user_id, ev.channel):
+            await ch.send(ev.chat_id, Out(
+                text="🛠 <b>Админ-панель — в Telegram</b>\n\n"
+                     "Здесь вам приходят заявки на доступ, их можно решать прямо в этом чате."))
+        else:
+            await ch.send(ev.chat_id, Out(
+                text="🔒 Нет доступа. Чтобы запросить права администратора, "
+                     "отправьте <code>/admin request</code>."))
+        return
+
+    # заявка на права администратора — в любом мессенджере
+    if access.is_request_command(text):
+        await access.request_rights(ev, ch)
+        return
+    if ev.kind == "callback" and (ev.payload or "").startswith("ar:"):
+        parts = ev.payload.split(":")
+        if len(parts) == 3 and parts[2].isdigit():
+            await access.decide(ev, ch, parts[1], int(parts[2]))
+        else:
+            await ch.answer_callback(ev.callback_id)
+        return
+
     # привязка чатов прямо из группы — чтобы не искать ID руками
     if text.startswith("/clip2"):
         await _clip_chat(ev, ch, is_group, reviews=True)
@@ -67,7 +90,7 @@ async def _route(ev: Event, ch: Channel) -> None:
                 "в администраторы бота или рабочего чата.")
         return
 
-    if ch.name == TG and await admins.is_admin(ev.user_id):
+    if ch.name == TG and await admins.is_admin(ev.user_id, ev.channel):
         # ввод для админки принимаем только в личном чате с ботом,
         # чтобы обычная переписка в рабочем чате не попала в форму
         if ev.kind == "text" and not is_group and await admin.handle_text(ev, ch):
@@ -90,7 +113,7 @@ async def _may_manage(ev: Event, ch: Channel, is_group: bool) -> bool:
     """
     if ch.name != TG:
         return False
-    if await admins.is_admin(ev.user_id):
+    if await admins.is_admin(ev.user_id, ev.channel):
         return True
     if not is_group:
         return False
@@ -119,7 +142,7 @@ async def _clip_chat(ev: Event, ch: Channel, is_group: bool,
                  f"туда пойдут {what}."))
         return
 
-    if not await admins.is_admin(ev.user_id):
+    if not await admins.is_admin(ev.user_id, ev.channel):
         await ch.send(ev.chat_id, Out(
             text="⛔ Привязать чат может только администратор бота."))
         return

@@ -417,6 +417,48 @@ async def broadcast_targets(channel: str = "") -> list[Row]:
     return await db.fetchall(sql, params)
 
 
+# ============================================================ заявки на права
+async def create_admin_request(channel: str, ext_id: str, chat_id: str,
+                               username: str, full_name: str) -> int:
+    return await db.insert(
+        "INSERT INTO admin_requests (channel, ext_id, chat_id, username, full_name) "
+        "VALUES (?, ?, ?, ?, ?)",
+        (channel, str(ext_id), str(chat_id), username, full_name))
+
+
+async def get_admin_request(request_id: int) -> Optional[Row]:
+    return await db.fetchone("SELECT * FROM admin_requests WHERE id = ?", (int(request_id),))
+
+
+async def pending_admin_request(channel: str, ext_id: str) -> Optional[Row]:
+    return await db.fetchone(
+        "SELECT * FROM admin_requests WHERE channel = ? AND ext_id = ? AND status = 'pending' "
+        "ORDER BY id DESC LIMIT 1", (channel, str(ext_id)))
+
+
+async def claim_admin_request(request_id: int, status: str, actor: str) -> bool:
+    """Закрыть заявку, только если её ещё никто не решил.
+
+    Условие стоит прямо в UPDATE: если два админа нажмут одновременно,
+    изменится заявка только у первого. Кто победил — видно по записи.
+    """
+    await db.execute(
+        "UPDATE admin_requests SET status = ?, decided_by = ? "
+        "WHERE id = ? AND status = 'pending'",
+        (status, actor, int(request_id)))
+    row = await get_admin_request(request_id)
+    return row is not None and row["status"] == status and row["decided_by"] == actor
+
+
+async def update_admin_request(request_id: int, **fields: Any) -> None:
+    data = {k: v for k, v in fields.items() if k in ("status", "decided_by", "messages")}
+    if not data:
+        return
+    sets = ", ".join(f"{k} = ?" for k in data)
+    await db.execute(f"UPDATE admin_requests SET {sets} WHERE id = ?",
+                     [*data.values(), int(request_id)])
+
+
 # ==================================================================== отзывы
 async def create_review(channel: str, ext_id: str, order_no: str, stars: int) -> int:
     return await db.insert(

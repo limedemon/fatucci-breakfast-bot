@@ -196,7 +196,8 @@ CREATE TABLE IF NOT EXISTS digests (
 
 CREATE TABLE IF NOT EXISTS admins (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id    INTEGER NOT NULL UNIQUE,
+    channel    TEXT NOT NULL DEFAULT 'tg',
+    user_id    BIGINT NOT NULL,
     username   TEXT NOT NULL DEFAULT '',
     full_name  TEXT NOT NULL DEFAULT '',
     is_owner   INTEGER NOT NULL DEFAULT 0,
@@ -224,8 +225,21 @@ CREATE TABLE IF NOT EXISTS reviews (
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+CREATE TABLE IF NOT EXISTS admin_requests (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    channel    TEXT NOT NULL,
+    ext_id     TEXT NOT NULL,
+    chat_id    TEXT NOT NULL DEFAULT '',
+    username   TEXT NOT NULL DEFAULT '',
+    full_name  TEXT NOT NULL DEFAULT '',
+    status     TEXT NOT NULL DEFAULT 'pending',
+    decided_by TEXT NOT NULL DEFAULT '',
+    messages   TEXT NOT NULL DEFAULT '[]',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE TABLE IF NOT EXISTS admin_state (
-    admin_id INTEGER PRIMARY KEY,
+    admin_id BIGINT PRIMARY KEY,
     state    TEXT NOT NULL DEFAULT '',
     data     TEXT NOT NULL DEFAULT '{}'
 );
@@ -241,6 +255,10 @@ INDEXES = [
     "CREATE INDEX IF NOT EXISTS idx_orders_user   ON orders (channel, ext_id)",
     "CREATE INDEX IF NOT EXISTS idx_orders_group  ON orders (group_key)",
     "CREATE INDEX IF NOT EXISTS idx_events_order  ON order_events (order_id)",
+    # один человек — один доступ в своём мессенджере; ID в Telegram и MAX
+    # могут совпасть, поэтому уникальность — по паре, а не по номеру
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_admins_channel_user ON admins (channel, user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_admin_requests_user ON admin_requests (channel, ext_id)",
 ]
 
 #: серверное «сейчас» в том же текстовом виде, что и у SQLite
@@ -451,6 +469,7 @@ MIGRATIONS: list[tuple[str, str, str]] = [
     ("orders", "address_ok", "INTEGER NOT NULL DEFAULT 1"),
     ("objects", "delivery_time", "TEXT NOT NULL DEFAULT '09:00'"),
     ("objects", "delivery_time_to", "TEXT NOT NULL DEFAULT ''"),
+    ("admins", "channel", "TEXT NOT NULL DEFAULT 'tg'"),
 ]
 
 
@@ -471,7 +490,55 @@ async def _migrate() -> None:
             continue
         log.info("Миграция: добавляю %s.%s", table, column)
         await execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+    await _migrate_admins()
     await _backfill()
+
+
+async def _migrate_admins() -> None:
+    """Админы: 64-битные ID и уникальность по паре «мессенджер + ID».
+
+    Раньше ID хранился в 32-битном поле с уникальностью по одному номеру.
+    Нынешние ID Telegram в такое поле не влезают, а ID из MAX могут совпасть
+    с телеграмными — поэтому поле расширяем, а старое ограничение снимаем.
+    Шаг повторяемый: на уже приведённой базе ничего не меняет.
+    """
+    if IS_PG:
+        await execute("ALTER TABLE admins ALTER COLUMN user_id TYPE BIGINT")
+        await execute("ALTER TABLE admin_state ALTER COLUMN admin_id TYPE BIGINT")
+        await execute("ALTER TABLE admins DROP CONSTRAINT IF EXISTS admins_user_id_key")
+        return
+
+    # SQLite не умеет снимать ограничение со столбца — пересобираем таблицу,
+    # если на user_id осталась старая уникальность
+    single_unique = False
+    for index in await fetchall("PRAGMA index_list(admins)"):
+        if not index["unique"]:
+            continue
+        columns = [row["name"] for row in await fetchall(f"PRAGMA index_info({index['name']})")]
+        if columns == ["user_id"]:
+            single_unique = True
+    if not single_unique:
+        return
+
+    log.info("Миграция: пересобираю таблицу админов под несколько мессенджеров")
+    await apply_ddl("""
+        CREATE TABLE admins_new (
+            id         INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel    TEXT NOT NULL DEFAULT 'tg',
+            user_id    BIGINT NOT NULL,
+            username   TEXT NOT NULL DEFAULT '',
+            full_name  TEXT NOT NULL DEFAULT '',
+            is_owner   INTEGER NOT NULL DEFAULT 0,
+            added_by   TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL DEFAULT (datetime('now'))
+        );
+        INSERT INTO admins_new (id, channel, user_id, username, full_name, is_owner,
+                                added_by, created_at)
+            SELECT id, COALESCE(channel, 'tg'), user_id, username, full_name, is_owner,
+                   added_by, created_at FROM admins;
+        DROP TABLE admins;
+        ALTER TABLE admins_new RENAME TO admins;
+    """)
 
 
 async def _backfill() -> None:

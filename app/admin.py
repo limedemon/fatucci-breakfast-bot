@@ -14,7 +14,7 @@ from typing import Any, Callable, Optional
 
 from . import (admins, courier, db, guide, media, notify, orders_service, payments,
                pricing, qrgen, repo, statuses)
-from .channels.base import MAX, TG, Btn, Channel, Event, Out, get_channel
+from .channels.base import MAX, TG, Btn, Channel, Event, Out, channel_title, get_channel
 from .config import cfg
 from .utils import (
     WEEKDAYS_FULL,
@@ -1133,12 +1133,15 @@ async def _access_route(ev: Event, ch: Channel, args: list[str]) -> None:
         await _access_guests(ev, ch, int(args[1]) if len(args) > 1 else 0)
     elif action == "p":
         await _access_add_guest(ev, ch, int(args[1]))
-    elif action == "d":
-        await _access_confirm_remove(ev, ch, int(args[1]))
-    elif action == "dd":
-        ok, message = await admins.remove(int(args[1]))
-        await _answer(ev, ch, message)
-        await _access_list(ev, ch)
+    elif action in ("d", "dd"):
+        # a:acc:d:<мессенджер>:<ID>; старые кнопки без мессенджера — это Telegram
+        channel, user_id = (args[1], int(args[2])) if len(args) > 2 else (TG, int(args[1]))
+        if action == "d":
+            await _access_confirm_remove(ev, ch, user_id, channel)
+        else:
+            ok, message = await admins.remove(user_id, channel)
+            await _answer(ev, ch, message)
+            await _access_list(ev, ch)
 
 
 async def _access_list(ev: Event, ch: Channel) -> None:
@@ -1149,17 +1152,21 @@ async def _access_list(ev: Event, ch: Channel) -> None:
         mark = "👑" if row["is_owner"] else "🛠"
         name = row["full_name"] or (f"@{row['username']}" if row["username"] else row["user_id"])
         role = "владелец" if row["is_owner"] else "менеджер"
-        lines.append(f"{mark} <b>{esc(name)}</b> — {role}\n"
+        where = "" if row["channel"] == TG else f" · {channel_title(row['channel'])}"
+        lines.append(f"{mark} <b>{esc(name)}</b> — {role}{where}\n"
                      f"   ID <code>{row['user_id']}</code> · добавлен {fmt_dt(row['created_at'])}")
         if not row["is_owner"]:
-            kb.append([Btn(text=f"🗑 Убрать {name}", data=f"a:acc:d:{row['user_id']}",
+            kb.append([Btn(text=f"🗑 Убрать {name}{where}",
+                           data=f"a:acc:d:{row['channel']}:{row['user_id']}",
                            intent="negative")])
     if not rows:
         lines.append("Пока никого — доступ выдан через переменную окружения ADMIN_IDS.")
     if cfg.admin_ids:
         lines += ["", f"🔑 Аварийный доступ из переменной ADMIN_IDS: "
                       f"<code>{', '.join(str(i) for i in cfg.admin_ids)}</code>"]
-    lines += ["", "<i>Владельца убрать нельзя — это защита от потери доступа к боту.</i>"]
+    lines += ["", "<i>Владельца убрать нельзя — это защита от потери доступа к боту.</i>",
+              "<i>Попросить доступ можно самому: команда <code>/admin request</code> "
+              "в личке с ботом — в Telegram или MAX.</i>"]
 
     kb.append([Btn(text="➕ Добавить по ID", data="a:acc:add"),
                Btn(text="👥 Выбрать из гостей", data="a:acc:g:0")])
@@ -1203,10 +1210,12 @@ async def _access_add_guest(ev: Event, ch: Channel, user_pk: int) -> None:
     await _access_list(ev, ch)
 
 
-async def _access_confirm_remove(ev: Event, ch: Channel, user_id: int) -> None:
-    row = await admins.get(user_id)
+async def _access_confirm_remove(ev: Event, ch: Channel, user_id: int,
+                                 channel: str = TG) -> None:
+    row = await admins.get(user_id, channel)
     name = (row["full_name"] or row["username"] or user_id) if row else user_id
-    kb = [[Btn(text="🗑 Да, убрать", data=f"a:acc:dd:{user_id}", intent="negative")],
+    kb = [[Btn(text="🗑 Да, убрать", data=f"a:acc:dd:{channel}:{user_id}",
+               intent="negative")],
           [Btn(text="✖️ Отмена", data="a:acc:l")]]
     await _show(ev, ch, Out(
         text=f"⚠️ Убрать доступ у <b>{esc(name)}</b>?\n\n"

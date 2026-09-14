@@ -210,7 +210,7 @@ async def _pin_support_button(ev: Event, ch: Channel) -> None:
     from . import admins
 
     try:
-        if await admins.is_admin(ev.user_id):
+        if await admins.is_admin(ev.user_id, ev.channel):
             await ch.show_admin_button(
                 str(ev.chat_id),
                 "🛠 Внизу закреплены <b>Админ-панель</b> и <b>Поддержка</b> — "
@@ -231,7 +231,7 @@ async def show_support(ev: Event, ch: Channel) -> None:
         kb.append([Btn(text="✍️ Написать в поддержку", url=link)])
     from . import admins
 
-    if await admins.is_admin(ev.user_id):
+    if await admins.is_admin(ev.user_id, ev.channel):
         kb.append([Btn(text="🛠 Админ-панель", data="a:h")])
     else:
         kb.append([Btn(text="🏠 В начало", data="g:menu")])

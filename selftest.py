@@ -208,9 +208,27 @@ async def simulate_old_database() -> None:
     создаться только после этого.
     """
     old = db.SCHEMA
-    for _table, column, _ddl in db.MIGRATIONS:
-        old = re.sub(rf"^ *{column} .*\n", "", old, flags=re.M)
+    for table, column, _ddl in db.MIGRATIONS:
+        # колонку убираем только в её таблице: имена вроде channel есть во многих
+        block = re.search(rf"CREATE TABLE IF NOT EXISTS {table} \((.*?)\n\);", old, re.S)
+        if block is None:
+            continue
+        body = re.sub(rf"^ *{column} .*\n", "", block.group(1) + "\n", flags=re.M).rstrip("\n")
+        old = old[:block.start(1)] + body + old[block.end(1):]
     old = re.sub(r",(\s*\);)", r"\1", old)        # запятая перед закрывающей скобкой
+
+    # таблица админов в старой базе: 32-битный ID с уникальностью по номеру
+    old = re.sub(r"CREATE TABLE IF NOT EXISTS admins \(.*?\n\);",
+                 "CREATE TABLE IF NOT EXISTS admins (\n"
+                 "    id         INTEGER PRIMARY KEY AUTOINCREMENT,\n"
+                 "    user_id    INTEGER NOT NULL UNIQUE,\n"
+                 "    username   TEXT NOT NULL DEFAULT '',\n"
+                 "    full_name  TEXT NOT NULL DEFAULT '',\n"
+                 "    is_owner   INTEGER NOT NULL DEFAULT 0,\n"
+                 "    added_by   TEXT NOT NULL DEFAULT '',\n"
+                 "    created_at TEXT NOT NULL DEFAULT (datetime('now'))\n);",
+                 old, count=1, flags=re.S)
+    old = old.replace("admin_id BIGINT PRIMARY KEY", "admin_id INTEGER PRIMARY KEY")
     await db.apply_ddl(old)
 
 
@@ -1333,6 +1351,121 @@ async def main() -> None:
 
     await repo.set_setting("pay_mode", payments.INVOICE)
     base.REGISTRY.pop("max", None)
+
+    print("\n— Заявка на права: Telegram —")
+    from app import admins as admins_mod
+
+    REQ = "8344248806"          # ID больше 2^31 — раньше такой не влез бы в базу
+    ch.clear()
+    await route(Event(channel="tg", user_id=REQ, chat_id=REQ, kind="text",
+                      text="/admin request", username="marina", full_name="Марина"), ch)
+    check("Запрос отправлен" in ch.to(REQ), "человеку ответили, что запрос ушёл")
+    admin_copy = ch.to(ADMIN)
+    check("Запрос прав администратора" in admin_copy, "заявка пришла админу в личку")
+    check("Марина" in admin_copy and REQ in admin_copy, "в заявке видно, кто просит")
+    ok_btn = ch.find_button("ar:ok:")
+    no_btn = ch.find_button("ar:no:")
+    ban_btn = ch.find_button("ar:ban:")
+    check(bool(ok_btn and no_btn and ban_btn), "у заявки три кнопки: принять, отклонить, забанить")
+    check(not any(chat == CHAT for chat, _ in ch.sent), "в рабочий чат заявка не попадает")
+
+    ch.clear()
+    await route(Event(channel="tg", user_id=REQ, chat_id=REQ, kind="text",
+                      text="/admin request", username="marina", full_name="Марина"), ch)
+    check("уже отправлен" in ch.to(REQ), "повторный запрос не плодит заявки")
+    check(not ch.to(ADMIN), "и админов второй раз не дёргает")
+
+    # посторонний не может решить заявку
+    ch.clear()
+    await route(Event(channel="tg", user_id=GUEST, chat_id=GUEST, kind="callback",
+                      payload=ok_btn, callback_id="ar1"), ch)
+    check(not await admins_mod.is_admin(REQ), "чужое нажатие права не выдаёт")
+
+    ch.clear()
+    await route(admin_event("callback", payload=ok_btn, callback_id="ar2"), ch)
+    check(await admins_mod.is_admin(REQ), "после «Принять» человек стал админом")
+    check("выданы права" in ch.to(REQ), "ему пришло уведомление")
+    check(any("Принято" in out.text for chat, out in ch.sent if chat == ADMIN),
+          "у админа заявка превратилась в итог")
+
+    ch.clear()
+    await route(admin_event("callback", payload=ban_btn, callback_id="ar3"), ch)
+    check(await admins_mod.is_admin(REQ), "второе решение по той же заявке не проходит")
+
+    ch.clear()
+    await route(Event(channel="tg", user_id=REQ, chat_id=REQ, kind="text",
+                      text="/admin request"), ch)
+    check("уже есть права" in ch.to(REQ), "админу запрашивать права незачем")
+
+    # отклонение
+    REQ2 = "700001"
+    ch.clear()
+    await route(Event(channel="tg", user_id=REQ2, chat_id=REQ2, kind="text",
+                      text="/admin request", full_name="Иван"), ch)
+    await route(admin_event("callback", payload=ch.find_button("ar:no:"), callback_id="ar4"), ch)
+    check(not await admins_mod.is_admin(REQ2), "после «Отклонить» прав нет")
+    check("отклонён" in ch.to(REQ2), "человеку сказали, что отказали")
+
+    # бан
+    REQ3 = "700002"
+    ch.clear()
+    await route(Event(channel="tg", user_id=REQ3, chat_id=REQ3, kind="text",
+                      text="/admin request", full_name="Спамер"), ch)
+    await route(admin_event("callback", payload=ch.find_button("ar:ban:"), callback_id="ar5"), ch)
+    banned = await repo.get_user("tg", REQ3)
+    check(banned is not None and banned["is_blocked"], "после «Забанить» человек в чёрном списке")
+    ch.clear()
+    await route(Event(channel="tg", user_id=REQ3, chat_id=REQ3, kind="text",
+                      text="/admin request"), ch)
+    check(not ch.to(ADMIN), "забаненный больше не может слать заявки")
+    ch.clear()
+    await route(Event(channel="tg", user_id=REQ3, chat_id=REQ3, kind="start"), ch)
+    check("недоступно" in ch.to(REQ3), "и пользоваться ботом тоже")
+
+    print("\n— Заявка на права: MAX —")
+    mx2 = FakeChannel("max")
+    base.REGISTRY["max"] = mx2
+    MREQ = "9100"
+    mx2.clear()
+    ch.clear()
+    await route(Event(channel="max", user_id=MREQ, chat_id="55001", kind="text",
+                      text="/admin request", full_name="Гость MAX"), mx2)
+    check("Запрос отправлен" in mx2.texts(), "в MAX заявка отправляется")
+    check("MAX" in ch.to(ADMIN), "админу в Telegram видно, что заявка из MAX")
+    await route(admin_event("callback", payload=ch.find_button("ar:ok:"), callback_id="ar6"), ch)
+    check(await admins_mod.is_admin(MREQ, "max"), "человек стал админом в MAX")
+    check(not await admins_mod.is_admin(MREQ, "tg"),
+          "а в Telegram с тем же номером — нет: мессенджеры не путаются")
+    check("выданы права" in mx2.texts(), "уведомление пришло в MAX")
+
+    # теперь новая заявка приходит и админу в MAX, и решать можно там
+    mx2.clear()
+    ch.clear()
+    await route(Event(channel="max", user_id="9200", chat_id="55002", kind="text",
+                      text="/admin request", full_name="Ещё гость"), mx2)
+    check(any(chat == f"u{MREQ}" for chat, _ in mx2.sent),
+          "админ из MAX получил заявку в личку MAX")
+    await route(Event(channel="max", user_id=MREQ, chat_id="55001", kind="callback",
+                      payload=mx2.find_button("ar:no:"), callback_id="ar7"), mx2)
+    request = await repo.pending_admin_request("max", "9200")
+    check(request is None, "админ из MAX решил заявку прямо в MAX")
+
+    mx2.clear()
+    await route(Event(channel="max", user_id=MREQ, chat_id="55001", kind="text",
+                      text="/admin"), mx2)
+    check("в Telegram" in mx2.texts(), "в MAX /admin подсказывает, что панель в Telegram")
+    base.REGISTRY.pop("max", None)
+
+    # «Доступ»: одинаковый номер в Telegram и MAX — это разные люди
+    await admins_mod.add(int(MREQ), "", "Тёзка в TG", added_by="тест", channel="tg")
+    ch.clear()
+    await route(admin_event("callback", payload="a:acc:l", callback_id="acc1"), ch)
+    check(ch.find_button(f"a:acc:d:max:{MREQ}") and ch.find_button(f"a:acc:d:tg:{MREQ}"),
+          "в «Доступе» у кнопок удаления указан мессенджер")
+    await route(admin_event("callback", payload=f"a:acc:dd:max:{MREQ}", callback_id="acc2"), ch)
+    check(not await admins_mod.is_admin(MREQ, "max"), "админ из MAX убран")
+    check(await admins_mod.is_admin(MREQ, "tg"), "а Telegram-админ с тем же номером остался")
+    await admins_mod.remove(int(MREQ), "tg")
 
     print("\n— Админка —")
     ch.clear()
