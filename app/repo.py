@@ -765,6 +765,13 @@ async def orders_for_delivery(day: str, status_list: Sequence[str]) -> list[Row]
     )
 
 
+async def open_card_payments() -> list[Row]:
+    """Заказы, у которых ссылка ЮKassa ещё ждёт оплаты."""
+    return await db.fetchall(
+        "SELECT * FROM orders WHERE payment_id LIKE 'yk:%' AND payment_url <> '' "
+        "ORDER BY id LIMIT 200")
+
+
 async def pending_payments() -> list[Row]:
     return await db.fetchall(
         "SELECT * FROM orders WHERE payment_id <> '' AND status = ? ORDER BY id",

@@ -9,6 +9,11 @@
 (/mybots → бот → Payments). Тогда гость платит картой в пару касаний,
 а оплату подтверждает сам Telegram, без участия менеджера.
 
+**Ссылкой ЮKassa** — если заданы shopId и секретный ключ (app/yookassa.py).
+Так гость из MAX платит картой: встроенных счетов там нет. В Telegram
+ссылка — запасной путь, когда счёт выставить нельзя (например, сумма
+меньше минимальной для Telegram).
+
 Пока не настроено ни то, ни другое, бот не даёт оформить заказ: гость видит
 сообщение, что приём заказов временно недоступен. Так не появляется заказов,
 за которые нечем заплатить.
@@ -108,15 +113,56 @@ async def details_offered() -> bool:
     return await details_configured() and await mode() in (DETAILS, BOTH)
 
 
-async def available(channel: str = "tg") -> bool:
-    """Можно ли вообще принять оплату — от этого зависит, откроется ли заказ.
+async def link_available() -> bool:
+    """Можно ли дать гостю ссылку на оплату картой через ЮKassa."""
+    from . import yookassa
 
-    В MAX встроенных счетов нет, поэтому там оплата возможна только
-    по реквизитам — касса гостю из MAX не поможет.
+    if not await is_enabled() or await mode() == DETAILS:
+        return False
+    return await yookassa.is_configured()
+
+
+async def card_available(channel: str = "tg") -> bool:
+    """Может ли гость в этом мессенджере заплатить картой.
+
+    В Telegram — счётом или ссылкой ЮKassa, в MAX — только ссылкой.
     """
-    if channel != "tg":
-        return await details_configured()
-    return await invoice_available() or await details_configured()
+    if channel == "tg" and await invoice_available():
+        return True
+    return await link_available()
+
+
+async def available(channel: str = "tg") -> bool:
+    """Можно ли вообще принять оплату — от этого зависит, откроется ли заказ."""
+    return await card_available(channel) or await details_configured()
+
+
+async def max_summary() -> str:
+    """Чем платит гость из MAX — строка для проверки оплаты и раздела настроек.
+
+    Пусто, если MAX не подключён и ЮKassa не настроена: тогда говорить не о чем.
+    """
+    from . import yookassa
+
+    link_ok = await yookassa.is_configured()
+    if not (link_ok or (await repo.get_setting("max_token")).strip()):
+        return ""
+    details_ok = await details_configured()
+    current = await mode()
+    if not await is_enabled():
+        line = "заказы не принимаются"
+    elif current == DETAILS:
+        line = "перевод по реквизитам" if details_ok else "оплатить нечем — нет реквизитов"
+    elif link_ok:
+        line = "кнопка «Оплатить картой» (ЮKassa), оплата подтверждается сама"
+        if current == BOTH and details_ok:
+            line += ", или перевод по реквизитам"
+    elif details_ok:
+        line = ("перевод по реквизитам — чтобы платили картой, "
+                "заполните ключи ЮKassa ниже")
+    else:
+        line = "оплатить нечем — нужны ключи ЮKassa или реквизиты"
+    return f"🟣 <b>MAX:</b> {line}"
 
 
 # ------------------------------------------------------------------- счёт
@@ -156,6 +202,15 @@ async def provider_data() -> str:
 # -------------------------------------------------------------- диагностика
 async def check_setup() -> tuple[bool, str]:
     """Что показывает кнопка «Проверить оплату» в админ-панели."""
+    ok, text = await _check_telegram()
+    extra = await max_summary()
+    return ok, text + (f"\n\n{extra}" if extra else "")
+
+
+async def _check_telegram() -> tuple[bool, str]:
+    from . import yookassa
+
+    link_ok = await yookassa.is_configured()
     if not await is_enabled():
         return False, (
             "⛔️ <b>Приём оплаты выключен</b>\n\n"
@@ -167,10 +222,11 @@ async def check_setup() -> tuple[bool, str]:
     current = await mode()
 
     if current == BOTH:
-        if not token_looks_valid(token) or not await details_configured():
+        card_ok = token_looks_valid(token) or link_ok
+        if not card_ok or not await details_configured():
             missing = []
-            if not token_looks_valid(token):
-                missing.append("токен кассы в поле выше")
+            if not card_ok:
+                missing.append("токен кассы или ключи ЮKassa в полях выше")
             if not await details_configured():
                 missing.append("текст «Реквизиты для оплаты» в ✍️ Тексты бота")
             return False, (
@@ -204,6 +260,14 @@ async def check_setup() -> tuple[bool, str]:
             "Выбран способ «Только перевод по реквизитам», но сами реквизиты "
             "пустые. Заполните текст <b>«Реквизиты для оплаты»</b> в разделе "
             "✍️ Тексты бота — или переключите способ оплаты на счёт."
+        )
+
+    if not token and link_ok:
+        return True, (
+            "✅ <b>Оплата картой по ссылке ЮKassa</b>\n\n"
+            "После подтверждения заказа гость получает кнопку «Оплатить картой» — "
+            "и в Telegram, и в MAX. Оплата подтверждается сама, обычно за минуту.\n\n"
+            "Ключи проверяет кнопка «Проверить ЮKassa» в разделе оплаты."
         )
 
     if not token:
@@ -269,6 +333,10 @@ async def _too_cheap_hint() -> str:
     low = [price for price in prices if 0 < price < MIN_AMOUNT_KOP]
     if not low:
         return ""
+    from . import yookassa
+
+    instead = ("ссылку на оплату ЮKassa" if await yookassa.is_configured()
+               else "реквизиты для перевода")
     return (f"\n\n⚠️ Есть цены ниже {fmt_money(MIN_AMOUNT_KOP)} "
             f"(минимум — {fmt_money(min(low))}). Счёт на такую сумму Telegram "
-            "не примет: по таким заказам гость получит реквизиты для перевода.")
+            f"не примет: по таким заказам гость получит {instead}.")

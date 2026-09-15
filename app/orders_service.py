@@ -121,10 +121,12 @@ async def _maybe_offer_review(order: Row) -> None:
 async def _send_payment_request(group: list[Row]) -> None:
     """Заказ подтверждён — просим оплатить.
 
-    Если подключена касса, шлём встроенный счёт Telegram: оплату подтвердит
-    сам мессенджер. Иначе отправляем реквизиты и кнопку «Я оплатил» — по ней
-    менеджер получит сообщение и сверит поступление вручную.
+    Картой: в Telegram — встроенный счёт, в MAX (или когда счёт выставить
+    нельзя) — ссылка ЮKassa. Обе оплаты подтверждаются сами. Переводом —
+    реквизиты и кнопка «Я оплатил», поступление сверяет менеджер.
     """
+    from . import yookassa
+
     head = group[0]
     total = notify.group_total(group)
     number = head["group_key"] or head["number"]
@@ -132,17 +134,34 @@ async def _send_payment_request(group: list[Row]) -> None:
     # Telegram не принимает совсем мелкие суммы. Проверяем это заранее:
     # иначе гостю обещали бы счёт, а следом приходили бы реквизиты.
     too_small = total < payments.MIN_AMOUNT_KOP
-    # счёт умеет только Telegram: гость из MAX платит по реквизитам всегда
     in_telegram = head["channel"] == TG
     can_invoice = in_telegram and await payments.invoice_available() and not too_small
-    with_details = await payments.details_offered() or (
-        not in_telegram and await payments.details_configured())
-    # реквизиты годятся и как запасной путь: касса есть, но счёт не выставить
-    fallback = await payments.details_configured() and not can_invoice
 
-    if can_invoice and not with_details:
+    link = ""
+    if not can_invoice and await payments.link_available():
+        link, error = await yookassa.payment_link(group)
+        if not link:
+            log.warning("Ссылка ЮKassa по заказу %s не создана: %s", number, error)
+            await notify.send_to_admins(
+                f"⚠️ Заказ <b>№{number}</b>: ЮKassa не выдала ссылку на оплату — "
+                f"<code>{esc(error)}</code>.\nПроверьте ключи: /admin → ⚙️ Настройки → "
+                "💳 Оплата → «Проверить ЮKassa».")
+    can_card = can_invoice or bool(link)
+
+    with_details = await payments.details_offered() or (
+        not can_card and await payments.details_configured())
+    # реквизиты годятся и как запасной путь: касса есть, но счёт не выставить
+    fallback = await payments.details_configured() and not can_card
+    card_btn = [Btn(text="💳 Оплатить картой", url=link)] if link else None
+
+    if can_card and not with_details:
+        intro = "pay_by_invoice" if can_invoice else "pay_by_link"
         text = await notify.group_status_text(
-            group, "status_accepted", pay_details=await repo.render_text("pay_by_invoice"))
+            group, "status_accepted", pay_details=await repo.render_text(intro))
+        if link:
+            await notify.notify_guest(head, text, [card_btn, [Btn(text="📦 Мои заказы",
+                                                                    data="g:my")]])
+            return
         await notify.notify_guest(head, text)
         if await _send_invoice(group, total):
             return
@@ -151,20 +170,20 @@ async def _send_payment_request(group: list[Row]) -> None:
 
     if with_details or fallback:
         parts = []
-        if can_invoice:
+        if can_card:
             # оба способа сразу: сначала про карту, потом реквизиты для перевода
             parts.append(await repo.render_text("pay_choice"))
-            parts.append(await repo.render_text("pay_by_invoice"))
+            parts.append(await repo.render_text("pay_by_invoice" if can_invoice
+                                                else "pay_by_link"))
         parts.append(await payments.details_text())
         text = await notify.group_status_text(
             group, "status_accepted", pay_details="\n\n".join(parts))
-        await notify.notify_guest(head, text, [
-            [Btn(text="✅ Я оплатил", data=f"g:paid:{head['id']}", intent="positive")],
-            [Btn(text="📦 Мои заказы", data="g:my")],
-        ])
+        kb = [[Btn(text="✅ Я оплатил", data=f"g:paid:{head['id']}", intent="positive")],
+              [Btn(text="📦 Мои заказы", data="g:my")]]
+        await notify.notify_guest(head, text, [card_btn, *kb] if card_btn else kb)
         if can_invoice and not await _send_invoice(group, total):
             log.warning("Счёт по заказу %s не выставлен", number)
-        if in_telegram and too_small and await payments.invoice_available():
+        if in_telegram and too_small and not link and await payments.invoice_available():
             await notify.send_to_admins(
                 f"ℹ️ Заказ <b>№{number}</b> на {fmt_money(total)}: счёт в Telegram "
                 f"не выставить — меньше {fmt_money(payments.MIN_AMOUNT_KOP)}. "
@@ -177,8 +196,27 @@ async def _send_payment_request(group: list[Row]) -> None:
         "payment_unavailable", number=number))
     await notify.send_to_admins(
         f"⚠️ Заказ <b>№{number}</b>: гостю нечем оплатить — не задано ни реквизитов, "
-        "ни токена кассы.\nОткройте /admin → ⚙️ Настройки → 💳 Оплата и свяжитесь с гостем."
+        "ни способа оплаты картой.\nОткройте /admin → ⚙️ Настройки → 💳 Оплата "
+        "и свяжитесь с гостем."
     )
+
+
+async def card_link_for_guest(order_id: int, ext_id: str, channel: str) -> tuple[str, str]:
+    """Гость просит ссылку на оплату картой (прежняя истекла). → (ссылка, ошибка)"""
+    from . import yookassa
+
+    order = await repo.get_order(order_id)
+    if order is None or order["ext_id"] != str(ext_id) or order["channel"] != channel:
+        return "", "Это не ваш заказ"
+    if order["status"] not in (statuses.NEW, statuses.ACCEPTED):
+        return "", f"Заказ уже в статусе «{statuses.label(order['status'])}»"
+    if not await payments.link_available():
+        return "", "Оплата картой сейчас недоступна — напишите менеджеру"
+    link, error = await yookassa.payment_link(await repo.group_of(order))
+    if not link:
+        log.warning("Ссылка ЮKassa для гостя не создана (%s): %s", order["number"], error)
+        return "", "Не получилось создать ссылку — попробуйте чуть позже"
+    return link, ""
 
 
 async def _send_invoice(group: list[Row], total: int) -> bool:
@@ -326,11 +364,12 @@ async def guest_confirm_received(order_id: int, ext_id: str, channel: str) -> tu
 
 
 # ------------------------------------------------------ совместимость с кодом
-async def apply_payment_success(order: Row, charge_id: str = "") -> None:
-    """Telegram подтвердил оплату счёта — отмечаем весь заказ оплаченным."""
+async def apply_payment_success(order: Row, charge_id: str = "",
+                                actor: str = "Telegram") -> None:
+    """Платёжная система подтвердила оплату — отмечаем весь заказ оплаченным."""
     if order["status"] in (statuses.PAID, statuses.DELIVERED, statuses.RECEIVED):
         return
     if charge_id:
         await repo.update_order(order["id"], payment_id=charge_id)
-    await change_status(order["id"], statuses.PAID, actor="Telegram",
+    await change_status(order["id"], statuses.PAID, actor=actor,
                         note="Оплата подтверждена платёжной системой")

@@ -282,6 +282,7 @@ async def _on_callback(ev: Event, ch: Channel, user: Row) -> None:
         "cancelall": lambda: _cancel_order(ev, ch, int(arg or 0), whole=True),
         "got": lambda: _confirm_received(ev, ch, int(arg or 0)),
         "paid": lambda: _mark_paid(ev, ch, int(arg or 0)),
+        "card": lambda: _card_link(ev, ch, int(arg or 0)),
         "paidnp": lambda: _send_paid(ev, ch, int(arg or 0)),
         "star": lambda: _pick_stars(ev, ch, parts[2:]),
         "revskip": lambda: _finish_review(ev, ch, int(arg or 0)),
@@ -489,6 +490,10 @@ async def _show_my_order(ev: Event, ch: Channel, order_id: int) -> None:
              "предыдущего дня доставки.</i>")
 
     kb: list[list[Btn]] = []
+    if order["status"] == statuses.ACCEPTED and await payments.link_available() and (
+            ev.channel != TG or not await payments.invoice_available()):
+        kb.append([Btn(text="💳 Оплатить картой", data=f"g:card:{order['id']}",
+                       intent="positive")])
     if order["status"] == statuses.ACCEPTED and await payments.details_configured():
         kb.append([Btn(text="✅ Я оплатил", data=f"g:paid:{order['id']}", intent="positive")])
     if order["status"] == statuses.DELIVERED:
@@ -517,6 +522,19 @@ async def _confirm_received(ev: Event, ch: Channel, order_id: int) -> None:
     ok, message = await orders_service.guest_confirm_received(order_id, ev.user_id, ev.channel)
     if not ok:
         await ch.send(ev.chat_id, Out(text="⚠️ " + message))
+
+
+async def _card_link(ev: Event, ch: Channel, order_id: int) -> None:
+    """Кнопка-ссылка на оплату картой — свежая, если прежняя истекла."""
+    await _answer(ev, ch, "Готовлю ссылку…")
+    link, error = await orders_service.card_link_for_guest(order_id, ev.user_id, ev.channel)
+    if not link:
+        await ch.send(ev.chat_id, Out(text=f"⚠️ {error}"))
+        return
+    await ch.send(ev.chat_id, Out(
+        text=await repo.render_text("pay_by_link"),
+        kb=[[Btn(text="💳 Оплатить картой", url=link)],
+            [Btn(text="⬅️ К заказу", data=f"g:ord:{order_id}")]]))
 
 
 async def _mark_paid(ev: Event, ch: Channel, order_id: int) -> None:

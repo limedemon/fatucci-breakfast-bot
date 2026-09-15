@@ -12,7 +12,7 @@ import re
 from datetime import timedelta
 from typing import Any, Callable, Optional
 
-from . import (access, admins, courier, db, guide, media, notify, orders_service, payments,
+from . import (access, admins, yookassa, courier, db, guide, media, notify, orders_service, payments,
                pricing, qrgen, repo, statuses)
 from .channels.base import MAX, TG, Btn, Channel, Event, Out, channel_title, get_channel
 from .config import cfg
@@ -145,7 +145,26 @@ SETTING_SECTIONS: dict[str, tuple[str, list[FieldSpec]]] = {
         ("pm_token", "Токен кассы от @BotFather", "secret"),
         ("pay_mode", "Способ оплаты", "choice"),
         ("pay_link", "Ссылка на оплату (если есть)", "text"),
+        ("yk_shop_id", "ЮKassa: shopId", "text"),
+        ("yk_secret", "ЮKassa: секретный ключ", "secret"),
+        ("yk_receipt", "ЮKassa: отправлять чеки 54-ФЗ", "bool"),
+        ("yk_vat_code", "ЮKassa: код НДС в чеке", "int"),
     ]),
+}
+
+YK_HINTS = {
+    "yk_shop_id": (
+        "Номер магазина из личного кабинета ЮKassa → <b>Интеграция → Ключи API</b> "
+        "(там же, где секретный ключ). Только цифры."),
+    "yk_secret": (
+        "Секретный ключ из личного кабинета ЮKassa → <b>Интеграция → Ключи API</b>.\n"
+        "Начинается с <code>live_</code>, у тестового магазина — с <code>test_</code>.\n\n"
+        "Ключ хранится только в базе бота. Сообщение с ним лучше удалить из чата."),
+    "yk_vat_code": (
+        "Код ставки НДС для чека:\n"
+        "<code>1</code> — без НДС (УСН, самозанятые)\n"
+        "<code>2</code> — 0%  ·  <code>3</code> — 10%  ·  <code>4</code> — 20%\n\n"
+        "Если не уверены — спросите бухгалтера. Нужен, только когда включены чеки."),
 }
 
 TEXT_TITLES: dict[str, str] = {
@@ -177,6 +196,8 @@ TEXT_TITLES: dict[str, str] = {
     "no_dates": "Нет доступных дат",
     "rules": "Условия заказа (правила)",
     "pay_by_invoice": "Сообщение перед счётом",
+    "pay_by_link": "Сообщение с кнопкой «Оплатить картой» (ЮKassa)",
+    "card_link_expired": "Ссылка на оплату истекла",
     "pay_choice": "Заголовок, когда способа два",
     "daily_reminder": "Ежедневное «успейте заказать»",
     "too_late": "Приём заказов на завтра закрыт",
@@ -1366,6 +1387,10 @@ async def _settings_route(ev: Event, ch: Channel, args: list[str]) -> None:
         ok, message = await payments.check_setup()
         await ch.send(ev.chat_id, Out(text=message if ok else "⚠️ " + message,
                                       kb=[_back("a:cfg:s:pay")]))
+    elif action == "ykapi":
+        await _answer(ev, ch, "Проверяю ЮKassa…")
+        ok, message = await yookassa.check_setup()
+        await ch.send(ev.chat_id, Out(text=message, kb=[_back("a:cfg:s:pay")]))
     elif action == "max":
         await _answer(ev, ch, "Проверяю…")
         message = await _check_max()
@@ -1409,6 +1434,10 @@ async def _settings_section(ev: Event, ch: Channel, code: str) -> None:
         kb.append([Btn(text="🧪 Проверить подключение MAX", data="a:cfg:max")])
     if code == "pay":
         lines += ["", await _pay_hint()]
+        max_line = await payments.max_summary()
+        if max_line:
+            lines += ["", max_line]
+        kb.append([Btn(text="🧪 Проверить ЮKassa", data="a:cfg:ykapi")])
     if code == "price":
         lines += ["", await _discount_preview()]
     topic = SECTION_HELP.get(code)
@@ -1525,6 +1554,11 @@ async def _settings_edit(ev: Event, ch: Channel, code: str, key: str) -> None:
                    "• от 10 наборов — минус 15%\n\n"
                    "Скидка считается только внутри одного заказа на один день.\n"
                    "Чтобы убрать скидки — отправьте <code>-</code>.")
+        return
+    if key in YK_HINTS:
+        await _ask(ev, ch, "setting", {"key": key, "kind": kind, "section": code},
+                   f"💳 <b>{esc(label)}</b>\n\n"
+                   f"Сейчас: <code>{esc(value) or 'не задан'}</code>\n\n{YK_HINTS[key]}")
         return
     if key == "pm_token":
         hint = (
@@ -1901,6 +1935,9 @@ async def _in_setting(ev: Event, ch: Channel, ctx: dict, text: str, photo: str) 
     note = ""
     if key == "orders_chat_id":
         note = "\n\n" + await _check_orders_chat(raw)
+    if key in ("yk_shop_id", "yk_secret") and raw and await yookassa.is_configured():
+        # оба ключа на месте — сразу спрашиваем ЮKassa, подходят ли они
+        note = "\n\n" + (await yookassa.check_setup())[1]
     if key == "max_token":
         # username для ссылок в QR узнаём сами — администратору вводить нечего
         note = "\n\n" + await _check_max()

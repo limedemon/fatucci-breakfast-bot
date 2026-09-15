@@ -5,7 +5,7 @@ import asyncio
 import logging
 from datetime import timedelta
 
-from . import courier, repo
+from . import courier, repo, yookassa
 from .channels.base import Btn, Out, get_channel
 from .utils import fmt_date_iso, now, parse_time
 
@@ -17,6 +17,8 @@ async def run_all() -> None:
         _loop("courier", courier_tick, 60),
         _loop("reminders", reminder_tick, 300),
         _loop("daily", daily_remind_tick, 60),
+        # оплата картой по ссылке: вебхуков нет, поэтому спрашиваем ЮKassa сами
+        _loop("card_payments", yookassa.watch_tick, 30),
     )
 
 

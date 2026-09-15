@@ -172,6 +172,12 @@ def admin_event(kind: str, chat_id: str = ADMIN, **kwargs) -> Event:
                  username="manager", full_name="Менеджер", **kwargs)
 
 
+def notify_total(group) -> int:
+    from app import notify
+
+    return notify.group_total(group)
+
+
 async def place_order(ch: FakeChannel, dates: int = 1, qty: int = 2, who: str = GUEST,
                       apartment: str = "45", allergies: str = "",
                       comment: str = "") -> list:
@@ -1348,6 +1354,187 @@ async def main() -> None:
     mx.clear()
     await route(max_event("callback", payload="g:order", callback_id="y3"), mx)
     check("недоступен" in mx.texts().lower(), "гостю MAX сказано, что заказать пока нельзя")
+
+    print("\n— Оплата картой по ссылке ЮKassa —")
+    from app import yookassa
+
+    yk_calls: list = []
+    yk_state = {"status": "pending", "n": 0, "fail": False}
+
+    async def fake_yookassa(method, path, body=None):
+        """ЮKassa понарошку: в настоящий API тесты не ходят."""
+        yk_calls.append((method, path, body))
+        if yk_state["fail"]:
+            return False, {"error": "Invalid credentials", "status": 401}
+        if method == "POST" and path == "/payments":
+            yk_state["n"] += 1
+            pid = f"pay-{yk_state['n']}"
+            return True, {"id": pid, "status": "pending", "confirmation": {
+                "confirmation_url": f"https://yoomoney.ru/checkout/{pid}"}}
+        if path.startswith("/payments/"):
+            return True, {"id": path.rsplit("/", 1)[-1], "status": yk_state["status"],
+                          "cancellation_details": {"reason": "expired_on_confirmation"}}
+        if path == "/me":
+            return True, {"account_id": "123456", "test": True}
+        return False, {"error": "unknown"}
+
+    def url_button(chan) -> str:
+        return next((b.url for _, o in chan.sent for r in (o.kb or []) for b in r if b.url), "")
+
+    async def max_order() -> dict:
+        await route(max_event("start", payload="demo1"), mx)
+        await route(max_event("callback", payload="g:order", callback_id="k1"), mx)
+        await route(max_event("callback", payload=mx.find_button("g:date:"), callback_id="k2"), mx)
+        await route(max_event("callback", payload="g:dates", callback_id="k3"), mx)
+        await route(max_event("callback", payload="g:qty:2", callback_id="k4"), mx)
+        if "апартамент" in mx.texts().lower():
+            await route(max_event("text", text="12"), mx)
+        await route(max_event("contact", phone="8 999 111-22-33"), mx)
+        await route(max_event("callback", payload="g:skipa", callback_id="k5"), mx)
+        await route(max_event("callback", payload="g:skip", callback_id="k6"), mx)
+        await route(max_event("callback", payload="g:confirm", callback_id="k7"), mx)
+        row = (await repo.list_orders(limit=1, user_key=("max", MX_GUEST)))[0]
+        await route(admin_event("callback", chat_id=CHAT,
+                                payload=f"a:ord:{row['id']}:{statuses.ACCEPTED}",
+                                callback_id="k8"), ch)
+        return await repo.get_order(row["id"])
+
+    real_yookassa = yookassa._request
+    yookassa._request = fake_yookassa
+    try:
+        await repo.set_setting("pay_mode", payments.INVOICE)
+        await repo.set_text("pay_details", "")
+        check(not await payments.available("max"), "без ключей ЮKassa и реквизитов MAX закрыт")
+        await repo.set_setting("yk_shop_id", "123456")
+        await repo.set_setting("yk_secret", "test_FAKE_KEY_FOR_SELFTEST")
+        check(await payments.available("max"), "с ключами ЮKassa MAX принимает заказы")
+
+        mx.clear()
+        ch.clear()
+        yk_calls.clear()
+        order = await max_order()
+        link = url_button(mx)
+        check(link.startswith("https://yoomoney.ru/checkout/"),
+              "гость MAX получил кнопку «Оплатить картой» со ссылкой ЮKassa")
+        check("ЮKassa" in mx.to(MX_GUEST) and not mx.find_button("g:paid:"),
+              "без реквизитов «Я оплатил» не показывается")
+        post = next(body for method, path, body in yk_calls if method == "POST")
+        group = await repo.group_of(order)
+        check(post["amount"]["value"] == f"{notify_total(group) // 100}.{notify_total(group) % 100:02d}",
+              "сумма платежа совпадает с суммой заказа")
+        check(post["confirmation"]["return_url"] and "receipt" not in post,
+              "после оплаты гость вернётся в бота; чек выключен — не отправляется")
+        check(order["payment_id"] == "yk:pay-1" and order["payment_url"] == link,
+              "платёж запомнен в заказе")
+
+        await yookassa.watch_tick()
+        check((await repo.get_order(order["id"]))["status"] == statuses.ACCEPTED,
+              "пока ЮKassa ждёт оплату, заказ не трогаем")
+        yk_state["status"] = "succeeded"
+        mx.clear()
+        await yookassa.watch_tick()
+        fresh = await repo.get_order(order["id"])
+        check(fresh["status"] == statuses.PAID and not fresh["payment_url"],
+              "ЮKassa подтвердила — заказ оплачен сам")
+        check("Оплата подтверждена" in mx.to(MX_GUEST), "гость MAX узнал об оплате")
+        yk_calls.clear()
+        await yookassa.watch_tick()
+        check(not yk_calls, "оплаченный платёж больше не проверяется")
+
+        # ссылка истекла — гость получает новую
+        yk_state["status"] = "pending"
+        mx.clear()
+        order = await max_order()
+        yk_state["status"] = "canceled"
+        mx.clear()
+        await yookassa.watch_tick()
+        check("больше не действует" in mx.to(MX_GUEST) and mx.find_button("g:card:"),
+              "истёкшая ссылка: гостю предложили новую")
+        yk_state["status"] = "pending"
+        mx.clear()
+        await route(max_event("callback", payload=f"g:card:{order['id']}", callback_id="k9"), mx)
+        second = url_button(mx)
+        check(second and second != link and second.endswith(f"pay-{yk_state['n']}"),
+              "по кнопке пришла свежая ссылка")
+        posts = sum(1 for m, _, _ in yk_calls if m == "POST")
+        mx.clear()
+        await route(max_event("callback", payload=f"g:card:{order['id']}", callback_id="k10"), mx)
+        check(url_button(mx) == second and sum(1 for m, _, _ in yk_calls if m == "POST") == posts,
+              "пока ссылка жива, повторное нажатие отдаёт её же — второго платежа нет")
+        mx.clear()
+        await route(max_event("callback", payload=f"g:ord:{order['id']}", callback_id="k11"), mx)
+        check(mx.find_button("g:card:"), "в карточке заказа гостя есть «Оплатить картой»")
+
+        # заплатили по ссылке уже отменённого заказа — менеджеры должны знать
+        await repo.set_status(order["id"], statuses.CANCELLED, actor="тест")
+        yk_state["status"] = "succeeded"
+        ch.clear()
+        await yookassa.watch_tick()
+        check("деньги можно вернуть" in ch.to(CHAT),
+              "оплата отменённого заказа — менеджерам предупреждение о возврате")
+        yk_state["status"] = "pending"
+
+        # чек по 54-ФЗ
+        await repo.set_setting("yk_receipt", "1")
+        yk_calls.clear()
+        order = await max_order()
+        post = next(body for method, path, body in yk_calls if method == "POST")
+        receipt = post.get("receipt") or {}
+        items_total = sum(round(float(i["amount"]["value"]) * 100) * int(float(i["quantity"]))
+                          for i in receipt.get("items", []))
+        check(receipt.get("customer", {}).get("phone") == "79991112233",
+              "в чеке телефон гостя в формате ЮKassa")
+        check(items_total == int(post["amount"]["value"].replace(".", "")),
+              "позиции чека в сумме равны платежу")
+        await repo.set_setting("yk_receipt", "0")
+
+        # оба способа: карта и перевод в одном сообщении
+        await repo.set_setting("pay_mode", payments.BOTH)
+        await repo.set_text("pay_details", "Перевод по номеру +7 900 000-00-00.")
+        mx.clear()
+        order = await max_order()
+        check(url_button(mx) and mx.find_button("g:paid:") and "+7 900" in mx.to(MX_GUEST),
+              "режим «оба»: в MAX и ссылка на карту, и реквизиты с «Я оплатил»")
+        await repo.set_text("pay_details", "")
+        await repo.set_setting("pay_mode", payments.INVOICE)
+
+        # ЮKassa отказала — гость не остаётся без ответа, менеджеры знают причину
+        yk_state["fail"] = True
+        mx.clear()
+        ch.clear()
+        order = await max_order()
+        check(not url_button(mx) and "подтверждён" in mx.to(MX_GUEST),
+              "ссылки нет — гостю сказали, что менеджер подскажет с оплатой")
+        check("ЮKassa не выдала ссылку" in ch.to(CHAT), "менеджерам пришла причина")
+        ch.clear()
+        await route(admin_event("callback", payload="a:cfg:ykapi", callback_id="k12"), ch)
+        check("не приняла ключи" in ch.texts(), "проверка ЮKassa подсвечивает неверные ключи")
+        yk_state["fail"] = False
+        ch.clear()
+        await route(admin_event("callback", payload="a:cfg:ykapi", callback_id="k13"), ch)
+        check("ЮKassa подключена" in ch.texts() and "Тестовый" in ch.texts(),
+              "проверка ЮKassa видит тестовый магазин")
+        ch.clear()
+        await route(admin_event("callback", payload="a:cfg:s:pay", callback_id="k14"), ch)
+        check("MAX:" in ch.texts() and ch.find_button("a:cfg:ykapi"),
+              "в разделе оплаты видно, чем платят в MAX")
+
+        # Telegram: сумма меньше минимума для счёта — выручает ссылка
+        demo = await repo.get_object_by_code("demo1")
+        old_price = demo["price_kop"]
+        await repo.update_object(demo["id"], price_kop=2000)
+        group = await place_order(ch, dates=1, qty=1, who=GUEST2)
+        ch.clear()
+        await route(admin_event("callback", chat_id=CHAT,
+                                payload=f"a:ord:{group[0]['id']}:{statuses.ACCEPTED}",
+                                callback_id="k15"), ch)
+        check(not ch.invoices and url_button(ch).startswith("https://yoomoney.ru/"),
+              "в Telegram сумму меньше 60 ₽ гость оплачивает по ссылке ЮKassa")
+        await repo.update_object(demo["id"], price_kop=old_price)
+    finally:
+        yookassa._request = real_yookassa
+        for key in ("yk_shop_id", "yk_secret", "yk_receipt"):
+            await repo.set_setting(key, "")
 
     await repo.set_setting("pay_mode", payments.INVOICE)
     base.REGISTRY.pop("max", None)
