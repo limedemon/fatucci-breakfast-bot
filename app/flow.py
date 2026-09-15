@@ -596,6 +596,11 @@ async def _input_receipt(ev: Event, ch: Channel, data: dict[str, Any]) -> None:
 
 async def _on_payment(ev: Event, ch: Channel) -> None:
     """Telegram подтвердил оплату встроенного счёта."""
+    from . import paytest
+
+    if paytest.is_test_payload(ev.payload):
+        await paytest.telegram_paid(ev, ch)
+        return
     order_id = payments.parse_payload(ev.payload)
     if order_id is None:
         log.warning("Оплата с неизвестной меткой: %r", ev.payload)

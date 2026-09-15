@@ -1366,13 +1366,20 @@ async def main() -> None:
         yk_calls.append((method, path, body))
         if yk_state["fail"]:
             return False, {"error": "Invalid credentials", "status": 401}
+        if method == "POST" and path == "/refunds":
+            return True, {"id": "refund-1", "status": "succeeded"}
         if method == "POST" and path == "/payments":
             yk_state["n"] += 1
             pid = f"pay-{yk_state['n']}"
+            yk_state[pid] = body
             return True, {"id": pid, "status": "pending", "confirmation": {
                 "confirmation_url": f"https://yoomoney.ru/checkout/{pid}"}}
         if path.startswith("/payments/"):
-            return True, {"id": path.rsplit("/", 1)[-1], "status": yk_state["status"],
+            pid = path.rsplit("/", 1)[-1]
+            created = yk_state.get(pid) or {}
+            return True, {"id": pid, "status": yk_state["status"],
+                          "amount": created.get("amount"), "metadata": created.get("metadata"),
+                          "payment_method": {"title": "Bank card *4477"},
                           "cancellation_details": {"reason": "expired_on_confirmation"}}
         if path == "/me":
             return True, {"account_id": "123456", "test": True}
@@ -1531,6 +1538,90 @@ async def main() -> None:
         check(not ch.invoices and url_button(ch).startswith("https://yoomoney.ru/"),
               "в Telegram сумму меньше 60 ₽ гость оплачивает по ссылке ЮKassa")
         await repo.update_object(demo["id"], price_kop=old_price)
+
+        print("\n— Тестовая оплата из админки —")
+        yk_state["status"] = "pending"
+        ch.clear()
+        await route(admin_event("callback", payload="a:cfg:s:pay", callback_id="t0"), ch)
+        check(ch.find_button("a:cfg:ptest"), "в разделе оплаты есть «Тестовая оплата»")
+        ch.clear()
+        await route(admin_event("callback", payload="a:cfg:ptest", callback_id="t1"), ch)
+        check(ch.find_button("a:cfg:ptinv") and ch.find_button("a:cfg:ptlink"),
+              "можно проверить и счёт Telegram, и ссылку ЮKassa")
+        check("1 ₽" in ch.texts() and "60 ₽" in ch.texts(), "на экране видны минимальные суммы")
+
+        orders_before = await repo.count_orders()
+        ch.clear()
+        await route(admin_event("callback", payload="a:cfg:ptinv", callback_id="t2"), ch)
+        invoice = ch.invoices[-1] if ch.invoices else {}
+        check(invoice.get("payload", "").startswith("test:") and "Счёт отправлен" in ch.texts(),
+              "тестовый счёт выставлен админу")
+        ch.clear()
+        await route(Event(channel="tg", user_id=ADMIN, chat_id=ADMIN, kind="payment",
+                          payload=invoice.get("payload", ""),
+                          raw={"charge_id": "tg_test_1", "amount": payments.MIN_AMOUNT_KOP}), ch)
+        check("Тестовая оплата прошла" in ch.to(ADMIN) and "tg_test_1" in ch.to(ADMIN),
+              "после оплаты счёта админу пришло уведомление")
+        check(await repo.count_orders() == orders_before, "заказов тестовая оплата не создаёт")
+
+        ch.clear()
+        await route(admin_event("callback", payload="a:cfg:ptlink", callback_id="t3"), ch)
+        test_link = url_button(ch)
+        check(test_link.startswith("https://yoomoney.ru/"), "тестовая ссылка ЮKassa создана")
+        test_pid = test_link.rsplit("/", 1)[-1]
+        check(yk_state[test_pid]["amount"]["value"] == "1.00", "на 1 ₽ — минимум ЮKassa")
+        ch.clear()
+        await yookassa.watch_tick()
+        check(not ch.to(ADMIN), "пока не оплачено — тишина")
+        yk_state["status"] = "succeeded"
+        await yookassa.watch_tick()
+        check("Тестовая оплата прошла" in ch.to(ADMIN) and "4477" in ch.to(ADMIN),
+              "оплатили ссылку — админу пришло уведомление")
+        refund_btn = ch.find_button("a:cfg:ptr:")
+        check(bool(refund_btn), "под уведомлением кнопка возврата")
+        ch.clear()
+        await yookassa.watch_tick()
+        check(not ch.to(ADMIN), "уведомление приходит один раз")
+        yk_calls.clear()
+        await route(admin_event("callback", payload=refund_btn, callback_id="t4"), ch)
+        refunds = [body for method, path, body in yk_calls if path == "/refunds"]
+        check(refunds and refunds[0]["payment_id"] == test_pid and "Возврат оформлен" in ch.texts(),
+              "возврат тестового платежа оформляется кнопкой")
+
+        yk_state["status"] = "pending"
+        ch.clear()
+        await route(admin_event("callback", payload="a:cfg:ptlink", callback_id="t5"), ch)
+        yk_state["status"] = "canceled"
+        ch.clear()
+        await yookassa.watch_tick()
+        check("не прошла" in ch.to(ADMIN), "неоплаченная тестовая ссылка — сообщение, что не прошла")
+
+        # то же из админки в MAX: там только ссылка ЮKassa, уведомление — в MAX
+        from app import admins as admins_test
+
+        MX_ADMIN = "9500"
+        await admins_test.add(int(MX_ADMIN), "", "Админ MAX", added_by="тест", channel="max")
+
+        def mx_admin(kind, **kw):
+            return Event(channel="max", user_id=MX_ADMIN, chat_id="66001", kind=kind,
+                         raw={"chat_type": "dialog"}, **kw)
+
+        yk_state["status"] = "pending"
+        mx.clear()
+        await route(mx_admin("callback", payload="a:cfg:ptest", callback_id="t6"), mx)
+        check(mx.find_button("a:cfg:ptlink") and not mx.find_button("a:cfg:ptinv"),
+              "в MAX тестовая оплата — ссылкой ЮKassa, счёта Telegram там нет")
+        mx.clear()
+        await route(mx_admin("callback", payload="a:cfg:ptlink", callback_id="t7"), mx)
+        check(url_button(mx).startswith("https://yoomoney.ru/"), "тестовая ссылка создана в MAX")
+        yk_state["status"] = "succeeded"
+        mx.clear()
+        ch.clear()
+        await yookassa.watch_tick()
+        check("Тестовая оплата прошла" in mx.to("66001") and not ch.to(ADMIN),
+              "уведомление об оплате пришло в MAX, в тот же чат")
+        check(mx.find_button("a:cfg:ptr:"), "и возврат доступен из MAX")
+        await admins_test.remove(int(MX_ADMIN), "max")
     finally:
         yookassa._request = real_yookassa
         for key in ("yk_shop_id", "yk_secret", "yk_receipt"):

@@ -12,7 +12,7 @@ import re
 from datetime import timedelta
 from typing import Any, Callable, Optional
 
-from . import (access, admins, yookassa, courier, db, guide, media, notify, orders_service, payments,
+from . import (access, admins, paytest, yookassa, courier, db, guide, media, notify, orders_service, payments,
                pricing, qrgen, repo, statuses)
 from .channels.base import MAX, TG, Btn, Channel, Event, Out, channel_title, get_channel
 from .config import cfg
@@ -1387,6 +1387,21 @@ async def _settings_route(ev: Event, ch: Channel, args: list[str]) -> None:
         ok, message = await payments.check_setup()
         await ch.send(ev.chat_id, Out(text=message if ok else "⚠️ " + message,
                                       kb=[_back("a:cfg:s:pay")]))
+    elif action == "ptest":
+        await _show(ev, ch, await paytest.screen(ev, ch))
+    elif action == "ptinv":
+        await _answer(ev, ch, "Выставляю счёт…")
+        message = await paytest.send_invoice(ev, ch)
+        await ch.send(ev.chat_id, Out(text=message, kb=[
+            [Btn(text="⬅️ К тестовой оплате", data="a:cfg:ptest")]]))
+    elif action == "ptlink":
+        await _answer(ev, ch, "Создаю ссылку…")
+        await ch.send(ev.chat_id, await paytest.send_link(ev, ch))
+    elif action == "ptr" and len(args) > 1:
+        await _answer(ev, ch, "Оформляю возврат…")
+        message = await paytest.refund(args[1], ev)
+        await ch.send(ev.chat_id, Out(text=message, kb=[
+            [Btn(text="⬅️ К оплате", data="a:cfg:s:pay"), Btn(text="🏠 Админка", data="a:h")]]))
     elif action == "ykapi":
         await _answer(ev, ch, "Проверяю ЮKassa…")
         ok, message = await yookassa.check_setup()
@@ -1437,7 +1452,8 @@ async def _settings_section(ev: Event, ch: Channel, code: str) -> None:
         max_line = await payments.max_summary()
         if max_line:
             lines += ["", max_line]
-        kb.append([Btn(text="🧪 Проверить ЮKassa", data="a:cfg:ykapi")])
+        kb.append([Btn(text="🧪 Проверить ЮKassa", data="a:cfg:ykapi"),
+                   Btn(text="💸 Тестовая оплата", data="a:cfg:ptest")])
     if code == "price":
         lines += ["", await _discount_preview()]
     topic = SECTION_HELP.get(code)

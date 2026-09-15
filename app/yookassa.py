@@ -233,11 +233,12 @@ async def check_setup() -> tuple[bool, str]:
 # ------------------------------------------------------------ опрос оплат
 async def watch_tick() -> int:
     """Проверить ждущие ссылки. Возвращает паузу до следующей проверки."""
-    from . import notify, orders_service
+    from . import notify, orders_service, paytest
     from .channels.base import Btn
 
     if not await is_configured():
         return 120
+    waiting_tests = await paytest.watch()
     rows = await repo.open_card_payments()
     for order in rows:
         payment_id = _payment_ref(order)
@@ -267,4 +268,4 @@ async def watch_tick() -> int:
                     [[Btn(text="💳 Новая ссылка на оплату", data=f"g:card:{order['id']}",
                           intent="positive")],
                      [Btn(text="📦 Мои заказы", data="g:my")]])
-    return 20 if rows else 60
+    return 20 if rows or waiting_tests else 60
